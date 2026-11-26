@@ -77,7 +77,6 @@ ed7e3c5d386e1532bc13d7d4abf7027c83f4f554  .github/bench/README.md
 d31af9b19fb87f7f78efc867dc2bc564b036c571  .github/bench/dagger-job.yaml
 c3fbbed4874b4bb01a1e5418e8e077bd51bb51e6  .github/bench/job.yaml
 87b90f5d643990b20b13b7809fae82cbbba1288d  .github/bench/runner-entrypoint.sh
-c5911e59e4a16bf777a33ea8979352b382de2200  .github/dependabot.yml
 b8cd5d39f89ad2b280cfb140cbcb90c5bc764ee8  .github/e2e-hibernation.env
 023c4a98f4e2ebe246944a84d796c189ff7a056e  .github/image-benchmark-waivers.json
 49dfabef5566ead009010f34c43c0fc76fc520ab  .github/images.json

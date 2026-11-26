@@ -1,4 +1,5 @@
 .claude/skills
+.github/dependabot.yml
 .github/workflows/actions.lock
 .github/workflows/backport.yml
 .github/workflows/benchmark.yml
