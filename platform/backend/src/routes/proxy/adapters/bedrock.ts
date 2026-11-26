@@ -1,0 +1,2234 @@
+import { createHash } from "node:crypto";
+import {
+  ArchestraInternalErrorCode,
+  BedrockErrorTypes,
+} from "@archestra/shared";
+import type { ConverseStreamOutput } from "@aws-sdk/client-bedrock-runtime";
+import { EventStreamCodec } from "@smithy/eventstream-codec";
+import { fromUtf8, toUtf8 } from "@smithy/util-utf8";
+import type { BedrockClient } from "@/clients/bedrock-client";
+import { buildBedrockClient } from "@/clients/bedrock-credentials";
+import { fetchWithLlmUpstreamDispatcher } from "@/clients/llm-upstream-dispatcher";
+import config from "@/config";
+import logger from "@/logging";
+import type {
+  Bedrock,
+  ChunkProcessingResult,
+  CommonMcpToolDefinition,
+  CommonMessage,
+  CommonToolCall,
+  CommonToolResult,
+  CreateClientOptions,
+  LLMProvider,
+  LLMRequestAdapter,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { isApprovedAsSent } from "../utils/approved-as-sent";
+import { wordToolCallId } from "../utils/tool-call-ids";
+import {
+  type SamplingParam,
+  withSamplingParamFallback,
+} from "./sampling-param-fallback";
+
+// =============================================================================
+// TYPE ALIASES
+// =============================================================================
+
+type BedrockRequest = Bedrock.Types.ConverseRequest;
+type BedrockResponse = Bedrock.Types.ConverseResponse;
+type BedrockMessages = Bedrock.Types.Message[];
+type BedrockHeaders = Bedrock.Types.ConverseHeaders;
+type BedrockCommandContext = {
+  commandInput: {
+    modelId: string;
+    messages: BedrockMessages | undefined;
+    system:
+      | Array<{
+          text?: string;
+          guardContent?: unknown;
+          cachePoint?: unknown;
+          // Passthrough for Bedrock-native system blocks we don't model
+          // explicitly (see SystemContentBlockSchema forward-compat fallback).
+          [key: string]: unknown;
+        }>
+      | undefined;
+    inferenceConfig: BedrockRequest["inferenceConfig"];
+    /**
+     * Model-native parameters Converse forwards verbatim (thinking config,
+     * reasoning effort, …). Every AI-SDK reasoning knob rides this field, so
+     * dropping it silently re-enables reasoning the caller disabled.
+     */
+    additionalModelRequestFields: Record<string, unknown> | undefined;
+    outputConfig: BedrockRequest["outputConfig"];
+    guardrailConfig: BedrockRequest["guardrailConfig"];
+    additionalModelResponseFieldPaths: BedrockRequest["additionalModelResponseFieldPaths"];
+    promptVariables: BedrockRequest["promptVariables"];
+    performanceConfig: BedrockRequest["performanceConfig"];
+    requestMetadata: BedrockRequest["requestMetadata"];
+    serviceTier: BedrockRequest["serviceTier"];
+    toolConfig:
+      | {
+          tools:
+            | Array<{
+                cachePoint?: { type: "default"; ttl?: string };
+                toolSpec?:
+                  | {
+                      name?: string;
+                      description?: string;
+                      inputSchema?: { json: Record<string, unknown> };
+                    }
+                  | undefined;
+              }>
+            | undefined;
+          toolChoice: Bedrock.Types.ToolChoice | undefined;
+        }
+      | undefined;
+  };
+  toolNameMapping: ToolNameMapping;
+};
+type BedrockCommandInput = BedrockCommandContext["commandInput"];
+
+// Stream event types from the SDK
+type BedrockStreamEvent = ConverseStreamOutput;
+
+// Extended event type that includes raw bytes for passthrough
+type BedrockStreamEventWithRaw = BedrockStreamEvent & {
+  __rawBytes?: Uint8Array;
+};
+
+// Event stream codec for binary encoding/decoding
+const eventStreamCodec = new EventStreamCodec(toUtf8, fromUtf8);
+
+// Padding alphabet used by Bedrock (lowercase + uppercase + digits)
+const PADDING_ALPHABET =
+  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const BEDROCK_MAX_TOOL_NAME_LENGTH = 64;
+// Bedrock constrains toolSpec names to ^[a-zA-Z0-9_-]{1,64}$. Anything outside
+// that set collapses to a single underscore.
+const BEDROCK_INVALID_TOOL_NAME_CHARS = /[^a-zA-Z0-9_-]+/g;
+const TOOL_NAME_HASH_LENGTH = 8;
+const TOOL_NAME_HASH_SEPARATOR = "_";
+const BEDROCK_DOCUMENT_NAME_FALLBACK = "Document";
+const bedrockCommandContextCache = new WeakMap<
+  BedrockRequest,
+  BedrockCommandContext
+>();
+
+/**
+ * Generate padding string to match Bedrock's format.
+ * Uses a prefix of the alphabet, with length to reach target body size.
+ */
+function generatePadding(currentBodyLength: number, targetSize = 80): string {
+  const paddingNeeded = Math.max(0, targetSize - currentBodyLength - 10); // -10 for `,"p":""`
+  return PADDING_ALPHABET.slice(
+    0,
+    Math.min(paddingNeeded, PADDING_ALPHABET.length),
+  );
+}
+
+/**
+ * Encode an event to AWS Event Stream binary format.
+ * Adds padding field "p" to match Bedrock's format.
+ */
+function encodeEventStreamMessage(
+  eventType: string,
+  body: unknown,
+): Uint8Array {
+  // Add padding to match Bedrock's format
+  const bodyWithoutPadding = JSON.stringify(body);
+  const padding = generatePadding(bodyWithoutPadding.length);
+  const bodyWithPadding = { ...(body as Record<string, unknown>), p: padding };
+  const bodyJson = JSON.stringify(bodyWithPadding);
+  const bodyBytes = fromUtf8(bodyJson);
+
+  return eventStreamCodec.encode({
+    headers: {
+      ":event-type": { type: "string", value: eventType },
+      ":content-type": { type: "string", value: "application/json" },
+      ":message-type": { type: "string", value: "event" },
+    },
+    body: bodyBytes,
+  });
+}
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/**
+ * Check if the model is a Nova model (requires tool name encoding).
+ */
+function isNovaModel(modelId: string): boolean {
+  return modelId.toLowerCase().includes("nova");
+}
+
+type ToolNameMapping = {
+  toProvider: Map<string, string>;
+  toOriginal: Map<string, string>;
+};
+
+/**
+ * Bedrock rejects tool names that fall outside ^[a-zA-Z0-9_-]{1,64}$, and Nova
+ * models additionally fail with "Model produced invalid sequence as part of
+ * ToolUse" when tool names contain hyphens. Clients reach the proxy with names
+ * Bedrock will not accept (dots, spaces, non-ASCII), so sanitize the character
+ * set before the Nova and length rules.
+ *
+ * Encode only the provider-facing names and keep mappings to restore originals,
+ * so the client still sees the name it sent. Sanitizing can map two distinct
+ * originals onto one encoded name; `getUniqueProviderToolName` disambiguates.
+ */
+function encodeToolName(name: string, options: { isNova: boolean }): string {
+  const sanitizedName = name.replace(BEDROCK_INVALID_TOOL_NAME_CHARS, "_");
+  const normalizedName = options.isNova
+    ? sanitizedName.replaceAll("-", "_")
+    : sanitizedName;
+  return truncateToolName(normalizedName, name);
+}
+
+/**
+ * Build a mapping from encoded tool names back to original names.
+ */
+function buildToolNameMapping(request: BedrockRequest): ToolNameMapping {
+  const isNova = isNovaModel(request.modelId);
+  const toProvider = new Map<string, string>();
+  const toOriginal = new Map<string, string>();
+  const tools = request.toolConfig?.tools ?? [];
+
+  for (const tool of tools) {
+    const originalName = tool.toolSpec?.name;
+    if (originalName) {
+      const encodedName = getUniqueProviderToolName({
+        originalName,
+        isNova,
+        usedNames: toOriginal,
+      });
+      toProvider.set(originalName, encodedName);
+      toOriginal.set(encodedName, originalName);
+    }
+  }
+
+  return { toProvider, toOriginal };
+}
+
+/**
+ * Decode tool name using the mapping (encoded → original).
+ */
+function decodeToolName(encodedName: string, mapping: ToolNameMapping): string {
+  return mapping.toOriginal.get(encodedName) ?? encodedName;
+}
+
+function getProviderToolName(
+  originalName: string,
+  mapping: ToolNameMapping,
+  options: { isNova: boolean },
+): string {
+  return (
+    mapping.toProvider.get(originalName) ??
+    encodeToolName(originalName, options)
+  );
+}
+
+function createEmptyToolNameMapping(): ToolNameMapping {
+  return {
+    toProvider: new Map(),
+    toOriginal: new Map(),
+  };
+}
+
+function getUniqueProviderToolName(params: {
+  originalName: string;
+  isNova: boolean;
+  usedNames: Map<string, string>;
+}): string {
+  const encodedName = encodeToolName(params.originalName, {
+    isNova: params.isNova,
+  });
+  const existingOriginalName = params.usedNames.get(encodedName);
+
+  if (!existingOriginalName || existingOriginalName === params.originalName) {
+    return encodedName;
+  }
+
+  return appendToolNameHash(encodedName, params.originalName);
+}
+
+function truncateToolName(name: string, hashInput: string): string {
+  if (name.length <= BEDROCK_MAX_TOOL_NAME_LENGTH) {
+    return name;
+  }
+
+  return appendToolNameHash(name, hashInput);
+}
+
+function appendToolNameHash(name: string, hashInput: string): string {
+  const hash = createHash("sha256")
+    .update(hashInput)
+    .digest("hex")
+    .slice(0, TOOL_NAME_HASH_LENGTH);
+  const prefixLength =
+    BEDROCK_MAX_TOOL_NAME_LENGTH -
+    TOOL_NAME_HASH_SEPARATOR.length -
+    TOOL_NAME_HASH_LENGTH;
+
+  return `${name.slice(0, prefixLength)}${TOOL_NAME_HASH_SEPARATOR}${hash}`;
+}
+
+function encodeProviderMessageToolNames(params: {
+  messages: BedrockMessages | undefined;
+  mapping: ToolNameMapping;
+  isNova: boolean;
+}): BedrockMessages | undefined {
+  if (!params.messages) {
+    return params.messages;
+  }
+
+  return params.messages.map((message) => {
+    if (!Array.isArray(message.content)) {
+      return message;
+    }
+
+    const content = message.content.map((contentBlock) => {
+      if (!isToolUseBlock(contentBlock)) {
+        return contentBlock;
+      }
+
+      const name = contentBlock.toolUse.name;
+      if (!name) {
+        return contentBlock;
+      }
+
+      return {
+        ...contentBlock,
+        toolUse: {
+          ...contentBlock.toolUse,
+          name: getProviderToolName(name, params.mapping, {
+            isNova: params.isNova,
+          }),
+        },
+      };
+    });
+
+    return {
+      ...message,
+      content,
+    };
+  }) as BedrockMessages;
+}
+
+// Applies all Bedrock provider-facing message rewrites before constructing the
+// AWS command input.
+function prepareProviderMessages(params: {
+  messages: BedrockMessages | undefined;
+  mapping: ToolNameMapping;
+  isNova: boolean;
+}): BedrockMessages | undefined {
+  const messagesWithEncodedToolNames = encodeProviderMessageToolNames(params);
+  return sanitizeProviderDocumentNames(messagesWithEncodedToolNames);
+}
+
+// Walks message content blocks and normalizes document names so Bedrock does
+// not reject otherwise valid file uploads on filename validation.
+function sanitizeProviderDocumentNames(
+  messages: BedrockMessages | undefined,
+): BedrockMessages | undefined {
+  if (!messages) {
+    return messages;
+  }
+
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) {
+      return message;
+    }
+
+    let changed = false;
+    const content = message.content.map((contentBlock) => {
+      const sanitizedContentBlock =
+        sanitizeDocumentNamesInContentBlock(contentBlock);
+      if (sanitizedContentBlock !== contentBlock) {
+        changed = true;
+      }
+      return sanitizedContentBlock;
+    });
+
+    return changed ? { ...message, content } : message;
+  }) as BedrockMessages;
+}
+
+// Sanitizes direct document blocks and document blocks nested inside tool
+// results while preserving unchanged content by reference.
+function sanitizeDocumentNamesInContentBlock(contentBlock: unknown): unknown {
+  if (isDocumentBlock(contentBlock)) {
+    const sanitizedName = sanitizeBedrockDocumentName(
+      contentBlock.document.name,
+    );
+    if (sanitizedName === contentBlock.document.name) {
+      return contentBlock;
+    }
+
+    return {
+      ...contentBlock,
+      document: {
+        ...contentBlock.document,
+        name: sanitizedName,
+      },
+    };
+  }
+
+  if (!isToolResultBlock(contentBlock)) {
+    return contentBlock;
+  }
+
+  const content = contentBlock.toolResult.content;
+  if (!Array.isArray(content)) {
+    return contentBlock;
+  }
+
+  let changed = false;
+  const sanitizedContent = content.map((item) => {
+    if (!isDocumentBlock(item)) {
+      return item;
+    }
+
+    const sanitizedName = sanitizeBedrockDocumentName(item.document.name);
+    if (sanitizedName === item.document.name) {
+      return item;
+    }
+
+    changed = true;
+    return {
+      ...item,
+      document: {
+        ...item.document,
+        name: sanitizedName,
+      },
+    };
+  });
+
+  return changed
+    ? {
+        ...contentBlock,
+        toolResult: {
+          ...contentBlock.toolResult,
+          content: sanitizedContent,
+        },
+      }
+    : contentBlock;
+}
+
+// Converts arbitrary filenames to Bedrock's document-name character set:
+// alphanumerics, whitespace, hyphens, parentheses, and square brackets.
+function sanitizeBedrockDocumentName(name: string): string {
+  const sanitizedName = name
+    .replace(/[^a-zA-Z0-9\s()[\]-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return sanitizedName || BEDROCK_DOCUMENT_NAME_FALLBACK;
+}
+
+function encodeProviderToolChoiceName(params: {
+  toolChoice: Bedrock.Types.ToolChoice | undefined;
+  mapping: ToolNameMapping;
+  isNova: boolean;
+}): Bedrock.Types.ToolChoice | undefined {
+  if (!params.toolChoice || !("tool" in params.toolChoice)) {
+    return params.toolChoice;
+  }
+
+  const toolChoice = params.toolChoice.tool as
+    | { name?: unknown }
+    | null
+    | undefined;
+  if (typeof toolChoice?.name !== "string") {
+    return params.toolChoice;
+  }
+
+  return {
+    ...params.toolChoice,
+    tool: {
+      ...toolChoice,
+      name: getProviderToolName(toolChoice.name, params.mapping, {
+        isNova: params.isNova,
+      }),
+    },
+  };
+}
+
+/**
+ * Check if a content block is a text block.
+ * Works with both AWS SDK ContentBlock and our internal Zod types.
+ */
+function isTextBlock(block: unknown): block is { text: string } {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    "text" in block &&
+    typeof (block as { text: unknown }).text === "string"
+  );
+}
+
+/**
+ * DeepSeek on Bedrock emits this provider-internal DSML sentinel as a text
+ * delta immediately before the real Converse `toolUse` block. Forwarding it
+ * leaks protocol syntax into chat while the call is already represented
+ * structurally, so remove only the exact reserved marker and its separator.
+ */
+function stripBedrockToolProtocolSentinels(text: string): string {
+  return text.replace(
+    /(?:[ \t]*\r?\n){0,2}[ \t]*<\s*[|｜]\s*DSML\s*[|｜]\s*function_calls\s*>?/gi,
+    "",
+  );
+}
+
+function splitPendingBedrockToolProtocolText(text: string): {
+  emit: string;
+  pending: string;
+} {
+  const stripped = stripBedrockToolProtocolSentinels(text);
+  const markerStart = stripped.lastIndexOf("<");
+  if (markerStart < 0) {
+    return { emit: stripped, pending: "" };
+  }
+
+  const candidate = stripped.slice(markerStart);
+  const normalizedCandidate = candidate
+    .replace(/\s/g, "")
+    .replaceAll("|", "｜")
+    .toLowerCase();
+  const marker = "<｜dsml｜function_calls";
+  if (!marker.startsWith(normalizedCandidate)) {
+    return { emit: stripped, pending: "" };
+  }
+
+  let pendingStart = markerStart;
+  while (pendingStart > 0 && /\s/.test(stripped[pendingStart - 1] ?? "")) {
+    pendingStart--;
+  }
+  return {
+    emit: stripped.slice(0, pendingStart),
+    pending: stripped.slice(pendingStart),
+  };
+}
+
+/**
+ * Check if a content block is a tool use block.
+ * Works with both AWS SDK ContentBlock and our internal Zod types.
+ */
+function isToolUseBlock(block: unknown): block is {
+  toolUse: { toolUseId?: string; name?: string; input?: unknown };
+} {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    "toolUse" in block &&
+    (block as { toolUse: unknown }).toolUse !== undefined
+  );
+}
+
+/** An extended-thinking block as it appears in a Converse response. */
+type BedrockReasoningContentBlock = Extract<
+  NonNullable<
+    NonNullable<BedrockResponse["output"]>["message"]
+  >["content"][number],
+  { reasoningContent: unknown }
+>;
+
+/**
+ * Check if a content block is an extended-thinking block, in either of the
+ * Converse API's variants (`reasoningText` or `redactedContent`).
+ */
+function isReasoningContentBlock(
+  block: unknown,
+): block is BedrockReasoningContentBlock {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    "reasoningContent" in block &&
+    (block as { reasoningContent: unknown }).reasoningContent !== undefined
+  );
+}
+
+/** Tool-use ids Bedrock accepts; see `wordToolCallId`. */
+export function withBedrockToolCallIds(
+  messages: BedrockMessages,
+): BedrockMessages {
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (isToolUseBlock(block) && block.toolUse.toolUseId) {
+        const toolUseId = wordToolCallId(block.toolUse.toolUseId);
+        if (toolUseId === block.toolUse.toolUseId) return block;
+        changed = true;
+        return { ...block, toolUse: { ...block.toolUse, toolUseId } };
+      }
+      if (isToolResultBlock(block) && block.toolResult.toolUseId) {
+        const toolUseId = wordToolCallId(block.toolResult.toolUseId);
+        if (toolUseId === block.toolResult.toolUseId) return block;
+        changed = true;
+        return { ...block, toolResult: { ...block.toolResult, toolUseId } };
+      }
+      return block;
+    });
+    return changed ? ({ ...message, content } as typeof message) : message;
+  });
+}
+
+/**
+ * Check if a content block is a tool result block.
+ * Works with both AWS SDK ContentBlock and our internal Zod types.
+ */
+function isToolResultBlock(block: unknown): block is {
+  toolResult: { toolUseId?: string; content?: unknown[]; status?: string };
+} {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    "toolResult" in block &&
+    (block as { toolResult: unknown }).toolResult !== undefined
+  );
+}
+
+// Narrows a loose Bedrock content item to the document block shape used in
+// messages and tool results.
+function isDocumentBlock(block: unknown): block is {
+  document: { name: string; format?: unknown; source?: unknown };
+} {
+  if (typeof block !== "object" || block === null || !("document" in block)) {
+    return false;
+  }
+
+  const document = (block as { document: unknown }).document;
+  return (
+    typeof document === "object" &&
+    document !== null &&
+    "name" in document &&
+    typeof (document as { name: unknown }).name === "string"
+  );
+}
+
+/**
+ * Generate a unique message ID for Bedrock responses
+ */
+function generateMessageId(): string {
+  return `msg_bedrock_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+}
+
+// =============================================================================
+// REQUEST ADAPTER
+// =============================================================================
+
+class BedrockRequestAdapter
+  implements LLMRequestAdapter<BedrockRequest, BedrockMessages>
+{
+  readonly provider = "bedrock" as const;
+  private request: BedrockRequest;
+  private modifiedModel: string | null = null;
+  private toolResultUpdates: Record<string, string> = {};
+  private toolNameMapping: ToolNameMapping;
+
+  constructor(request: BedrockRequest) {
+    this.request = request;
+    this.toolNameMapping = buildToolNameMapping(request);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Read Access
+  // ---------------------------------------------------------------------------
+
+  getModel(): string {
+    return this.modifiedModel ?? this.request.modelId;
+  }
+
+  isStreaming(): boolean {
+    // Check _isStreaming flag injected by routes based on endpoint URL
+    // (converse-stream endpoints set _isStreaming: true, converse endpoints set _isStreaming: false)
+    return this.request._isStreaming === true;
+  }
+
+  getMessages(): CommonMessage[] {
+    return this.toCommonFormat(this.request.messages ?? []);
+  }
+
+  getToolResults(): CommonToolResult[] {
+    const results: CommonToolResult[] = [];
+
+    for (const message of this.request.messages ?? []) {
+      if (message.role === "user" && Array.isArray(message.content)) {
+        for (const contentBlock of message.content) {
+          if (isToolResultBlock(contentBlock)) {
+            const toolResult = contentBlock.toolResult;
+            const toolUseId = toolResult.toolUseId ?? "";
+            // Find the paired tool use from previous assistant messages
+            const toolUse = this.findToolUse(
+              this.request.messages ?? [],
+              toolUseId,
+            );
+
+            const { content, structured } = sentToolResultContent(toolResult);
+            results.push({
+              id: toolUseId,
+              name: toolUse?.name ?? "unknown",
+              arguments: toolUse?.arguments,
+              content,
+              structured,
+              isError: toolResult.status === "error",
+            });
+          }
+        }
+      }
+    }
+
+    return results;
+  }
+
+  getTools(): CommonMcpToolDefinition[] {
+    if (!this.request.toolConfig?.tools) return [];
+
+    return this.request.toolConfig.tools.flatMap((tool) =>
+      tool.toolSpec
+        ? [
+            {
+              name: tool.toolSpec?.name ?? "",
+              description: tool.toolSpec?.description,
+              inputSchema: (tool.toolSpec?.inputSchema?.json ?? {}) as Record<
+                string,
+                unknown
+              >,
+            },
+          ]
+        : [],
+    );
+  }
+
+  hasTools(): boolean {
+    return (
+      this.request.toolConfig?.tools?.some(
+        (tool) => tool.toolSpec !== undefined,
+      ) ?? false
+    );
+  }
+
+  getProviderMessages(): BedrockMessages {
+    return this.request.messages ?? [];
+  }
+
+  getOriginalRequest(): BedrockRequest {
+    return this.request;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Modify Access
+  // ---------------------------------------------------------------------------
+
+  setModel(model: string): void {
+    this.modifiedModel = model;
+  }
+
+  updateToolResult(toolCallId: string, newContent: string): void {
+    this.toolResultUpdates[toolCallId] = newContent;
+  }
+
+  applyToolResultUpdates(updates: Record<string, string>): void {
+    Object.assign(this.toolResultUpdates, updates);
+  }
+
+  convertToolResultContent(messages: BedrockMessages): BedrockMessages {
+    // Bedrock uses a different format for images, no conversion needed for now
+    return messages;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build Modified Request
+  // ---------------------------------------------------------------------------
+
+  toProviderRequest(): BedrockRequest {
+    let messages = this.request.messages ?? [];
+
+    // Apply tool result updates if any
+    if (Object.keys(this.toolResultUpdates).length > 0) {
+      messages = this.applyUpdates(messages, this.toolResultUpdates);
+    }
+
+    return {
+      ...this.request,
+      modelId: this.getModel(),
+      // After the result updates above, which look up the client's call ids.
+      messages: withBedrockToolCallIds(messages),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private Helpers
+  // ---------------------------------------------------------------------------
+
+  private findToolUse(
+    messages: BedrockMessages,
+    toolUseId: string,
+  ): { name: string; arguments?: Record<string, unknown> } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role === "assistant" && Array.isArray(message.content)) {
+        for (const content of message.content) {
+          if (
+            isToolUseBlock(content) &&
+            content.toolUse.toolUseId === toolUseId
+          ) {
+            const name = content.toolUse.name ?? null;
+            if (!name) {
+              return null;
+            }
+            return {
+              name: decodeToolName(name, this.toolNameMapping),
+              arguments: extractCommonToolCallArguments(content.toolUse.input),
+            };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Convert Bedrock messages to common format for policy evaluation
+   */
+  private toCommonFormat(messages: BedrockMessages): CommonMessage[] {
+    logger.debug(
+      { messageCount: messages.length },
+      "[BedrockAdapter] toCommonFormat: starting conversion",
+    );
+    const commonMessages: CommonMessage[] = [];
+
+    for (const message of messages) {
+      const commonMessage: CommonMessage = {
+        role: message.role as CommonMessage["role"],
+        content: extractCommonMessageText(message),
+      };
+
+      // Handle user messages that may contain tool results
+      if (message.role === "user" && Array.isArray(message.content)) {
+        const toolCalls: CommonToolResult[] = [];
+
+        for (const contentBlock of message.content) {
+          if (isToolResultBlock(contentBlock)) {
+            const toolResult = contentBlock.toolResult;
+            const toolUseId = toolResult.toolUseId ?? "";
+            const toolUse = this.findToolUse(messages, toolUseId);
+
+            if (toolUse) {
+              logger.debug(
+                { toolUseId, toolName: toolUse.name },
+                "[BedrockAdapter] toCommonFormat: found tool result",
+              );
+
+              let parsedResult: unknown;
+              if (toolResult.content && toolResult.content.length > 0) {
+                const firstContent = toolResult.content[0];
+                if ("text" in firstContent && firstContent.text) {
+                  try {
+                    parsedResult = JSON.parse(firstContent.text);
+                  } catch {
+                    parsedResult = firstContent.text;
+                  }
+                } else if ("json" in firstContent) {
+                  parsedResult = firstContent.json;
+                }
+              }
+
+              toolCalls.push({
+                id: toolUseId,
+                name: toolUse.name,
+                arguments: toolUse.arguments,
+                content: parsedResult,
+                isError: false,
+              });
+            }
+          }
+        }
+
+        if (toolCalls.length > 0) {
+          commonMessage.toolCalls = toolCalls;
+          logger.debug(
+            { toolCallCount: toolCalls.length },
+            "[BedrockAdapter] toCommonFormat: attached tool calls to message",
+          );
+        }
+      }
+
+      commonMessages.push(commonMessage);
+    }
+
+    logger.debug(
+      { inputCount: messages.length, outputCount: commonMessages.length },
+      "[BedrockAdapter] toCommonFormat: conversion complete",
+    );
+    return commonMessages;
+  }
+
+  /**
+   * Extract tool name from messages by finding the assistant message
+   * that contains the tool_use_id
+   */
+  /**
+   * Apply tool result updates back to Bedrock messages
+   */
+  private applyUpdates(
+    messages: BedrockMessages,
+    updates: Record<string, string>,
+  ): BedrockMessages {
+    const updateCount = Object.keys(updates).length;
+    logger.debug(
+      { messageCount: messages.length, updateCount },
+      "[BedrockAdapter] applyUpdates: starting",
+    );
+
+    if (updateCount === 0) {
+      logger.debug("[BedrockAdapter] applyUpdates: no updates to apply");
+      return messages;
+    }
+
+    let appliedCount = 0;
+    const result = messages.map((message) => {
+      // Only process user messages with content arrays
+      if (message.role === "user" && Array.isArray(message.content)) {
+        const updatedContent = message.content.map((contentBlock) => {
+          if (
+            isToolResultBlock(contentBlock) &&
+            contentBlock.toolResult.toolUseId &&
+            Object.hasOwn(updates, contentBlock.toolResult.toolUseId)
+          ) {
+            // Kept as sent: the runtime read this one block, so a block
+            // forwarded unchanged (an image, a JSON block) is what it approved.
+            // Further blocks were never read, so they are never forwarded.
+            if (
+              contentBlock.toolResult.content?.length === 1 &&
+              approvedMatches({
+                sent: sentToolResultContent(contentBlock.toolResult),
+                approved: updates[contentBlock.toolResult.toolUseId],
+              })
+            ) {
+              return contentBlock;
+            }
+            appliedCount++;
+            logger.debug(
+              { toolUseId: contentBlock.toolResult.toolUseId },
+              "[BedrockAdapter] applyUpdates: applying update to tool result",
+            );
+            return {
+              toolResult: {
+                ...contentBlock.toolResult,
+                content: [{ text: updates[contentBlock.toolResult.toolUseId] }],
+              },
+            };
+          }
+          return contentBlock;
+        });
+
+        return {
+          ...message,
+          content: updatedContent,
+        };
+      }
+
+      return message;
+    });
+
+    logger.debug(
+      { updateCount, appliedCount },
+      "[BedrockAdapter] applyUpdates: complete",
+    );
+    return result as BedrockMessages;
+  }
+}
+
+// =============================================================================
+// RESPONSE ADAPTER
+// =============================================================================
+
+/**
+ * Cache-creation tokens written at the 1-hour TTL, from Bedrock's per-TTL
+ * `cacheDetails` breakdown (the remainder of cacheWriteInputTokens is 5m). Used
+ * to bill the 1h write portion at the higher rate.
+ */
+function bedrockCacheWrite1hTokens(
+  usage:
+    | {
+        cacheDetails?: ({ ttl?: string; inputTokens?: number } | null)[] | null;
+      }
+    | null
+    | undefined,
+): number {
+  return (usage?.cacheDetails ?? []).reduce(
+    (sum, detail) =>
+      detail?.ttl === "1h" ? sum + (detail.inputTokens ?? 0) : sum,
+    0,
+  );
+}
+
+class BedrockResponseAdapter implements LLMResponseAdapter<BedrockResponse> {
+  readonly provider = "bedrock" as const;
+  private response: BedrockResponse;
+  private messageId: string;
+
+  constructor(response: BedrockResponse) {
+    this.response = response;
+    this.messageId = response.$metadata?.requestId ?? generateMessageId();
+  }
+
+  getId(): string {
+    return this.messageId;
+  }
+
+  getModel(): string {
+    // Bedrock doesn't return the model in response, return empty string
+    // The caller should track which model was used
+    return "";
+  }
+
+  getText(): string {
+    const outputMessage = this.response.output?.message;
+    if (!outputMessage?.content) return "";
+
+    const textBlocks = outputMessage.content.filter(isTextBlock);
+    return textBlocks
+      .map((block) => stripBedrockToolProtocolSentinels(block.text))
+      .join("");
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    const outputMessage = this.response.output?.message;
+    if (!outputMessage?.content) return [];
+
+    const toolCalls: CommonToolCall[] = [];
+    for (const block of outputMessage.content) {
+      if (isToolUseBlock(block)) {
+        toolCalls.push({
+          id: block.toolUse.toolUseId ?? "",
+          // Tool names are already decoded by execute() before response reaches here
+          name: block.toolUse.name ?? "",
+          arguments: (block.toolUse.input ?? {}) as Record<string, unknown>,
+        });
+      }
+    }
+    return toolCalls;
+  }
+
+  hasToolCalls(): boolean {
+    const outputMessage = this.response.output?.message;
+    if (!outputMessage?.content) return false;
+
+    return outputMessage.content.some(isToolUseBlock);
+  }
+
+  getUsage(): UsageView {
+    return {
+      inputTokens: this.response.usage?.inputTokens ?? 0,
+      outputTokens: this.response.usage?.outputTokens ?? 0,
+      cacheReadTokens: this.response.usage?.cacheReadInputTokens ?? 0,
+      cacheWriteTokens: this.response.usage?.cacheWriteInputTokens ?? 0,
+      cacheWrite1hTokens: bedrockCacheWrite1hTokens(this.response.usage),
+    };
+  }
+
+  getOriginalResponse(): BedrockResponse {
+    // Ensure totalTokens is present — the AWS Bedrock API doesn't return it,
+    // but @ai-sdk/amazon-bedrock requires it in its response schema.
+    if (this.response.usage && this.response.usage.totalTokens == null) {
+      this.response.usage.totalTokens =
+        (this.response.usage.inputTokens ?? 0) +
+        (this.response.usage.outputTokens ?? 0);
+    }
+    return this.response;
+  }
+
+  getFinishReasons(): string[] {
+    const reason = this.response.stopReason;
+    return reason ? [reason] : [];
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): BedrockResponse {
+    // Positional: one rewritten entry per call this response carries, in
+    // order, so ids the client correlates by are untouched.
+    const outputMessage = this.response.output?.message;
+    if (!outputMessage?.content) return this.response;
+    let next = 0;
+    const content = outputMessage.content.map((block) => {
+      if (!isToolUseBlock(block)) return block;
+      const rewritten = toolCalls[next++];
+      if (!rewritten) return block;
+      return {
+        ...block,
+        toolUse: {
+          ...block.toolUse,
+          name: rewritten.name,
+          input: parseArgs(rewritten.arguments),
+        },
+      };
+    });
+    return {
+      ...this.response,
+      output: {
+        ...this.response.output,
+        message: { ...outputMessage, content },
+      },
+    };
+  }
+
+  toRefusalResponse(
+    _refusalMessage: string,
+    contentMessage: string,
+  ): BedrockResponse {
+    return {
+      ...this.response,
+      output: {
+        message: {
+          role: "assistant",
+          content: [{ text: contentMessage }],
+        },
+      },
+      stopReason: "end_turn",
+    };
+  }
+
+  /** The response as one text answer, as a governed child's turn ends. */
+  withReplacedText(text: string): BedrockResponse {
+    return this.toRefusalResponse("", text);
+  }
+}
+
+// =============================================================================
+// STREAM ADAPTER
+// =============================================================================
+
+class BedrockStreamAdapter
+  implements LLMStreamAdapter<BedrockStreamEvent, BedrockResponse>
+{
+  readonly provider = "bedrock" as const;
+  readonly state: StreamAccumulatorState;
+  private currentToolCallIndex = -1;
+  private toolNameMapping: ToolNameMapping = createEmptyToolNameMapping();
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal. On a blocked tool-call turn the upstream messageStop was buffered
+  // with the (discarded) tool events, so formatEndSSE must synthesize a terminal
+  // messageStop (end_turn); toProviderResponse persists the refusal, not the
+  // blocked tool calls.
+  /**
+   * The reasoning the model streamed, accumulated.
+   *
+   * Bedrock sends it as `reasoningContent` deltas which stream through
+   * untouched and are deliberately kept out of `state.text` (that holds the
+   * answer). Nothing else captured them, so the reconstructed turn — the one
+   * persisted as the interaction — recorded a reasoning turn as though the
+   * model had gone straight to its answer.
+   *
+   * The signature is kept with the text: it is what makes a reasoning block
+   * replayable, and a record without it describes something the API rejects.
+   */
+  private reasoningText = "";
+  private reasoningSignature = "";
+  private redactedReasoning: string | null = null;
+
+  private accumulateReasoningDelta(delta: unknown): void {
+    // Structurally narrowed rather than typed against the SDK union: the union
+    // members differ per reasoning kind (text/signature vs redacted), and this
+    // only ever reads the fields it recognises.
+    const reasoning = (
+      delta as {
+        reasoningContent?: {
+          text?: unknown;
+          signature?: unknown;
+          redactedContent?: unknown;
+          data?: unknown;
+        };
+      }
+    ).reasoningContent;
+    if (!reasoning) {
+      return;
+    }
+    if (typeof reasoning.text === "string") {
+      this.reasoningText += reasoning.text;
+    }
+    if (typeof reasoning.signature === "string") {
+      this.reasoningSignature += reasoning.signature;
+    }
+    const redacted = reasoning.redactedContent ?? reasoning.data;
+    if (typeof redacted === "string") {
+      this.redactedReasoning = (this.redactedReasoning ?? "") + redacted;
+    }
+  }
+
+  private replacedText: string | null = null;
+  private pendingProtocolText = "";
+  private pendingProtocolContentBlockIndex: number | null = null;
+
+  // Bedrock-specific extended state
+  private bedrockState: {
+    latencyMs: number | null;
+    trace: unknown | null;
+    // Buffer for messageStop and metadata events when tool calls are pending
+    // These must be sent AFTER tool call events in the correct stream order
+    pendingFinalEvents: BedrockStreamEventWithRaw[];
+  };
+
+  constructor() {
+    this.state = {
+      responseId: generateMessageId(),
+      model: "",
+      text: "",
+      toolCalls: [],
+      rawToolCallEvents: [],
+      usage: null,
+      stopReason: null,
+      timing: {
+        startTime: Date.now(),
+        firstChunkTime: null,
+      },
+    };
+    this.bedrockState = {
+      latencyMs: null,
+      trace: null,
+      pendingFinalEvents: [],
+    };
+  }
+
+  /**
+   * Set the tool name mapping from the request for decoding tool names in responses.
+   */
+  setToolNameMapping(toolNameMapping: ToolNameMapping): void {
+    this.toolNameMapping = toolNameMapping;
+  }
+
+  processChunk(chunk: BedrockStreamEventWithRaw): ChunkProcessingResult {
+    // Track first chunk time
+    if (this.state.timing.firstChunkTime === null) {
+      this.state.timing.firstChunkTime = Date.now();
+    }
+
+    let sseData: Uint8Array | null = null;
+    let isToolCallChunk = false;
+    let isFinal = false;
+
+    // Use raw bytes if available (passthrough from Bedrock), otherwise re-encode
+    const rawBytes = chunk.__rawBytes;
+
+    // Process based on event type
+    if ("messageStart" in chunk && chunk.messageStart) {
+      sseData =
+        rawBytes ??
+        encodeEventStreamMessage("messageStart", chunk.messageStart);
+    } else if ("contentBlockStart" in chunk && chunk.contentBlockStart) {
+      const blockStart = chunk.contentBlockStart;
+      if (
+        blockStart.start &&
+        "toolUse" in blockStart.start &&
+        blockStart.start.toolUse
+      ) {
+        // Tool use block - buffer for policy evaluation
+        const toolUse = blockStart.start.toolUse;
+        this.currentToolCallIndex = this.state.toolCalls.length;
+        this.state.toolCalls.push({
+          id: toolUse.toolUseId ?? "",
+          name: decodeToolName(toolUse.name ?? "", this.toolNameMapping),
+          arguments: "",
+        });
+        this.state.rawToolCallEvents.push(chunk);
+        isToolCallChunk = true;
+      } else {
+        sseData =
+          rawBytes ??
+          encodeEventStreamMessage(
+            "contentBlockStart",
+            chunk.contentBlockStart,
+          );
+      }
+    } else if ("contentBlockDelta" in chunk && chunk.contentBlockDelta) {
+      const blockDelta = chunk.contentBlockDelta;
+      if (
+        blockDelta.delta &&
+        "text" in blockDelta.delta &&
+        typeof blockDelta.delta.text === "string"
+      ) {
+        const text = this.consumeProtocolFilteredText({
+          text: blockDelta.delta.text,
+          contentBlockIndex: blockDelta.contentBlockIndex ?? 0,
+        });
+        this.state.text += text;
+        if (text) {
+          sseData =
+            text === blockDelta.delta.text && rawBytes
+              ? rawBytes
+              : encodeEventStreamMessage("contentBlockDelta", {
+                  ...chunk.contentBlockDelta,
+                  delta: { ...blockDelta.delta, text },
+                });
+        }
+      } else if (
+        blockDelta.delta &&
+        "toolUse" in blockDelta.delta &&
+        blockDelta.delta.toolUse
+      ) {
+        // Tool use delta - buffer for policy evaluation
+        const toolUseDelta = blockDelta.delta.toolUse;
+        if (this.currentToolCallIndex >= 0 && toolUseDelta.input) {
+          this.state.toolCalls[this.currentToolCallIndex].arguments +=
+            toolUseDelta.input;
+        }
+        this.state.rawToolCallEvents.push(chunk);
+        isToolCallChunk = true;
+      } else if (blockDelta.delta) {
+        // Any other delta kind — reasoningContent (text/signature/redacted)
+        // and whatever Bedrock adds next — streams through unmodified. Only
+        // toolUse deltas are held back for policy evaluation. Reasoning is
+        // deliberately not folded into state.text, which holds the final
+        // answer for interaction logging — it is accumulated separately so the
+        // recorded turn still shows the reasoning the model produced.
+        this.accumulateReasoningDelta(blockDelta.delta);
+        sseData =
+          rawBytes ??
+          encodeEventStreamMessage(
+            "contentBlockDelta",
+            chunk.contentBlockDelta,
+          );
+      }
+    } else if ("contentBlockStop" in chunk && chunk.contentBlockStop) {
+      const isToolBlock =
+        this.state.toolCalls.length > 0 &&
+        this.currentToolCallIndex === this.state.toolCalls.length - 1;
+
+      if (isToolBlock) {
+        // A tool called with no input streams only an empty `input` delta;
+        // its input is `{}`, not the empty string policy evaluation would
+        // reject.
+        const call = this.state.toolCalls[this.currentToolCallIndex];
+        if (call.arguments === "") call.arguments = "{}";
+        this.state.rawToolCallEvents.push(chunk);
+        isToolCallChunk = true;
+      } else {
+        const contentBlockStop =
+          rawBytes ??
+          encodeEventStreamMessage("contentBlockStop", chunk.contentBlockStop);
+        // A held fragment only exists when it still matches the beginning of
+        // the DSML sentinel. Drop it at block end; normal text was emitted as
+        // soon as it stopped matching the reserved protocol prefix.
+        this.clearPendingProtocolText(chunk.contentBlockStop.contentBlockIndex);
+        sseData = contentBlockStop;
+      }
+    } else if ("messageStop" in chunk && chunk.messageStop) {
+      this.state.stopReason = chunk.messageStop.stopReason ?? "end_turn";
+      // If we have pending tool calls, buffer this event to send after tool blocks
+      // The stream order must be: text blocks → tool blocks → messageStop → metadata
+      if (this.state.toolCalls.length > 0) {
+        this.bedrockState.pendingFinalEvents.push(chunk);
+        isToolCallChunk = true; // Mark as tool-related so it's not streamed yet
+      } else {
+        sseData =
+          rawBytes ??
+          encodeEventStreamMessage("messageStop", chunk.messageStop);
+      }
+      // Don't set isFinal here - metadata chunk comes after messageStop
+    } else if ("metadata" in chunk && chunk.metadata) {
+      const metadata = chunk.metadata as {
+        usage?: {
+          inputTokens?: number;
+          outputTokens?: number;
+          cacheReadInputTokens?: number;
+          cacheWriteInputTokens?: number;
+          cacheDetails?: ({ ttl?: string; inputTokens?: number } | null)[];
+        };
+        metrics?: { latencyMs?: number };
+        trace?: unknown;
+      };
+      if (metadata.usage) {
+        this.state.usage = {
+          inputTokens: metadata.usage.inputTokens ?? 0,
+          outputTokens: metadata.usage.outputTokens ?? 0,
+          cacheReadTokens: metadata.usage.cacheReadInputTokens ?? 0,
+          cacheWriteTokens: metadata.usage.cacheWriteInputTokens ?? 0,
+          cacheWrite1hTokens: bedrockCacheWrite1hTokens(metadata.usage),
+        };
+      }
+      if (metadata.metrics?.latencyMs !== undefined) {
+        this.bedrockState.latencyMs = metadata.metrics.latencyMs;
+      }
+      if (metadata.trace) {
+        this.bedrockState.trace = metadata.trace;
+      }
+      // If we have pending tool calls, buffer this event to send after tool blocks
+      if (this.state.toolCalls.length > 0) {
+        this.bedrockState.pendingFinalEvents.push(chunk);
+        isToolCallChunk = true; // Mark as tool-related so it's not streamed yet
+      } else {
+        // Pass through metadata chunk as-is - this is the final event
+        sseData =
+          rawBytes ?? encodeEventStreamMessage("metadata", chunk.metadata);
+      }
+      isFinal = true;
+    } else if (
+      "internalServerException" in chunk &&
+      chunk.internalServerException
+    ) {
+      return {
+        sseData: null,
+        isToolCallChunk: false,
+        isFinal: true,
+        error: {
+          type: "internal_server_error",
+          message:
+            chunk.internalServerException.message ?? "Internal server error",
+        },
+      };
+    } else if (
+      "modelStreamErrorException" in chunk &&
+      chunk.modelStreamErrorException
+    ) {
+      return {
+        sseData: null,
+        isToolCallChunk: false,
+        isFinal: true,
+        error: {
+          type: "model_stream_error",
+          message:
+            chunk.modelStreamErrorException.message ?? "Model stream error",
+        },
+      };
+    } else if (
+      "serviceUnavailableException" in chunk &&
+      chunk.serviceUnavailableException
+    ) {
+      return {
+        sseData: null,
+        isToolCallChunk: false,
+        isFinal: true,
+        error: {
+          type: "service_unavailable",
+          message:
+            chunk.serviceUnavailableException.message ?? "Service unavailable",
+        },
+      };
+    } else if ("throttlingException" in chunk && chunk.throttlingException) {
+      return {
+        sseData: null,
+        isToolCallChunk: false,
+        isFinal: true,
+        error: {
+          type: "throttling",
+          message: chunk.throttlingException.message ?? "Request throttled",
+        },
+      };
+    } else if ("validationException" in chunk && chunk.validationException) {
+      return {
+        sseData: null,
+        isToolCallChunk: false,
+        isFinal: true,
+        error: {
+          type: "validation_error",
+          message: chunk.validationException.message ?? "Validation error",
+        },
+      };
+    }
+
+    return { sseData, isToolCallChunk, isFinal };
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "application/vnd.amazon.eventstream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "request-id": `req-proxy-${Date.now()}`,
+    };
+  }
+
+  formatTextDeltaSSE(text: string): Uint8Array {
+    // AWS Event Stream binary format
+    return encodeEventStreamMessage("contentBlockDelta", {
+      contentBlockIndex: 0,
+      delta: { text },
+    });
+  }
+
+  getRawToolCallEvents(): Uint8Array[] {
+    const result: Uint8Array[] = [];
+
+    // Re-encode all tool call content blocks with decoded tool names
+    // We cannot use raw bytes because they contain encoded names (hyphens replaced with underscores)
+    for (const rawEvent of this.state.rawToolCallEvents) {
+      const event = rawEvent as BedrockStreamEventWithRaw;
+
+      if ("contentBlockStart" in event && event.contentBlockStart) {
+        const blockStart = event.contentBlockStart;
+        // Decode tool name if this is a tool use block
+        if (
+          blockStart.start &&
+          "toolUse" in blockStart.start &&
+          blockStart.start.toolUse
+        ) {
+          const originalName = blockStart.start.toolUse.name ?? "";
+          const decodedName = decodeToolName(
+            originalName,
+            this.toolNameMapping,
+          );
+          const decodedEvent = {
+            ...blockStart,
+            start: {
+              toolUse: {
+                ...blockStart.start.toolUse,
+                name: decodedName,
+              },
+            },
+          };
+          result.push(
+            encodeEventStreamMessage("contentBlockStart", decodedEvent),
+          );
+        } else {
+          result.push(
+            encodeEventStreamMessage(
+              "contentBlockStart",
+              event.contentBlockStart,
+            ),
+          );
+        }
+      } else if ("contentBlockDelta" in event && event.contentBlockDelta) {
+        result.push(
+          encodeEventStreamMessage(
+            "contentBlockDelta",
+            event.contentBlockDelta,
+          ),
+        );
+      } else if ("contentBlockStop" in event && event.contentBlockStop) {
+        result.push(
+          encodeEventStreamMessage("contentBlockStop", event.contentBlockStop),
+        );
+      }
+    }
+
+    // Then, add the buffered final events (messageStop and metadata) in order
+    // These must come AFTER all content blocks for correct stream order
+    for (const finalEvent of this.bedrockState.pendingFinalEvents) {
+      const event = finalEvent as BedrockStreamEventWithRaw;
+
+      // Use original raw bytes if available (these don't contain tool names)
+      if (event.__rawBytes) {
+        result.push(event.__rawBytes);
+        continue;
+      }
+
+      // Fallback to re-encoding
+      if ("messageStop" in event && event.messageStop) {
+        result.push(encodeEventStreamMessage("messageStop", event.messageStop));
+      } else if ("metadata" in event && event.metadata) {
+        result.push(encodeEventStreamMessage("metadata", event.metadata));
+      }
+    }
+
+    return result;
+  }
+
+  formatToolCallsSSE(
+    toolCalls: StreamAccumulatorState["toolCalls"],
+  ): Uint8Array[] {
+    // The planner rewrites 1:1 in order, so each rewritten call reuses the
+    // contentBlockIndex of the tool_use block it replaces — those blocks were
+    // held, never streamed, so the indices are free. Same three-frame shape as
+    // a live tool_use block; input rides as one whole JSON string delta.
+    const heldBlockIndices: number[] = [];
+    for (const rawEvent of this.state.rawToolCallEvents) {
+      const event = rawEvent as BedrockStreamEventWithRaw;
+      if (
+        "contentBlockStart" in event &&
+        event.contentBlockStart?.start &&
+        "toolUse" in event.contentBlockStart.start &&
+        event.contentBlockStart.contentBlockIndex !== undefined
+      ) {
+        heldBlockIndices.push(event.contentBlockStart.contentBlockIndex);
+      }
+    }
+    const result: Uint8Array[] = [];
+    toolCalls.forEach((toolCall, position) => {
+      const contentBlockIndex =
+        heldBlockIndices[position] ??
+        (heldBlockIndices.length > 0
+          ? Math.max(...heldBlockIndices) + 1 + position
+          : position);
+      result.push(
+        encodeEventStreamMessage("contentBlockStart", {
+          contentBlockIndex,
+          start: {
+            toolUse: { toolUseId: toolCall.id, name: toolCall.name },
+          },
+        }),
+        encodeEventStreamMessage("contentBlockDelta", {
+          contentBlockIndex,
+          delta: { toolUse: { input: toolCall.arguments } },
+        }),
+        encodeEventStreamMessage("contentBlockStop", { contentBlockIndex }),
+      );
+    });
+
+    // The buffered terminal events (messageStop, metadata) travel with the
+    // tool events on the normal path, so they must follow here as well.
+    for (const finalEvent of this.bedrockState.pendingFinalEvents) {
+      const event = finalEvent as BedrockStreamEventWithRaw;
+      if (event.__rawBytes) {
+        result.push(event.__rawBytes);
+      } else if ("messageStop" in event && event.messageStop) {
+        result.push(encodeEventStreamMessage("messageStop", event.messageStop));
+      } else if ("metadata" in event && event.metadata) {
+        result.push(encodeEventStreamMessage("metadata", event.metadata));
+      }
+    }
+    return result;
+  }
+
+  formatCompleteTextSSE(text: string): Uint8Array[] {
+    this.replacedText = text;
+    // AWS Event Stream binary format
+    return [
+      encodeEventStreamMessage("contentBlockStart", {
+        contentBlockIndex: 0,
+        start: { text: "" },
+      }),
+      encodeEventStreamMessage("contentBlockDelta", {
+        contentBlockIndex: 0,
+        delta: { text },
+      }),
+      encodeEventStreamMessage("contentBlockStop", {
+        contentBlockIndex: 0,
+      }),
+    ];
+  }
+
+  formatEndSSE(): string | Uint8Array {
+    // On the normal path, messageStop and metadata are passed through in
+    // processChunk. On a refusal they were buffered with the blocked tool
+    // events and discarded, so synthesize the terminal here or the client
+    // never sees a stream end.
+    if (this.replacedText !== null) {
+      const messageStop = encodeEventStreamMessage("messageStop", {
+        stopReason: "end_turn",
+      });
+      const metadata = encodeEventStreamMessage("metadata", {
+        usage: {
+          inputTokens: this.state.usage?.inputTokens ?? 0,
+          outputTokens: this.state.usage?.outputTokens ?? 0,
+        },
+      });
+      const terminal = new Uint8Array(messageStop.length + metadata.length);
+      terminal.set(messageStop, 0);
+      terminal.set(metadata, messageStop.length);
+      return terminal;
+    }
+    return "";
+  }
+
+  toProviderResponse(): BedrockResponse {
+    // Typed from the response shape itself so reasoning blocks are expressible
+    // here rather than only in the wire type.
+    const content: NonNullable<
+      NonNullable<BedrockResponse["output"]>["message"]
+    >["content"] = [];
+
+    // Reasoning first, matching the order Bedrock emits it: a reasoning block
+    // precedes the answer it produced, and a record that reordered them would
+    // not describe the turn the client saw.
+    if (this.reasoningText) {
+      content.push({
+        reasoningContent: {
+          reasoningText: {
+            text: this.reasoningText,
+            ...(this.reasoningSignature
+              ? { signature: this.reasoningSignature }
+              : {}),
+          },
+        },
+      });
+    }
+    if (this.redactedReasoning !== null) {
+      content.push({
+        reasoningContent: { redactedContent: this.redactedReasoning },
+      });
+    }
+
+    // Add text block if we have text
+    if (this.state.text) {
+      content.push({ text: this.state.text });
+    }
+
+    // A refusal does not erase what the model already said: its text streamed
+    // as it arrived and the refusal was appended after it, so the client holds
+    // both. Recording the refusal alone deletes the model's own answer from the
+    // turn, leaving anything that reads it back a turn in which it never spoke.
+    if (this.replacedText !== null) {
+      content.push({ text: this.replacedText });
+    }
+
+    // Add tool use blocks. Calls held back by the gate never reached the
+    // client, so they stay out of the record — a turn naming them would owe
+    // tool results nothing will ever send.
+    for (const toolCall of this.replacedText === null
+      ? this.state.toolCalls
+      : []) {
+      let parsedInput: Record<string, unknown> = {};
+      try {
+        parsedInput = JSON.parse(toolCall.arguments);
+      } catch {
+        // Keep empty object if parse fails
+      }
+
+      content.push({
+        toolUse: {
+          toolUseId: toolCall.id,
+          name: toolCall.name,
+          input: parsedInput,
+        },
+      });
+    }
+
+    // Build metrics if latency is available
+    const metrics =
+      this.bedrockState.latencyMs !== null
+        ? { latencyMs: this.bedrockState.latencyMs }
+        : undefined;
+
+    return {
+      $metadata: {
+        requestId: this.state.responseId,
+      },
+      output: {
+        message: {
+          role: "assistant",
+          content,
+        },
+      },
+      stopReason:
+        this.replacedText !== null
+          ? "end_turn"
+          : ((this.state.stopReason as BedrockResponse["stopReason"]) ??
+            "end_turn"),
+      usage: {
+        inputTokens: this.state.usage?.inputTokens ?? 0,
+        outputTokens: this.state.usage?.outputTokens ?? 0,
+      },
+      metrics,
+      trace: this.bedrockState.trace ?? undefined,
+    };
+  }
+
+  private consumeProtocolFilteredText(params: {
+    text: string;
+    contentBlockIndex: number;
+  }): string {
+    const combined = `${this.pendingProtocolText}${params.text}`;
+    this.pendingProtocolText = "";
+    this.pendingProtocolContentBlockIndex = null;
+
+    const { emit, pending } = splitPendingBedrockToolProtocolText(combined);
+    if (pending) {
+      this.pendingProtocolText = pending;
+      this.pendingProtocolContentBlockIndex = params.contentBlockIndex;
+    }
+    return emit;
+  }
+
+  private clearPendingProtocolText(contentBlockIndex?: number): void {
+    if (
+      this.pendingProtocolContentBlockIndex === null ||
+      contentBlockIndex === undefined ||
+      this.pendingProtocolContentBlockIndex === contentBlockIndex
+    ) {
+      this.pendingProtocolText = "";
+      this.pendingProtocolContentBlockIndex = null;
+    }
+  }
+}
+
+// =============================================================================
+// HELPER: Build Command Input
+// =============================================================================
+
+function buildBedrockCommandContext(
+  request: BedrockRequest,
+): BedrockCommandContext {
+  const cachedContext = bedrockCommandContextCache.get(request);
+  if (cachedContext) {
+    return cachedContext;
+  }
+
+  const shouldEncodeHyphens = isNovaModel(request.modelId);
+  const toolNameMapping = buildToolNameMapping(request);
+
+  const context = {
+    commandInput: {
+      modelId: request.modelId,
+      messages: prepareProviderMessages({
+        messages: request.messages,
+        mapping: toolNameMapping,
+        isNova: shouldEncodeHyphens,
+      }),
+      system: request.system?.map((s) => {
+        if ("text" in s && typeof s.text === "string") return { text: s.text };
+        return s;
+      }),
+      inferenceConfig: request.inferenceConfig,
+      additionalModelRequestFields: request.additionalModelRequestFields,
+      outputConfig: request.outputConfig,
+      // These options are native to Converse and must still reach AWS when a
+      // pool keeps a request on Bedrock because cross-wire routing is unsafe.
+      guardrailConfig: request.guardrailConfig,
+      additionalModelResponseFieldPaths:
+        request.additionalModelResponseFieldPaths,
+      promptVariables: request.promptVariables,
+      performanceConfig: request.performanceConfig,
+      requestMetadata: request.requestMetadata,
+      serviceTier: request.serviceTier,
+      toolConfig: request.toolConfig
+        ? {
+            tools: request.toolConfig.tools?.map((t) =>
+              t.cachePoint
+                ? { cachePoint: t.cachePoint }
+                : {
+                    toolSpec: t.toolSpec
+                      ? {
+                          name: t.toolSpec.name
+                            ? getProviderToolName(
+                                t.toolSpec.name,
+                                toolNameMapping,
+                                {
+                                  isNova: shouldEncodeHyphens,
+                                },
+                              )
+                            : t.toolSpec.name,
+                          description: t.toolSpec.description,
+                          inputSchema: t.toolSpec.inputSchema
+                            ? {
+                                json: t.toolSpec.inputSchema.json,
+                              }
+                            : undefined,
+                        }
+                      : undefined,
+                  },
+            ),
+            toolChoice: encodeProviderToolChoiceName({
+              toolChoice: request.toolConfig.toolChoice,
+              mapping: toolNameMapping,
+              isNova: shouldEncodeHyphens,
+            }),
+          }
+        : undefined,
+    },
+    toolNameMapping,
+  };
+
+  bedrockCommandContextCache.set(request, context);
+  return context;
+}
+
+/**
+ * Convert BedrockRequest to AWS SDK command input format.
+ * Used by both ConverseCommand and ConverseStreamCommand.
+ * Maps tool names to provider-safe names and decodes them after Bedrock returns.
+ */
+export function getCommandInput(request: BedrockRequest): BedrockCommandInput {
+  return buildBedrockCommandContext(request).commandInput;
+}
+
+// =============================================================================
+// HELPER: Sampling-parameter fallback
+// =============================================================================
+
+// Maps the canonical sampling-param names to Bedrock's `inferenceConfig` keys
+// (Bedrock uses camelCase `topP`).
+const BEDROCK_INFERENCE_KEY: Record<SamplingParam, "temperature" | "topP"> = {
+  temperature: "temperature",
+  top_p: "topP",
+};
+
+/**
+ * Return a copy of the command input with the rejected sampling params removed
+ * from `inferenceConfig`, dropping `inferenceConfig` entirely once it's empty.
+ * Returns null when none were set. Passed to the shared
+ * {@link withSamplingParamFallback}.
+ */
+function stripBedrockSamplingParams(
+  commandInput: BedrockCommandInput,
+  rejected: SamplingParam[],
+): BedrockCommandInput | null {
+  const inferenceConfig = commandInput.inferenceConfig;
+  if (!inferenceConfig) return null;
+  const keys = rejected
+    .map((p) => BEDROCK_INFERENCE_KEY[p])
+    .filter((k) => inferenceConfig[k] !== undefined);
+  if (keys.length === 0) return null;
+  const next = { ...inferenceConfig };
+  for (const k of keys) delete next[k];
+  return {
+    ...commandInput,
+    inferenceConfig: Object.keys(next).length > 0 ? next : undefined,
+  };
+}
+
+// =============================================================================
+// HELPER: Structured-output fallback
+// =============================================================================
+
+/**
+ * Run a Converse call and, when the model rejects `outputConfig` because it has
+ * no structured output support, run it once more without the field. The answer
+ * is then unconstrained, which is what the caller got before the proxy forwarded
+ * the constraint. A schema error from a model that supports the field is not
+ * retried.
+ *
+ * When the retry is accepted, the field is also removed from `request`: the
+ * caller stores that object as the request sent to the model, and a later
+ * attempt with it must not send the refused field again.
+ */
+async function withOutputConfigFallback<TResult>(params: {
+  request: BedrockRequest;
+  input: BedrockCommandInput;
+  run: (input: BedrockCommandInput) => Promise<TResult>;
+}): Promise<TResult> {
+  const { request, input, run } = params;
+  try {
+    return await run(input);
+  } catch (error) {
+    if (!input.outputConfig || !isUnsupportedOutputConfigError(error)) {
+      throw error;
+    }
+    logger.warn(
+      { provider: "bedrock", modelId: input.modelId },
+      "[llm-proxy] model has no structured output support; retrying without outputConfig",
+    );
+    const result = await run({ ...input, outputConfig: undefined });
+    delete request.outputConfig;
+    bedrockCommandContextCache.delete(request);
+    return result;
+  }
+}
+
+/**
+ * True only for Bedrock's refusal of the field itself: "This model doesn't
+ * support the outputConfig field." An error about the schema inside the field,
+ * such as an unsupported keyword, comes from a model that enforces schemas and
+ * must reach the caller.
+ */
+function isUnsupportedOutputConfigError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { statusCode, message, responseBody } = error as {
+    statusCode?: number;
+    message?: string;
+    responseBody?: string;
+  };
+  if (statusCode !== 400) return false;
+  return UNSUPPORTED_OUTPUT_CONFIG_PATTERN.test(
+    `${message ?? ""} ${responseBody ?? ""}`,
+  );
+}
+
+const UNSUPPORTED_OUTPUT_CONFIG_PATTERN =
+  /model (?:doesn['’]t|does not) support the outputConfig field/i;
+
+// =============================================================================
+// ADAPTER FACTORY
+// =============================================================================
+
+export const bedrockAdapterFactory: LLMProvider<
+  BedrockRequest,
+  BedrockResponse,
+  BedrockMessages,
+  BedrockStreamEvent,
+  BedrockHeaders
+> = {
+  provider: "bedrock",
+  interactionType: "bedrock:converse",
+  // Bedrock's custom SigV4 client (BedrockClient) can't self-instrument the
+  // request-duration metric the way fetch/Gemini transports do, so the LLM
+  // proxy handler records `llm_request_duration_seconds` on its behalf.
+  recordRequestDurationInHandler: true,
+
+  createRequestAdapter(
+    request: BedrockRequest,
+  ): LLMRequestAdapter<BedrockRequest, BedrockMessages> {
+    return new BedrockRequestAdapter(request);
+  },
+
+  createResponseAdapter(
+    response: BedrockResponse,
+  ): LLMResponseAdapter<BedrockResponse> {
+    return new BedrockResponseAdapter(response);
+  },
+
+  createStreamAdapter(
+    request?: BedrockRequest,
+  ): LLMStreamAdapter<BedrockStreamEvent, BedrockResponse> {
+    const adapter = new BedrockStreamAdapter();
+    if (request) {
+      const { toolNameMapping } = buildBedrockCommandContext(request);
+      adapter.setToolNameMapping(toolNameMapping);
+    }
+    return adapter;
+  },
+
+  // TODO: currently extracts only bearer
+  extractApiKey(headers: BedrockHeaders): string | undefined {
+    // Extract Bearer token from Authorization header
+    const authHeader = headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+      return authHeader.slice(7);
+    }
+    return undefined;
+  },
+
+  getBaseUrl(): string | undefined {
+    return config.llm.bedrock.baseUrl || undefined;
+  },
+
+  spanName: "chat",
+
+  createClient(
+    apiKey: string | undefined,
+    options?: CreateClientOptions,
+  ): BedrockClient {
+    logger.info(
+      { hasApiKey: !!apiKey, apiKeyLength: apiKey?.length },
+      "[BedrockAdapter] createClient called",
+    );
+    return buildBedrockClient({
+      apiKey: apiKey ?? null,
+      baseUrl: options?.baseUrl,
+      fetch: fetchWithAbortSignal(
+        fetchWithLlmUpstreamDispatcher,
+        options?.abortSignal,
+      ),
+    });
+  },
+
+  async execute(
+    client: unknown,
+    request: BedrockRequest,
+  ): Promise<BedrockResponse> {
+    const bedrockClient = client as BedrockClient;
+    const { commandInput, toolNameMapping } =
+      buildBedrockCommandContext(request);
+
+    // Use fetch-based client.converse(), retrying without sampling params the
+    // model rejects (e.g. "`temperature` is deprecated for this model.").
+    const response = await withSamplingParamFallback({
+      input: commandInput,
+      strip: stripBedrockSamplingParams,
+      logContext: { provider: "bedrock", modelId: commandInput.modelId },
+      run: (input) =>
+        withOutputConfigFallback({
+          request,
+          input,
+          run: (attempt) => bedrockClient.converse(request.modelId, attempt),
+        }),
+    });
+
+    // Convert response to our internal format with decoded tool names.
+    // Reasoning blocks are carried by reference: only tool names need decoding,
+    // and dropping them would strip extended thinking from the answer and cost
+    // the client the signature it has to echo back on the next turn.
+    const outputContent: Array<
+      | { text: string }
+      | {
+          toolUse: {
+            toolUseId: string;
+            name: string;
+            input: Record<string, unknown>;
+          };
+        }
+      | BedrockReasoningContentBlock
+    > = [];
+    if (response.output?.message?.content) {
+      for (const c of response.output.message.content) {
+        if (isTextBlock(c)) {
+          const text = stripBedrockToolProtocolSentinels(c.text);
+          if (text) {
+            outputContent.push({ text });
+          }
+        } else if (isToolUseBlock(c)) {
+          outputContent.push({
+            toolUse: {
+              toolUseId: c.toolUse.toolUseId ?? "",
+              name: decodeToolName(c.toolUse.name ?? "", toolNameMapping),
+              input: (c.toolUse.input ?? {}) as Record<string, unknown>,
+            },
+          });
+        } else if (isReasoningContentBlock(c)) {
+          outputContent.push(c);
+        }
+      }
+    }
+
+    return {
+      $metadata: {
+        requestId: response.$metadata?.requestId,
+      },
+      output: {
+        message: response.output?.message
+          ? {
+              role: "assistant",
+              content: outputContent,
+            }
+          : undefined,
+      },
+      stopReason: response.stopReason as BedrockResponse["stopReason"],
+      usage: {
+        inputTokens: response.usage?.inputTokens ?? 0,
+        outputTokens: response.usage?.outputTokens ?? 0,
+        // Preserve cache usage so getUsage() can report it on the non-streaming
+        // path; cacheDetails carries the per-TTL write split for 1h cost.
+        cacheReadInputTokens: response.usage?.cacheReadInputTokens,
+        cacheWriteInputTokens: response.usage?.cacheWriteInputTokens,
+        cacheDetails: response.usage?.cacheDetails,
+      },
+      metrics: response.metrics,
+      additionalModelResponseFields: response.additionalModelResponseFields as
+        | Record<string, unknown>
+        | undefined,
+      trace: response.trace,
+    };
+  },
+
+  async executeStream(
+    client: unknown,
+    request: BedrockRequest,
+  ): Promise<AsyncIterable<BedrockStreamEventWithRaw>> {
+    const bedrockClient = client as BedrockClient;
+    const { commandInput } = buildBedrockCommandContext(request);
+
+    // Use fetch-based client.converseStream() - returns events with __rawBytes
+    // already set. Retry without sampling params the model rejects (e.g.
+    // "`temperature` is deprecated for this model.").
+    return withSamplingParamFallback({
+      input: commandInput,
+      strip: stripBedrockSamplingParams,
+      logContext: { provider: "bedrock", modelId: commandInput.modelId },
+      run: (input) =>
+        withOutputConfigFallback({
+          request,
+          input,
+          run: (attempt) =>
+            bedrockClient.converseStream(request.modelId, attempt),
+        }),
+    });
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    // Bedrock returns ValidationException with per-model messages for
+    // context overflow: "Input is too long for requested model.",
+    // "prompt is too long: X tokens > Y maximum." (Claude on Bedrock),
+    // or "model_context_window_exceeded" on some Nova models. No structured
+    // code — read the SDK error's name + message.
+    if (!error || typeof error !== "object") return undefined;
+    const awsError = error as {
+      name?: string;
+      message?: string;
+      statusCode?: number;
+      responseBody?: string;
+    };
+    // The fetch-based Bedrock client throws a plain Error with statusCode and
+    // responseBody, whereas the SDK throws a named ValidationException.
+    const isValidationError =
+      awsError.name === BedrockErrorTypes.VALIDATION ||
+      (awsError.statusCode === 400 &&
+        (awsError.responseBody?.includes("ValidationException") ||
+          awsError.message?.startsWith("Bedrock API error (400):")));
+    if (!isValidationError) return undefined;
+    const msg = awsError.message?.toLowerCase() ?? "";
+    if (
+      msg.includes("too long") ||
+      msg.includes("model_context_window_exceeded")
+    ) {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return undefined;
+  },
+
+  extractErrorMessage(error: unknown): string {
+    // Handle AWS SDK error format
+    if (error && typeof error === "object") {
+      const awsError = error as {
+        message?: string;
+        $metadata?: { httpStatusCode?: number };
+        name?: string;
+      };
+      if (awsError.message) {
+        return awsError.message;
+      }
+      if (awsError.name) {
+        return `AWS Error: ${awsError.name}`;
+      }
+    }
+
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return "Internal server error";
+  },
+};
+
+/** Rewritten arguments arrive as the JSON string the model emitted; this wire
+ * shape carries them as an object. A repaired call always parses (the planner
+ * refuses to rewrite otherwise), so the fallback is defensive only. */
+function parseArgs(argumentsJson: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(argumentsJson);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The content the runtime reads for a Bedrock tool result: its first block.
+ * `structured` is false for text, whose JSON the adapter parsed.
+ */
+function sentToolResultContent(toolResult: {
+  content?: Array<Record<string, unknown>>;
+}): { content: unknown; structured: boolean } {
+  if (!toolResult.content || toolResult.content.length === 0) {
+    return { content: undefined, structured: false };
+  }
+  const firstContent = toolResult.content[0];
+  if ("text" in firstContent && firstContent.text) {
+    try {
+      return {
+        content: JSON.parse(firstContent.text as string),
+        structured: false,
+      };
+    } catch {
+      return { content: firstContent.text, structured: false };
+    }
+  }
+  if ("json" in firstContent) {
+    return { content: firstContent.json, structured: true };
+  }
+  return { content: firstContent, structured: true };
+}
+
+/** How the runtime is handed a result: text as is, anything else as JSON. */
+function approvedMatches(params: {
+  sent: { content: unknown; structured: boolean };
+  approved: string;
+}): boolean {
+  const { content, structured } = params.sent;
+  if (typeof content === "string") return params.approved === content;
+  return structured
+    ? isApprovedAsSent({ sent: content, approved: params.approved })
+    : params.approved === JSON.stringify(content);
+}

@@ -1,0 +1,798 @@
+import { TimeInMs } from "@archestra/shared";
+import KeyvPostgres from "@keyv/postgres";
+import { type SQL, sql } from "drizzle-orm";
+import Keyv, { type KeyvStoreAdapter } from "keyv";
+import config from "@/config";
+import db, { type Transaction } from "@/database";
+import { buildPgConnectionConfig } from "@/database/rds-iam";
+import logger from "@/logging";
+import CacheEntryModel from "@/models/cache-entry";
+
+export { LRUCacheManager } from "@/in-memory-lru-cache";
+
+/**
+ * Predefined cache key prefixes for the distributed cache.
+ *
+ * These prefixes categorize cache entries and enable efficient invalidation
+ * of related entries using deleteByPrefix().
+ */
+export const CacheKey = {
+  OpenAppaHitlSummary: "openappa-hitl-summary",
+  /** Policy repository pull request results checked, and repositories that refused a check. */
+  OpenAppaPolicyCheck: "openappa-policy-check",
+  ClientConnection: "client-connection",
+  ClientConnectionRateLimit: "client-connection-rate-limit",
+  DesktopDeviceSignIn: "desktop-device-sign-in",
+  DesktopDeviceSignInRateLimit: "desktop-device-sign-in-rate-limit",
+  DesktopMcpInstallAttempt: "desktop-mcp-install-attempt",
+  /** models.dev sync tracking */
+  ModelsDevSync: "models-dev-sync",
+  /** Recent scheduled model sync attempt for an LLM provider API key */
+  LlmModelSyncAttempt: "llm-model-sync-attempt",
+  /** MCP tools for chat feature */
+  ChatMcpTools: "chat-mcp-tools",
+  /** Last verified provider tool-token count, bounded to one slot per gateway. */
+  McpToolTokenCount: "mcp-tool-token-count",
+  /** Deduplication for processed emails */
+  ProcessedEmail: "processed-email",
+  /** Rate limiting for webhooks */
+  WebhookRateLimit: "webhook-rate-limit",
+  /** OAuth flow state during authentication */
+  OAuthState: "oauth-state",
+  /** Token endpoint requests, before verifying client credentials. */
+  OAuthTokenRateLimit: "oauth-token-rate-limit",
+  /** Gateway authentication attempts and recent validated-pair exemptions. */
+  McpGatewayRateLimit: "mcp-gateway-rate-limit",
+  /** GitHub Actions OIDC token ids already exchanged, until they expire. */
+  GitHubActionsTokenJti: "github-actions-token-jti",
+  /** GitHub Actions token exchange requests, before verifying the OIDC token. */
+  GitHubActionsTokenRateLimit: "github-actions-token-rate-limit",
+  /** Workload identity token exchange requests, before verifying the OIDC token. */
+  WorkloadIdentityTokenRateLimit: "workload-identity-token-rate-limit",
+  /** MCP Gateway session state */
+  McpSession: "mcp-session",
+  /** Legacy HTTP+SSE stream records for the MCP Gateway */
+  LegacySseSession: "legacy-sse-session",
+  /** Short-lived replies waiting for a legacy SSE stream on another replica */
+  LegacySseMessages: "legacy-sse-messages",
+  /** Who an in-band gateway request (a form) was sent to, readable by every replica */
+  McpGatewayPendingRequest: "mcp-gateway-pending-request",
+  /** A client's answer to an in-band gateway request, waiting for the replica that sent it */
+  McpGatewayParkedAnswer: "mcp-gateway-parked-answer",
+  /** IdP groups cache during login flow */
+  IdpGroups: "idp-groups",
+  /** Chat stream stop signal for cross-pod abort */
+  ChatStop: "chat-stop",
+  /** Maps a conversation to the id of its currently-running chat stream */
+  ChatActiveStream: "chat-active-stream",
+  /** Pending MCP elicitation responses from the chat UI */
+  ChatMcpElicitation: "chat-mcp-elicitation",
+  /** Chat MCP elicitations still waiting for an answer (consume-once) */
+  ChatMcpElicitationPending: "chat-mcp-elicitation-pending",
+  /** Native OpenAPPA questions issued by this proxy and not answered yet */
+  OpenAppaNativeQuestion: "openappa-native-question",
+  /** Original choices behind an ordinary native question, retained for replay. */
+  NativeUserQuestion: "native-user-question",
+  /** Single-card choices and provenance, isolated from older grouped-only decoders. */
+  NativeUserQuestionPresentation: "native-question-presentation",
+  /** The LLM session and user behind an MCP tool call the proxy handed a client, for the gateway that runs it */
+  LlmToolCallSession: "llm-tool-call-session",
+  /** The proxy session behind a yell call it allowed, for the gateway that runs it (consume-once) */
+  OpenAppaYellSession: "openappa-yell-session",
+  /** Sessions the proxy admitted as unattended, for the gateway's Break the glass review waiver */
+  OpenAppaUnattendedSession: "openappa-unattended-session",
+  OpenAppaYellResult: "openappa-yell-result",
+  /** The chat a Cursor subagent's subagents belong to, for the hook steps Cursor sends for them */
+  CursorSubagentRoot: "cursor-subagent-root",
+  /** Offers Guardrails made for calls of Cursor's own tools, whose results a hook cannot withhold */
+  CursorOwnToolOffer: "cursor-own-tool-offer",
+  /** Cursor chats whose model saw a result that Guardrails had to withhold */
+  CursorUnvouchedChat: "cursor-unvouched-chat",
+  /** Calls a Cursor subagent has open, which the end of the main agent's loop must not close */
+  CursorSubagentOpenCall: "cursor-subagent-open-call",
+  /** Cursor chats in which a subagent called a tool lately */
+  CursorSubagentActive: "cursor-subagent-active",
+  /** Guardrails marks a Cursor chat's model was told to show and has not shown yet */
+  CursorOwedMarks: "cursor-owed-marks",
+  /** Cursor chats whose model was already told to show the session mark */
+  CursorSessionMarkAsked: "cursor-session-mark-asked",
+  /** Cursor subagents that were already told to show their marks */
+  CursorSubagentMarkAsked: "cursor-subagent-mark-asked",
+  /** The Cursor chat and call that a web tool's CLI process reports for */
+  CursorWebCall: "cursor-web-call",
+  /** The Cursor chat that owns a disconnect reference, and that chat's exemption */
+  CursorDisconnectChat: "cursor-disconnect-chat",
+  /** OpenAPPA reviews waiting for a native client question */
+  OpenAppaHitlReview: "openappa-hitl-review",
+  /** One-use rulings returned by a native client question */
+  OpenAppaHitlRuling: "openappa-hitl-ruling",
+  /** review_required results the proxy already asked the client to put to the user, once each */
+  OpenAppaHitlQuestionAsked: "openappa-hitl-question-asked",
+  /** Per-call server-issued review status, for history only; never a ruling. */
+  OpenAppaHitlReviewHistory: "openappa-hitl-review-history",
+  /** Canonical result text replayed on later requests. Keep the deployed preview's
+   * namespace so upgrading a live conversation does not rewrite its earlier results. */
+  OpenAppaHitlReviewContinuation: "openappa-hitl-page-continuation",
+  /** Sessions already told once to resend a request that lacked the gateway remedy tools */
+  OpenAppaRemedyToolsMissing: "openappa-remedy-tools-missing",
+  /** Ruling on a call to a tool the client had not loaded, answered on that call's result */
+  OpenAppaNotLoadedRuling: "openappa-not-loaded-ruling",
+  /** Ruling an undeclared notice call carried, as the client can act on it, answered on that call's result */
+  OpenAppaCarriedRuling: "openappa-carried-ruling",
+  /** Notice for a call whose annotator gave no answer, answered on that call's result */
+  OpenAppaUnansweredAnnotationNotice: "openappa-unanswered-annotation-notice",
+  /** Host clarification appended to a runtime-confirmed denied call's result. */
+  OpenAppaDeniedCallClarification: "openappa-denied-call-clarification",
+  /** How many results followed a ruling when its remedy continuation was last delivered. */
+  OpenAppaRemedyContinuationDelivered: "openappa-remedy-continuation-delivered",
+  /** Sessions whose client already waited once for the gateway remedy tools to load */
+  OpenAppaRemedyToolsAwaited: "openappa-remedy-tools-awaited",
+  /** OpenAI credentials that cannot generate reasoning summaries (unverified org) */
+  OpenaiReasoningSummaryUnsupported: "openai-reasoning-summary-unsupported",
+  /** Channel discovery TTL per workspace */
+  ChannelDiscovery: "channel-discovery",
+  /** Admission and failure cooldown, not cleared by manual freshness refresh. */
+  ChannelDiscoveryLease: "channel-scan-lease",
+  /** Slack user ID → email mapping */
+  SlackUserEmail: "slack-user-email",
+  /** Virtual API key brute-force rate limiting per IP */
+  VirtualKeyRateLimit: "virtual-key-rate-limit",
+  /** Connection-setup script token brute-force rate limiting per IP */
+  ConnectionSetupScriptRateLimit: "connection-setup-script-rate-limit",
+  /** First native conversation to present a verified setup reference */
+  ConnectionSetupConversation: "connection-setup-conversation",
+  /** Archestra VAF Add On package and script rate limiting per IP */
+  MfilesVafAddOnPackageRateLimit: "mfiles-vaf-add-on-package-rate-limit",
+  /** Resolved release pin (package URL + ref) for the Archestra VAF Add On installer */
+  MfilesVafAddOnReleasePin: "mfiles-vaf-add-on-release-pin",
+  ConnectionHealthRateLimit: "connection-health-rate-limit",
+  /** GitHub Copilot device-flow sign-in rate limiting per user */
+  GithubCopilotDeviceAuthRateLimit: "github-copilot-device-auth-rate-limit",
+  /** Microsoft 365 Copilot device-flow sign-in rate limiting per user */
+  Microsoft365CopilotDeviceAuthRateLimit:
+    "microsoft-365-copilot-device-auth-rate-limit",
+  /** ChatGPT/Codex subscription device-flow sign-in rate limiting per user */
+  OpenaiCodexDeviceAuthRateLimit: "openai-codex-device-auth-rate-limit",
+  /** SuperGrok subscription device-flow sign-in rate limiting per user */
+  XaiSubscriptionDeviceAuthRateLimit: "xai-subscription-device-auth-rate-limit",
+  /** RUM event-batch ingest rate limiting per user */
+  RumIngestRateLimit: "rum-ingest-rate-limit",
+  /** Slack missing-scope notification throttle per workspace */
+  SlackScopeNotification: "slack-scope-notification",
+  SlackAppInstallState: "slack-app-install-state",
+  /** Organization-scoped settings cache */
+  OrganizationSettings: "organization-settings",
+  /** Most active users in an organization's LLM logs, for the logs user filter */
+  InteractionUserOptions: "interaction-user-options-v3",
+  /** Per-user group-token resolution for auto-sync-permissions KB connectors */
+  KbGroupTokens: "kb-group-tokens",
+  /** Cross-pass upstream identity lookups (account id → email/profile) for KB permission sync */
+  KbConnectorIdentity: "kb-connector-identity",
+  /** Files of the MS Teams message that triggered an agent-selection card, replayed once the agent is picked */
+  TeamsAgentSelectionAttachments: "teams-agent-selection-attachments",
+  /** An MS Teams group-chat message held until its sender signs in so the bot can read its files */
+  TeamsFileSignIn: "teams-file-sign-in",
+  /** OAuth state (PKCE verifier) of an MS Teams file sign-in in progress */
+  TeamsFileSignInState: "teams-file-sign-in-state",
+  /** Page URL of an MS Teams channel's files folder, learned from a sender's sign-in */
+  TeamsChannelFilesFolder: "teams-channel-files-folder",
+  /** MS Teams channel threads where the bot was @mentioned (sticky auto-reply) */
+  JiraThreadActive: "jira-thread-active",
+  TeamsThreadActive: "teams-thread-active",
+  /** Slack channel threads where the bot was @mentioned (sticky auto-reply) */
+  SlackThreadActive: "slack-thread-active",
+  /** MS Teams channel threads that already got the one-time "you can mute me" hint */
+  JiraThreadMuteHint: "jira-thread-mute-hint",
+  TeamsThreadMuteHint: "teams-thread-mute-hint",
+  /** Slack channel threads that already got the one-time "you can mute me" hint */
+  SlackThreadMuteHint: "slack-thread-mute-hint",
+  /** Latest mute token per MS Teams channel thread (cross-pod in-flight reply suppression) */
+  JiraThreadMuteMarker: "jira-thread-mute-marker",
+  TeamsThreadMuteMarker: "teams-thread-mute-marker",
+  /** Latest mute token per Slack channel thread (cross-pod in-flight reply suppression) */
+  SlackThreadMuteMarker: "slack-thread-mute-marker",
+  /** MS Teams channel threads muted while the channel answers all messages */
+  JiraThreadMuted: "jira-thread-muted",
+  TeamsThreadMuted: "teams-thread-muted",
+  /** Slack channel threads muted while the channel answers all messages */
+  SlackThreadMuted: "slack-thread-muted",
+  /** Per-channel "answer all messages" flag, briefly cached to spare the gate a DB read per message */
+  ChatOpsChannelAnswerAll: "chatops-channel-answer-all",
+  ChatOpsReplyAnchor: "chatops-reply-anchor",
+  ChatOpsRuntimeAcknowledgement: "chatops-runtime-acknowledgement",
+  /** MS Teams thread-format team id → aadGroupId, so the gate resolves it without a Bot Framework call per message */
+  TeamsTeamAadGroupId: "teams-team-aad-group-id",
+  /** MS Teams teams that have delivered an un-mentioned channel message — proof the RSC consent for reading channel messages exists */
+  TeamsUnmentionedChannelTraffic: "teams-unmentioned-channel-traffic",
+  /** Telegram approval-button payloads (callback_data is capped at 64 bytes) */
+  TelegramApprovalCallback: "chatops-telegram-approval",
+  /** One-shot codes linking a Telegram chat to a signed-in user */
+  TelegramLinkCode: "chatops-telegram-link",
+  /** Positive "this chat session is an encrypted chat" lookups for LLM proxy redaction */
+  /**
+   * v2: entries changed from a bare `true` to a facts object (fingerprint +
+   * escrow presence). The suffix is load-bearing — the cache is Postgres-backed
+   * and shared across replicas, so during a rolling deploy new code must not
+   * read an old boolean and mistake it for "not an encrypted chat".
+   */
+  EncryptedChatSession: "encrypted-chat-session-v2",
+  /** Arguments behind a Slack approval's "View arguments" button (a button value is capped at 2,000 chars) */
+  SlackApprovalArguments: "chatops-slack-approval-arguments",
+  /**
+   * Protected runtime files pinned for a parent session while their runtime
+   * was mid-call, one entry per runtime session. Any replica serving the
+   * runtime's next request releases them; any replica serving the parent's
+   * next call reads them.
+   */
+  AgentRuntimePendingExports: "agent-runtime-pending-exports-v1",
+  /** Model pool members sitting out after a failure, shared by every replica. */
+  ModelPoolBench: "model-pool-bench",
+  /**
+   * Workspace transfer tickets: minted by whichever replica serves the tool
+   * or API call, redeemed by whichever one the public content URL reaches.
+   */
+  AgentWorkspaceTransferTicket: "agent-workspace-transfer-ticket-v1",
+  /**
+   * Short-lived one-time credential grants minted by transfer_credential({ ephemeral: true })
+   * and redeemed by start_agent_run on whichever replica handles the request.
+   */
+  EphemeralCredentialGrant: "ephemeral-credential-grant-v1",
+  /**
+   * Distributed per-caller subagent load-balancer rotation state shared across backend pods.
+   */
+  SubagentLoadBalancer: "subagent-load-balancer-v1",
+  /**
+   * MCP File Uploads extension: an upload the gateway asked a caller for, the
+   * upstream state its retry resumes, and each relayed file target.
+   */
+  McpFileUploadSession: "mcp-file-upload-session-v1",
+  McpFileUploadRelay: "mcp-file-upload-relay-v1",
+  McpFileUploadRelayDone: "mcp-file-upload-relay-done-v1",
+} as const;
+
+export type CacheKeyPrefix = (typeof CacheKey)[keyof typeof CacheKey];
+
+/**
+ * Allowed cache key format: either a base prefix or prefix with suffix.
+ *
+ * Examples:
+ * - "get-chat-models" (just the prefix)
+ * - "oauth-state-abc123" (prefix with unique identifier)
+ * - "sso-groups-provider:user@example.com" (prefix with composite key)
+ */
+export type AllowedCacheKey =
+  | `${CacheKeyPrefix}`
+  | `${CacheKeyPrefix}-${string}`;
+
+type TransactionalCache = Pick<
+  CacheManager,
+  "get" | "set" | "delete" | "getAndDelete" | "getAndDeleteMany"
+>;
+
+/**
+ * PostgreSQL-based cache manager for distributed caching using Keyv.
+ *
+ * Provides a simple key-value store with TTL support using the @keyv/postgres adapter.
+ * All cache operations are automatically shared across all application pods.
+ *
+ * Features:
+ * - Automatic TTL expiration (handled by Keyv)
+ * - JSONB storage for flexible value types
+ * - Upsert semantics (set overwrites existing keys)
+ * - Connection pooling via @keyv/postgres
+ */
+class CacheManager {
+  private keyv: Keyv | null = null;
+  private defaultTtl = TimeInMs.Hour;
+  private isShuttingDown = false;
+
+  /**
+   * Start the cache manager by initializing the Keyv connection.
+   * Should be called once during server startup.
+   *
+   * @param store - Keyv storage for the `keyv_cache` table. Defaults to the
+   * PostgreSQL adapter; tests pass one bound to their in-process database.
+   */
+  start(store?: KeyvStoreAdapter): void {
+    if (this.keyv) {
+      return;
+    }
+
+    this.isShuttingDown = false;
+    this.keyv = new Keyv({
+      store: store ?? createPostgresStore(),
+      // Let this wrapper decide which operations may fall back to a cache miss.
+      throwOnErrors: true,
+    });
+
+    this.keyv.on("error", (err) => {
+      if (!this.isShuttingDown) {
+        logger.error({ err }, "CacheManager: Keyv connection error");
+      }
+    });
+
+    logger.debug("CacheManager: Started with Keyv PostgreSQL storage");
+  }
+
+  /**
+   * SQL that is true while a live entry is stored under `${prefix}-${id}`,
+   * for queries that must skip rows whose entry has not expired. `id` is a
+   * text SQL expression, usually a column. Entries are JSON text with an
+   * epoch-millisecond `expires`; one without it never expires.
+   *
+   * This reads Keyv's stored envelope (`{"value": ..., "expires": <ms>}`),
+   * the format incrementFixedWindows also writes. If a Keyv upgrade renamed
+   * `expires`, every entry would look live forever. The model sync schedule
+   * tests write their markers through `set` and expect a retry once the TTL
+   * passes, so they fail on such a change.
+   */
+  liveEntryExists(params: { prefix: CacheKeyPrefix; id: SQL; now: Date }): SQL {
+    const { prefix, id, now } = params;
+    return sql`EXISTS (
+      SELECT 1 FROM keyv_cache
+      WHERE keyv_cache.key = ${`keyv:${prefix}-`} || ${id}
+        AND coalesce((keyv_cache.value::jsonb ->> 'expires')::numeric > ${now.getTime()}, true)
+    )`;
+  }
+
+  /**
+   * Get a value from the cache.
+   * Returns undefined if the key doesn't exist or has expired.
+   *
+   * By default, returns undefined on error rather than throwing. This is intentional:
+   * cache reads are non-critical and callers should handle cache misses gracefully.
+   * A failed cache read should fall through to the underlying data source.
+   * Use throwOnError for state that has no underlying fallback.
+   */
+  async get<T>(
+    key: AllowedCacheKey,
+    options?: { throwOnError?: boolean },
+  ): Promise<T | undefined> {
+    if (!this.keyv) {
+      if (options?.throwOnError) throw new Error("CacheManager: Not started");
+      logger.warn("CacheManager: Not started, returning undefined for get");
+      return undefined;
+    }
+
+    try {
+      const value = await this.keyv.get(key);
+      return value as T | undefined;
+    } catch (error) {
+      logger.error({ error, key }, "CacheManager: Error getting cache entry");
+      if (options?.throwOnError) throw error;
+      return undefined;
+    }
+  }
+
+  /**
+   * Set a value in the cache with optional TTL.
+   * If the key already exists, it will be overwritten.
+   *
+   * Note: Unlike get() and delete(), this method throws on error rather than
+   * returning a fallback value. This is intentional: a failed cache write for
+   * critical data (like OAuth state or SSO groups) could cause security issues
+   * if the caller assumes the data was cached. Callers should handle the error
+   * or let it propagate to fail the operation.
+   *
+   * @param key - Cache key
+   * @param value - Value to store (will be serialized as JSON)
+   * @param ttl - Time-to-live in milliseconds (defaults to 1 hour)
+   */
+  async set<T>(
+    key: AllowedCacheKey,
+    value: T,
+    ttl?: number,
+  ): Promise<T | undefined> {
+    if (!this.keyv) {
+      throw new Error("CacheManager: Not started");
+    }
+
+    try {
+      await this.keyv.set(key, value, ttl ?? this.defaultTtl);
+      return value;
+    } catch (error) {
+      logger.error({ error, key }, "CacheManager: Error setting cache entry");
+      throw error;
+    }
+  }
+
+  /**
+   * Delete a value from the cache.
+   * Returns true if the operation succeeded.
+   *
+   * By default, returns false on error because most cache deletes are
+   * best-effort cleanup. Pass `throwOnError` when a failed delete would leave
+   * security- or lifecycle-sensitive state claimable.
+   */
+  async delete(
+    key: AllowedCacheKey,
+    options?: { throwOnError?: boolean },
+  ): Promise<boolean> {
+    if (!this.keyv) {
+      if (options?.throwOnError) {
+        throw new Error("CacheManager: Not started");
+      }
+      logger.warn("CacheManager: Not started, returning false for delete");
+      return false;
+    }
+
+    try {
+      return await this.keyv.delete(key);
+    } catch (error) {
+      logger.error({ error, key }, "CacheManager: Error deleting cache entry");
+      if (options?.throwOnError) throw error;
+      return false;
+    }
+  }
+
+  /**
+   * Atomically get and delete a value from the cache.
+   * Returns the value if it existed and hadn't expired, undefined otherwise.
+   *
+   * This is useful for one-time use tokens like OAuth state where you need to
+   * ensure the same token can't be used twice (prevents replay attacks).
+   *
+   * Implementation uses DELETE ... RETURNING for true atomicity - the delete
+   * and read happen in a single database operation, preventing race conditions
+   * where two requests could both read the same token before either deletes it.
+   */
+  async getAndDelete<T>(
+    key: AllowedCacheKey,
+    options?: { throwOnError?: boolean },
+  ): Promise<T | undefined> {
+    if (!this.keyv) {
+      if (options?.throwOnError) throw new Error("CacheManager: Not started");
+      logger.warn(
+        "CacheManager: Not started, returning undefined for getAndDelete",
+      );
+      return undefined;
+    }
+
+    try {
+      // Use raw SQL for atomic delete-and-return
+      // Keyv stores: key (text), value (text containing JSON with {value, expires})
+      // The key is namespaced with "keyv:" prefix by Keyv
+      // Note: expires is stored inside the JSON value, not as a separate column
+      const keyvKey = `keyv:${key}`;
+      const result = await db.execute<{ value: string }>(
+        sql`DELETE FROM keyv_cache
+            WHERE key = ${keyvKey}
+            RETURNING value`,
+      );
+
+      if (result.rows.length === 0) {
+        return undefined;
+      }
+
+      // Keyv stores values as JSON strings: {"value": <actual-value>, "expires": <timestamp>}
+      const rawValue = result.rows[0].value;
+      const parsed =
+        typeof rawValue === "string" ? JSON.parse(rawValue) : rawValue;
+
+      // Check expiration from the JSON payload
+      if (parsed.expires && Date.now() > parsed.expires) {
+        // Entry was expired, treat as not found
+        return undefined;
+      }
+
+      return parsed.value as T | undefined;
+    } catch (error) {
+      logger.error(
+        { error, key },
+        "CacheManager: Error in getAndDelete operation",
+      );
+      if (options?.throwOnError) throw error;
+      return undefined;
+    }
+  }
+
+  /** Append atomically so concurrent writers cannot overwrite each other's items. */
+  async appendToList<T>(params: {
+    key: AllowedCacheKey;
+    value: T;
+    ttl: number;
+  }): Promise<void> {
+    if (!this.keyv) throw new Error("CacheManager: Not started");
+    const now = Date.now();
+    const payload = await this.keyv.serializeData({
+      value: [params.value],
+      expires: now + params.ttl,
+    });
+    await db.execute(sql`
+      INSERT INTO keyv_cache (key, value)
+      VALUES (${`keyv:${params.key}`}, ${payload})
+      ON CONFLICT (key) DO UPDATE SET value = jsonb_set(
+        EXCLUDED.value::jsonb, '{value}',
+        CASE WHEN (keyv_cache.value::jsonb->>'expires')::bigint > ${now}
+          THEN keyv_cache.value::jsonb->'value' ELSE '[]'::jsonb END
+        || (EXCLUDED.value::jsonb->'value')
+      )::text
+    `);
+  }
+
+  /** Consume a batch by exact keys, using the existing cache primary key index. */
+  async getAndDeleteMany<T>(
+    keys: AllowedCacheKey[],
+  ): Promise<Array<{ key: AllowedCacheKey; value: T }>> {
+    if (!this.keyv) throw new Error("CacheManager: Not started");
+    if (keys.length === 0) return [];
+    const prefixed = keys.map((key) => sql`${`keyv:${key}`}`);
+    const result = await db.execute<{ key: string; value: string }>(sql`
+      DELETE FROM keyv_cache WHERE key IN (${sql.join(prefixed, sql`, `)})
+      RETURNING key, value
+    `);
+    const entries: Array<{ key: AllowedCacheKey; value: T }> = [];
+    for (const row of result.rows) {
+      const data = await this.keyv.deserializeData<T>(row.value);
+      if (
+        data?.value !== undefined &&
+        (!data.expires || data.expires > Date.now())
+      ) {
+        entries.push({
+          key: row.key.slice("keyv:".length) as AllowedCacheKey,
+          value: data.value,
+        });
+      }
+    }
+    return entries;
+  }
+
+  /** All participants must use the same scope and this transaction's cache methods. */
+  async withLock<T>(
+    scope: AllowedCacheKey,
+    callback: (cache: TransactionalCache, tx: Transaction) => Promise<T>,
+  ): Promise<T> {
+    const keyv = this.keyv;
+    if (!keyv) throw new Error("CacheManager: Not started");
+    // KeyvPostgres creates its table asynchronously; await that before direct SQL.
+    if (keyv.opts.store instanceof KeyvPostgres) {
+      await keyv.opts.store.query("SELECT 1");
+    }
+    return CacheEntryModel.withLock(scope, async (entries, tx) => {
+      const decode = async <V>(
+        raw: string | undefined,
+      ): Promise<V | undefined> => {
+        if (raw === undefined) return undefined;
+        const data = await keyv.deserializeData<V>(raw);
+        return data && (!data.expires || data.expires > Date.now())
+          ? data.value
+          : undefined;
+      };
+      const take = async <V>(keys: AllowedCacheKey[]) => {
+        const rows = await entries.take(keys.map((key) => `keyv:${key}`));
+        const values: Array<{ key: AllowedCacheKey; value: V }> = [];
+        for (const row of rows) {
+          const value = await decode<V>(row.value);
+          if (value !== undefined)
+            values.push({ key: row.key.slice(5) as AllowedCacheKey, value });
+        }
+        return values;
+      };
+      return callback(
+        {
+          get: async <V>(key: AllowedCacheKey) =>
+            decode<V>(await entries.get(`keyv:${key}`)),
+          set: async <V>(key: AllowedCacheKey, value: V, ttl?: number) => {
+            const lifetime = ttl ?? this.defaultTtl;
+            const payload = await keyv.serializeData({
+              value,
+              expires: lifetime === 0 ? undefined : Date.now() + lifetime,
+            });
+            await entries.set(
+              `keyv:${key}`,
+              typeof payload === "string" ? payload : JSON.stringify(payload),
+            );
+            return value;
+          },
+          delete: async (key: AllowedCacheKey) =>
+            (await entries.take([`keyv:${key}`])).length > 0,
+          getAndDelete: async <V>(key: AllowedCacheKey) =>
+            (await take<V>([key]))[0]?.value,
+          getAndDeleteMany: take,
+        },
+        tx,
+      );
+    });
+  }
+
+  /**
+   * Read several keys in one statement. Unlike {@link getMany}, a storage
+   * failure throws so a caller cannot treat an outage as an empty poll.
+   */
+  async readMany<T>(keys: AllowedCacheKey[]): Promise<Map<AllowedCacheKey, T>> {
+    const entries = new Map<AllowedCacheKey, T>();
+    if (!this.keyv) throw new Error("CacheManager: Not started");
+    if (keys.length === 0) return entries;
+    const rows = await CacheEntryModel.getMany(
+      keys.map((key) => `keyv:${key}`),
+    );
+    const now = Date.now();
+    for (const row of rows) {
+      const data = await this.keyv.deserializeData<T>(row.value);
+      if (data?.value === undefined) continue;
+      if (typeof data.expires === "number" && now > data.expires) continue;
+      entries.set(row.key.slice("keyv:".length) as AllowedCacheKey, data.value);
+    }
+    return entries;
+  }
+
+  /**
+   * Read several keys in one statement. Absent and expired entries are left
+   * out. Like {@link get}, a failed read is reported as misses.
+   */
+  async getMany<T>(keys: AllowedCacheKey[]): Promise<Map<AllowedCacheKey, T>> {
+    const entries = new Map<AllowedCacheKey, T>();
+    if (!this.keyv) {
+      logger.warn("CacheManager: Not started, returning no entries");
+      return entries;
+    }
+    if (keys.length === 0) return entries;
+    try {
+      const prefixed = keys.map((key) => sql`${`keyv:${key}`}`);
+      const result = await db.execute<{ key: string; value: string }>(sql`
+        SELECT key, value FROM keyv_cache
+        WHERE key IN (${sql.join(prefixed, sql`, `)})
+      `);
+      const now = Date.now();
+      for (const row of result.rows) {
+        const data = await this.keyv.deserializeData<T>(row.value);
+        if (data?.value === undefined) continue;
+        if (typeof data.expires === "number" && now > data.expires) continue;
+        entries.set(
+          row.key.slice("keyv:".length) as AllowedCacheKey,
+          data.value,
+        );
+      }
+    } catch (error) {
+      logger.error(
+        { error, keys },
+        "CacheManager: Error getting cache entries",
+      );
+      entries.clear();
+    }
+    return entries;
+  }
+
+  /**
+   * Count one event in each key's fixed window with a single atomic upsert,
+   * so concurrent writers never lose an increment. An entry whose window is
+   * still open keeps its end; an absent, ended or end-less entry starts a new
+   * window of `windowMs`. Entries are stored as
+   * `{ count, windowEndsAt }` and expire when their window ends.
+   */
+  async incrementFixedWindows(params: {
+    keys: AllowedCacheKey[];
+    windowMs: number;
+  }): Promise<void> {
+    if (!this.keyv) throw new Error("CacheManager: Not started");
+    if (params.keys.length === 0) return;
+    const now = Date.now();
+    const freshEnd = now + params.windowMs;
+    // Sorted so concurrent statements lock shared rows in the same order.
+    const rows = [...new Set(params.keys)]
+      .sort()
+      .map(
+        (key) =>
+          sql`(${`keyv:${key}`}, jsonb_build_object('value', jsonb_build_object('count', 1, 'windowEndsAt', ${freshEnd}::bigint), 'expires', ${freshEnd}::bigint)::text)`,
+      );
+    await db.execute(sql`
+      INSERT INTO keyv_cache (key, value)
+      VALUES ${sql.join(rows, sql`, `)}
+      ON CONFLICT (key) DO UPDATE SET value = CASE
+        WHEN jsonb_typeof(keyv_cache.value::jsonb #> '{value,windowEndsAt}') = 'number'
+          AND (keyv_cache.value::jsonb #>> '{value,windowEndsAt}')::numeric > ${now}
+          AND (
+            jsonb_typeof(keyv_cache.value::jsonb -> 'expires') IS DISTINCT FROM 'number'
+            OR (keyv_cache.value::jsonb ->> 'expires')::numeric >= ${now}
+          )
+        THEN jsonb_build_object(
+          'value', jsonb_build_object(
+            'count', COALESCE((keyv_cache.value::jsonb #>> '{value,count}')::numeric, 0) + 1,
+            'windowEndsAt', keyv_cache.value::jsonb #> '{value,windowEndsAt}'
+          ),
+          'expires', keyv_cache.value::jsonb #> '{value,windowEndsAt}'
+        )::text
+        ELSE EXCLUDED.value
+      END
+    `);
+  }
+
+  /** Keyv expires entries on reads; sweep abandoned entries in this namespace too. */
+  async deleteExpiredByPrefix(prefix: CacheKeyPrefix): Promise<void> {
+    const pattern = `keyv:${prefix.replace(/[\\%_]/g, "\\$&")}-%`;
+    await db.execute(sql`
+      DELETE FROM keyv_cache WHERE key LIKE ${pattern}
+      AND (value::jsonb->>'expires')::bigint <= ${Date.now()}
+    `);
+  }
+
+  /**
+   * Delete all entries with keys matching a prefix.
+   * Useful for invalidating related cache entries (e.g., all chat models cache).
+   *
+   * Uses raw SQL with LIKE pattern matching for efficient bulk deletion.
+   * Returns the number of entries deleted.
+   */
+  async deleteByPrefix(prefix: AllowedCacheKey): Promise<number> {
+    if (!this.keyv) {
+      logger.warn("CacheManager: Not started, skipping deleteByPrefix");
+      return 0;
+    }
+
+    try {
+      // Keyv namespaces keys with "keyv:" prefix. Escape LIKE metacharacters
+      // in the caller's prefix before appending the wildcard.
+      const likePattern = `keyv:${prefix.replace(/[\\%_]/g, "\\$&")}%`;
+      const result = await db.execute<{ count: string }>(
+        sql`WITH deleted AS (
+          DELETE FROM keyv_cache
+          WHERE key LIKE ${likePattern}
+          RETURNING 1
+        )
+        SELECT COUNT(*) as count FROM deleted`,
+      );
+
+      const deletedCount = Number.parseInt(result.rows[0]?.count ?? "0", 10);
+      if (deletedCount > 0) {
+        logger.info(
+          { prefix, deletedCount },
+          "CacheManager: Deleted entries by prefix",
+        );
+      }
+      return deletedCount;
+    } catch (error) {
+      logger.error({ error, prefix }, "CacheManager: Error deleting by prefix");
+      return 0;
+    }
+  }
+
+  /**
+   * Stop the cache manager and close connections.
+   * Should be called during graceful shutdown.
+   */
+  shutdown(): void {
+    this.isShuttingDown = true;
+    if (this.keyv) {
+      this.keyv.disconnect();
+      this.keyv = null;
+    }
+  }
+}
+
+export const cacheManager = new CacheManager();
+
+// === Internal helpers
+
+function createPostgresStore(): KeyvStoreAdapter {
+  const pgPoolOptions = buildPgConnectionConfig(
+    config.database.url,
+    { max: 10 },
+    {
+      iamAuthEnabled: config.database.iamAuthEnabled,
+      entraAuthEnabled: config.database.entraAuthEnabled,
+      awsRegion: config.database.awsRegion || undefined,
+    },
+  );
+  return new KeyvPostgres({
+    ...pgPoolOptions,
+    uri:
+      config.database.iamAuthEnabled || config.database.entraAuthEnabled
+        ? undefined
+        : config.database.url,
+    table: "keyv_cache",
+    max: 10,
+    /**
+     * From the PostgreSQL documentation:
+     * If specified, the table is created as an unlogged table. Data written to unlogged tables is not written to the
+     * write-ahead log (see Chapter 28), which makes them considerably faster than ordinary tables. However, they are
+     * not crash-safe: an unlogged table is automatically truncated after a crash or unclean shutdown. The contents
+     * of an unlogged table are also not replicated to standby servers. Any indexes created on an unlogged table are
+     * automatically unlogged as well.
+     *
+     * We use this to improve performance of the cache manager.
+     *
+     * https://keyv.org/docs/storage-adapters/postgres/#using-an-unlogged-table-for-performance
+     */
+    useUnloggedTable: true,
+  });
+}

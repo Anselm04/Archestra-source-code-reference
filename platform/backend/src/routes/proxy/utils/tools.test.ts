@@ -1,0 +1,507 @@
+import { afterEach } from "vitest";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import { AgentToolModel, ToolModel } from "@/models";
+import { describe, expect, test } from "@/test";
+import { persistTools } from "./tools";
+
+describe("persistTools", () => {
+  afterEach(() => {
+    // archestraMcpBranding is a process-global singleton; reset it so the
+    // branded-org test below cannot leak into other tests in this file.
+    archestraMcpBranding.syncFromOrganization(null);
+  });
+
+  test("creates new tools in bulk", async ({ makeAgent }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    const tools = [
+      {
+        toolName: "new-tool-1",
+        toolParameters: { type: "object", properties: {} },
+        toolDescription: "First tool",
+      },
+      {
+        toolName: "new-tool-2",
+        toolParameters: { type: "object", properties: {} },
+        toolDescription: "Second tool",
+      },
+      {
+        toolName: "new-tool-3",
+        toolParameters: { type: "object", properties: {} },
+        toolDescription: "Third tool",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // Verify tools were created in the tools table
+    const tool1 = await ToolModel.findByName("new-tool-1");
+    const tool2 = await ToolModel.findByName("new-tool-2");
+    const tool3 = await ToolModel.findByName("new-tool-3");
+
+    expect(tool1).not.toBeNull();
+    expect(tool2).not.toBeNull();
+    expect(tool3).not.toBeNull();
+
+    // Proxy tools should have no catalogId, no agentId, no delegateToAgentId
+    expect(tool1?.catalogId).toBeNull();
+    expect(tool1?.agentId).toBeNull();
+
+    // No agent_tools entries should be created
+    const toolIds = await AgentToolModel.findToolIdsByAgent(agent.id);
+    const proxyToolIds = [tool1?.id, tool2?.id, tool3?.id];
+    for (const id of proxyToolIds) {
+      expect(toolIds).not.toContain(id);
+    }
+  });
+
+  test("handles empty tools array without errors", async ({ makeAgent }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    // Should not throw
+    await persistTools({ tools: [], agentId: agent.id });
+  });
+
+  test("skips Archestra built-in tools", async ({ makeAgent }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    // Try to persist tools with Archestra tool names
+    const tools = [
+      {
+        toolName: "archestra__whoami", // This is an Archestra built-in tool
+        toolParameters: { type: "object" },
+        toolDescription: "Fake whoami",
+      },
+      {
+        toolName: "regular-tool",
+        toolParameters: { type: "object" },
+        toolDescription: "Regular tool",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // Only the regular tool should be created as a proxy-sniffed tool
+    const regularTool = await ToolModel.findByName("regular-tool");
+    expect(regularTool).not.toBeNull();
+    expect(regularTool?.catalogId).toBeNull();
+  });
+
+  test("skips Archestra built-ins under BOTH the default and branded prefix", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    // White-labeled org: the gateway serves built-ins as `acme_copilot__*`, but a
+    // client (e.g. chat routed through the LLM proxy) can still hand the proxy the
+    // default `archestra__*` name. BOTH are the same built-in and must be skipped —
+    // recognizing only the current brand auto-discovers the off-brand twin and, once
+    // seeding promotes it, surfaces a duplicate built-in in the catalog.
+    archestraMcpBranding.syncFromOrganization({
+      appName: "Acme Copilot",
+      iconLogo: null,
+    });
+
+    const tools = [
+      {
+        toolName: "archestra__whoami", // default prefix, core tool
+        toolParameters: { type: "object" },
+        toolDescription: "off-brand built-in",
+      },
+      {
+        toolName: "archestra__edit_file", // default prefix, the observed symptom
+        toolParameters: { type: "object" },
+        toolDescription: "off-brand built-in",
+      },
+      {
+        toolName: "acme_copilot__whoami", // branded prefix
+        toolParameters: { type: "object" },
+        toolDescription: "branded built-in",
+      },
+      {
+        toolName: "regular-tool", // a genuine external tool
+        toolParameters: { type: "object" },
+        toolDescription: "Regular tool",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // Neither prefix of a built-in may be auto-discovered…
+    expect(await ToolModel.findByName("archestra__whoami")).toBeNull();
+    expect(await ToolModel.findByName("archestra__edit_file")).toBeNull();
+    expect(await ToolModel.findByName("acme_copilot__whoami")).toBeNull();
+    // …but a real external tool still is.
+    expect(await ToolModel.findByName("regular-tool")).not.toBeNull();
+  });
+
+  test("skips client-decorated gateway tools but discovers foreign look-alikes", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    // White-labeled org: the gateway server name slugifies to `archestra_staging`.
+    archestraMcpBranding.syncFromOrganization({
+      appName: "Archestra Staging",
+      iconLogo: null,
+    });
+
+    const tools = [
+      {
+        // Client inserts its own MCP-server label between our server name and the
+        // tool short name — the shape this fix targets.
+        toolName: "archestra_staging__my_mcp_gateway_1234567__run_tool",
+        toolParameters: { type: "object" },
+        toolDescription: "decorated gateway tool",
+      },
+      {
+        // Same decoration, but under the off-brand default server name.
+        toolName: "archestra__my_mcp_gateway_1234567__search_tools",
+        toolParameters: { type: "object" },
+        toolDescription: "decorated off-brand gateway tool",
+      },
+      {
+        // A known short name behind a foreign server segment — must still be
+        // discovered (no Archestra server name present).
+        toolName: "unrelated_server__run_tool",
+        toolParameters: { type: "object" },
+        toolDescription: "foreign look-alike",
+      },
+      {
+        // A genuinely external tool — must still be discovered.
+        toolName: "custom__list_issues",
+        toolParameters: { type: "object" },
+        toolDescription: "genuine external tool",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // Decorated gateway tools are recognized as ours and NOT auto-discovered…
+    expect(
+      await ToolModel.findByName(
+        "archestra_staging__my_mcp_gateway_1234567__run_tool",
+      ),
+    ).toBeNull();
+    expect(
+      await ToolModel.findByName(
+        "archestra__my_mcp_gateway_1234567__search_tools",
+      ),
+    ).toBeNull();
+    // …while foreign look-alikes and genuine external tools still are.
+    expect(
+      await ToolModel.findByName("unrelated_server__run_tool"),
+    ).not.toBeNull();
+    expect(await ToolModel.findByName("custom__list_issues")).not.toBeNull();
+  });
+
+  test("skips exactly the tools attestation says the gateway served, whatever their name", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    await persistTools({
+      tools: [
+        {
+          // The gateway's own search_tools under a label nothing recognizes.
+          toolName: "mcp__gw__archestra__search_tools",
+          toolDescription: "attested gateway tool",
+          servedByGateway: true,
+        },
+        {
+          // A server beside the gateway copying the name, with no attestation.
+          toolName: "mcp__evil__archestra__search_tools",
+          toolDescription: "unattested lookalike",
+          servedByGateway: false,
+        },
+      ],
+      agentId: agent.id,
+    });
+
+    expect(
+      await ToolModel.findByName("mcp__gw__archestra__search_tools"),
+    ).toBeNull();
+    // The lookalike is discovered like any foreign tool rather than skipped
+    // as a built-in.
+    expect(
+      await ToolModel.findByName("mcp__evil__archestra__search_tools"),
+    ).not.toBeNull();
+  });
+
+  test("skips agent delegation tools (agent__*)", async ({ makeAgent }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    // Try to persist tools including agent delegation tools
+    const tools = [
+      {
+        toolName: "agent__research_bot", // Agent delegation tool
+        toolParameters: { type: "object" },
+        toolDescription: "Should be skipped",
+      },
+      {
+        toolName: "agent__code_reviewer", // Another agent delegation tool
+        toolParameters: { type: "object" },
+        toolDescription: "Should also be skipped",
+      },
+      {
+        toolName: "regular-tool",
+        toolParameters: { type: "object" },
+        toolDescription: "Regular tool",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // Only the regular tool should be created
+    const regularTool = await ToolModel.findByName("regular-tool");
+    expect(regularTool).not.toBeNull();
+
+    // Agent delegation tools should not exist as proxy tools
+    const agentTool1 = await ToolModel.findByName("agent__research_bot");
+    const agentTool2 = await ToolModel.findByName("agent__code_reviewer");
+    expect(agentTool1).toBeNull();
+    expect(agentTool2).toBeNull();
+  });
+
+  test("skips MCP tools already assigned to the agent", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+    const catalog = await makeInternalMcpCatalog();
+    await makeMcpServer({ catalogId: catalog.id });
+
+    // Create an MCP tool and assign it to the agent
+    const mcpTool = await makeTool({
+      name: "mcp-tool-1",
+      catalogId: catalog.id,
+    });
+    await AgentToolModel.createIfNotExists(agent.id, mcpTool.id);
+
+    // Try to persist tools including one with the same name as the MCP tool
+    const tools = [
+      {
+        toolName: "mcp-tool-1", // Same name as MCP tool
+        toolParameters: { type: "object" },
+        toolDescription: "Should be skipped",
+      },
+      {
+        toolName: "proxy-tool-1",
+        toolParameters: { type: "object" },
+        toolDescription: "Should be created",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // The proxy tool should be created
+    const proxyTool = await ToolModel.findByName("proxy-tool-1");
+    expect(proxyTool).not.toBeNull();
+    expect(proxyTool?.catalogId).toBeNull();
+  });
+
+  test("skips MCP tools with catalogId (even without MCP server)", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeTool,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+    const catalog = await makeInternalMcpCatalog();
+
+    // Create an MCP tool with catalogId (catalogId is what identifies MCP tools)
+    const mcpTool = await makeTool({
+      name: "mcp-tool-orphaned",
+      catalogId: catalog.id,
+    });
+    await AgentToolModel.createIfNotExists(agent.id, mcpTool.id);
+
+    // Try to persist a tool with the same name as the orphaned MCP tool
+    const tools = [
+      {
+        toolName: "mcp-tool-orphaned", // Same name as MCP tool with catalogId
+        toolParameters: { type: "object" },
+        toolDescription: "Should be skipped",
+      },
+      {
+        toolName: "proxy-tool-1",
+        toolParameters: { type: "object" },
+        toolDescription: "Should be created",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // The proxy tool should be created
+    const proxyTool = await ToolModel.findByName("proxy-tool-1");
+    expect(proxyTool).not.toBeNull();
+    expect(proxyTool?.catalogId).toBeNull();
+  });
+
+  test("is idempotent - does not create duplicate tools", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    const tools = [
+      {
+        toolName: "idempotent-tool",
+        toolParameters: { type: "object" },
+        toolDescription: "Should only exist once",
+      },
+    ];
+
+    // Call persistTools twice
+    await persistTools({ tools, agentId: agent.id });
+    await persistTools({ tools, agentId: agent.id });
+
+    // Should only have one tool with this name
+    const tool = await ToolModel.findByName("idempotent-tool");
+    expect(tool).not.toBeNull();
+  });
+
+  test("handles tools with missing optional fields", async ({ makeAgent }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    const tools = [
+      {
+        toolName: "tool-with-all-fields",
+        toolParameters: { type: "object" },
+        toolDescription: "Has all fields",
+      },
+      {
+        toolName: "tool-without-params",
+        // No toolParameters
+        toolDescription: "No params",
+      },
+      {
+        toolName: "tool-without-description",
+        toolParameters: { type: "object" },
+        // No toolDescription
+      },
+      {
+        toolName: "tool-minimal",
+        // Only toolName
+      },
+    ];
+
+    // Should not throw
+    await persistTools({ tools, agentId: agent.id });
+
+    // Verify all tools were created
+    expect(await ToolModel.findByName("tool-with-all-fields")).not.toBeNull();
+    expect(await ToolModel.findByName("tool-without-params")).not.toBeNull();
+    expect(
+      await ToolModel.findByName("tool-without-description"),
+    ).not.toBeNull();
+    expect(await ToolModel.findByName("tool-minimal")).not.toBeNull();
+  });
+
+  test("handles concurrent calls without errors", async ({ makeAgent }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    const tools = [
+      {
+        toolName: "concurrent-tool-1",
+        toolParameters: { type: "object" },
+        toolDescription: "Tool 1",
+      },
+      {
+        toolName: "concurrent-tool-2",
+        toolParameters: { type: "object" },
+        toolDescription: "Tool 2",
+      },
+    ];
+
+    // Call persistTools multiple times concurrently - should not throw
+    await Promise.all([
+      persistTools({ tools, agentId: agent.id }),
+      persistTools({ tools, agentId: agent.id }),
+      persistTools({ tools, agentId: agent.id }),
+    ]);
+
+    // Verify tools were created
+    expect(await ToolModel.findByName("concurrent-tool-1")).not.toBeNull();
+    expect(await ToolModel.findByName("concurrent-tool-2")).not.toBeNull();
+  });
+
+  test("filters all tools when all are MCP or Archestra tools", async ({
+    makeAgent,
+    makeInternalMcpCatalog,
+    makeMcpServer,
+    makeTool,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+    const catalog = await makeInternalMcpCatalog();
+    await makeMcpServer({ catalogId: catalog.id });
+
+    // Create an MCP tool and assign it
+    const mcpTool = await makeTool({
+      name: "existing-mcp-tool",
+      catalogId: catalog.id,
+    });
+    await AgentToolModel.createIfNotExists(agent.id, mcpTool.id);
+
+    // Try to persist only tools that should be filtered
+    const tools = [
+      {
+        toolName: "existing-mcp-tool", // MCP tool
+        toolParameters: { type: "object" },
+        toolDescription: "Should be skipped",
+      },
+      {
+        toolName: "archestra__whoami", // Archestra tool
+        toolParameters: { type: "object" },
+        toolDescription: "Should be skipped",
+      },
+    ];
+
+    await persistTools({ tools, agentId: agent.id });
+
+    // No new proxy tools should be created — the existing MCP tool should remain unchanged
+    const existingTool = await ToolModel.findByName("existing-mcp-tool");
+    expect(existingTool).not.toBeNull();
+    expect(existingTool?.catalogId).toBe(catalog.id);
+  });
+
+  test("handles duplicate tool names in input without constraint violation", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({ name: "Test Agent" });
+
+    // Input contains duplicate tool names - this should not cause a constraint violation
+    const tools = [
+      {
+        toolName: "duplicate-tool",
+        toolParameters: { type: "object" },
+        toolDescription: "First occurrence",
+      },
+      {
+        toolName: "duplicate-tool", // Duplicate!
+        toolParameters: { type: "object", additionalProperties: true },
+        toolDescription: "Second occurrence",
+      },
+      {
+        toolName: "unique-tool",
+        toolParameters: { type: "object" },
+        toolDescription: "Unique tool",
+      },
+      {
+        toolName: "duplicate-tool", // Triple duplicate!
+        toolParameters: {},
+        toolDescription: "Third occurrence",
+      },
+    ];
+
+    // Should not throw a constraint violation error
+    await persistTools({ tools, agentId: agent.id });
+
+    // Verify tools were created (only unique names)
+    const duplicateTool = await ToolModel.findByName("duplicate-tool");
+    const uniqueTool = await ToolModel.findByName("unique-tool");
+
+    expect(duplicateTool).not.toBeNull();
+    expect(uniqueTool).not.toBeNull();
+  });
+});

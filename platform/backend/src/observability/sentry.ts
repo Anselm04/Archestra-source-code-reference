@@ -1,0 +1,329 @@
+import {
+  ERROR_REPORTING_DATA_COLLECTION,
+  scrubErrorReportBreadcrumb,
+  scrubErrorReportEvent,
+} from "@archestra/shared/error-reporting";
+import type {
+  ErrorEvent,
+  EventHint,
+  Integration,
+  TracesSamplerSamplingContext,
+  TransactionEvent,
+} from "@sentry/core";
+import * as Sentry from "@sentry/node";
+import config from "@/config";
+import logger from "@/logging";
+import { classifyErrorForTracking } from "./error-tracking-policy";
+import { rememberErrorTrackingServerSpan } from "./request-context";
+import { telemetryPreference } from "./telemetry-preference";
+import { ATTR_MCP_METHOD_NAME } from "./tracing/attributes";
+import {
+  isLongLivedMcpStream,
+  isNoiseRoute,
+  isNoisyMcpGatewayGetRoute,
+  isNoisyTransactionName,
+  isPolledLogListRoute,
+} from "./utils";
+
+const {
+  api: { version },
+  observability: {
+    sentry: {
+      enabled,
+      dsn,
+      environment: sentryEnvironment,
+      errorsOnly,
+      tracesSampleRate,
+      mcpGatewayTracesSampleRate,
+      profilesSampleRate,
+    },
+  },
+} = config;
+
+/**
+ * Share of the normal trace sample rate kept for the polled log list routes
+ * (see {@link isPolledLogListRoute}).
+ */
+const POLLED_LOG_LIST_TRACES_SAMPLE_FACTOR = 0.01;
+
+/**
+ * Build the Error object reported for a raw upstream-provider failure.
+ *
+ * The upstream HTTP status is attached to the Error so the {@link filterErrorEvent}
+ * 4xx filter drops expected provider CLIENT errors (rate limits, invalid
+ * credentials, provider-side content blocks) as noise, while genuine provider
+ * 5xx failures still report.
+ * @public — exported for testability
+ */
+export function buildRawProviderError(params: {
+  statusCode: number | undefined;
+  errorMessage: string;
+}): Error {
+  const error = new Error(params.errorMessage);
+  error.name = "RawProviderError";
+  if (params.statusCode !== undefined) {
+    (error as Error & { statusCode?: number }).statusCode = params.statusCode;
+  }
+  return error;
+}
+
+export function captureRawProviderErrorInSentry(params: {
+  provider: string;
+  statusCode: number | undefined;
+  parsedError: unknown;
+  errorCode: string;
+  errorMessage: string;
+  errorType: string | undefined;
+  rawErrorJson: string;
+}): void {
+  const error = buildRawProviderError({
+    statusCode: params.statusCode,
+    errorMessage: params.errorMessage,
+  });
+
+  Sentry.captureException(error, {
+    level: "error",
+    fingerprint: [
+      "chat-provider-error-raw-error-json",
+      params.provider,
+      String(params.statusCode ?? "unknown"),
+      params.errorCode,
+    ],
+    tags: {
+      provider: params.provider,
+      mapped_code: params.errorCode,
+      raw_error_json: "true",
+      ...(params.statusCode !== undefined
+        ? { status_code: String(params.statusCode) }
+        : {}),
+      ...(params.errorType ? { error_type: params.errorType } : {}),
+    },
+    extra: {
+      parsedError: params.parsedError,
+      errorMessage: params.errorMessage,
+      rawErrorJson: params.rawErrorJson,
+    },
+  });
+}
+
+/**
+ * Sentry `beforeSend` filter. Delegates the drop/keep-and-group decision to the
+ * {@link classifyErrorForTracking} policy, then applies the result in Sentry's
+ * shape: return null to drop, or set the event's fingerprint/tags to group an
+ * availability incident. What is kept is scrubbed of request content,
+ * credentials, and personal data before it leaves the deployment.
+ *
+ * https://docs.sentry.io/platforms/javascript/configuration/filtering/
+ * @public — exported for testability
+ */
+export function filterErrorEvent(
+  event: ErrorEvent,
+  hint: EventHint,
+): ErrorEvent | null {
+  const decision = classifyErrorForTracking(hint.originalException);
+  if (!decision.report) {
+    return null;
+  }
+  if (decision.fingerprint) {
+    event.fingerprint = decision.fingerprint;
+  }
+  if (decision.tags) {
+    event.tags = { ...event.tags, ...decision.tags };
+  }
+  return scrubErrorReportEvent(event);
+}
+
+/**
+ * Sentry `beforeSendTransaction` filter. Drops transactions for traffic that
+ * is not worth tracing (health, metrics, OAuth discovery, MCP gateway GETs)
+ * and for long-lived MCP streams.
+ *
+ * A long-lived MCP stream shares its route with ordinary MCP requests, so only
+ * the method recorded on its request spans identifies it. Its duration is how
+ * long the connection lived, and would skew request latency.
+ *
+ * @public — exported for testability
+ */
+export function filterTransactionEvent(
+  event: TransactionEvent,
+): TransactionEvent | null {
+  if (event.transaction && isNoisyTransactionName(event.transaction)) {
+    return null;
+  }
+  if (
+    isLongLivedMcpStream(event.contexts?.trace?.data?.[ATTR_MCP_METHOD_NAME])
+  ) {
+    return null;
+  }
+  return scrubErrorReportEvent(event);
+}
+
+/**
+ * Safely load the profiling integration.
+ * The @sentry/profiling-node package contains native bindings that can fail to load
+ * on some systems (particularly Windows or certain Mac configurations).
+ * We gracefully handle this by returning null if loading fails.
+ */
+const getProfilingIntegration = async (): Promise<Integration | null> => {
+  try {
+    // Dynamic import to catch loading errors for native module
+    const { nodeProfilingIntegration } = await import("@sentry/profiling-node");
+    return nodeProfilingIntegration();
+  } catch (error) {
+    logger.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      "Failed to load Sentry profiling integration - profiling will be disabled",
+    );
+    return null;
+  }
+};
+
+/**
+ * {@link filterErrorEvent} for reports that go to Archestra's project: drops
+ * the event when an admin turned telemetry off in the first-run setup dialog.
+ */
+async function filterErrorEventWithTelemetryChoice(
+  event: ErrorEvent,
+  hint: EventHint,
+): Promise<ErrorEvent | null> {
+  if (!(await telemetryPreference.isOptedIn())) return null;
+  return filterErrorEvent(event, hint);
+}
+
+let sentryClient: Sentry.NodeClient | undefined;
+
+/**
+ * Initialize Sentry asynchronously to handle dynamic profiling import.
+ * This is an IIFE that runs at module load time.
+ */
+const initSentry = async (): Promise<void> => {
+  if (!enabled) {
+    logger.debug("Error reporting is off, skipping Sentry initialization");
+    return;
+  }
+
+  if (errorsOnly) {
+    sentryClient = Sentry.init({
+      ...getBaseOptions(),
+      integrations: [
+        // Keep per-request scope isolation, without spans or the
+        // outgoing-request breadcrumbs that name upstream hosts.
+        Sentry.httpIntegration({ spans: false, breadcrumbs: false }),
+        Sentry.nativeNodeFetchIntegration({ spans: false, breadcrumbs: false }),
+      ],
+      // No tracing: nothing but error events leaves the deployment, and no
+      // trace headers go out on outgoing requests.
+      tracePropagationTargets: [],
+    });
+    logger.info(
+      { environment: sentryEnvironment },
+      "Error reporting to Archestra initialized (errors only)",
+    );
+    return;
+  }
+
+  const profilingIntegration = await getProfilingIntegration();
+
+  // Build integrations array, only including profiling if it loaded successfully
+  const integrations: Integration[] = [
+    // Replaces the default HTTP integration, with the same options, to keep the
+    // server span of each request. Request handlers mark it, for example with
+    // the MCP method that {@link filterTransactionEvent} reads.
+    Sentry.httpIntegration({
+      incomingRequestSpanHook: rememberErrorTrackingServerSpan,
+    }),
+    // Add Pino integration to send logs to Sentry
+    // https://docs.sentry.io/platforms/javascript/guides/fastify/logs/#pino-integration
+    Sentry.pinoIntegration(),
+  ];
+
+  if (profilingIntegration) {
+    integrations.unshift(profilingIntegration);
+  }
+
+  // https://docs.sentry.io/platforms/javascript/guides/fastify/install/commonjs/
+  sentryClient = Sentry.init({
+    ...getBaseOptions(),
+
+    integrations,
+
+    /**
+     * Set profilesSampleRate to 1.0 to profile 100% of sampled transactions (this is relative to tracesSampleRate)
+     * Only effective if profiling integration loaded successfully
+     * https://docs.sentry.io/platforms/javascript/guides/node/configuration/options/#profilesSampleRate
+     */
+    profilesSampleRate: profilingIntegration ? profilesSampleRate : 0,
+
+    // Enable logs to be sent to Sentry
+    enableLogs: true,
+
+    // https://docs.sentry.io/platforms/javascript/configuration/options/#tracesSampler
+    tracesSampler: ({
+      normalizedRequest,
+      name: transactionName,
+    }: TracesSamplerSamplingContext) => {
+      const url = normalizedRequest?.url;
+      const method = normalizedRequest?.method;
+
+      if (transactionName && isNoisyTransactionName(transactionName)) {
+        return 0;
+      }
+
+      if (!url) return tracesSampleRate;
+
+      if (isNoiseRoute(url)) {
+        return 0;
+      }
+
+      // MCP gateway GET discovery/polling traffic dominates span volume and has low debugging value.
+      if (method && isNoisyMcpGatewayGetRoute({ method, url })) {
+        return 0;
+      }
+
+      // Sample remaining MCP gateway traffic much more conservatively than normal app routes.
+      if (url.startsWith("/v1/mcp")) {
+        return mcpGatewayTracesSampleRate;
+      }
+
+      // Clients page through the LLM proxy log lists one request at a time.
+      if (method && isPolledLogListRoute({ method, url })) {
+        return tracesSampleRate * POLLED_LOG_LIST_TRACES_SAMPLE_FACTOR;
+      }
+
+      return tracesSampleRate;
+    },
+
+    beforeSendTransaction: filterTransactionEvent,
+  });
+
+  logger.info(
+    { profilingEnabled: !!profilingIntegration },
+    "Sentry initialized successfully",
+  );
+};
+
+// Initialize Sentry (runs at module load)
+await initSentry();
+
+export default sentryClient;
+
+/** Options every reporting mode shares, including the privacy filters. */
+function getBaseOptions(): Sentry.NodeOptions {
+  return {
+    dsn,
+    environment: sentryEnvironment,
+    release: version,
+    dataCollection: ERROR_REPORTING_DATA_COLLECTION,
+    /**
+     * Disable Sentry's automatic OpenTelemetry setup: tracing/sdk.ts owns it.
+     * https://docs.sentry.io/platforms/javascript/guides/express/opentelemetry/custom-setup/
+     */
+    skipOpenTelemetrySetup: true,
+    // Reports to Archestra's project also follow the admin's telemetry
+    // choice; the deployment's own project always gets its reports.
+    beforeSend: errorsOnly
+      ? filterErrorEventWithTelemetryChoice
+      : filterErrorEvent,
+    beforeBreadcrumb: (breadcrumb) => scrubErrorReportBreadcrumb(breadcrumb),
+  };
+}

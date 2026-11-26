@@ -1,0 +1,3053 @@
+import type { UIMessage } from "@ai-sdk/react";
+import {
+  type ArchestraToolShortName,
+  type archestraApiTypes,
+  type ChatMessageFeedback,
+  ChatMessageMetadataSchema,
+  extractMcpExecutedAs,
+  HOOK_RUN_PART_TYPE,
+  MCP_TASK_PART_TYPE,
+  type McpTaskPartData,
+  parseArchestraAppResourceUri,
+  parseFullToolName,
+  type ResourceVisibilityScope,
+  TOOL_ASK_USER_FULL_NAME,
+  TOOL_ASK_USER_SHORT_NAME,
+  TOOL_REQUEST_BATTERY_CREDENTIALS_SHORT_NAME,
+  TOOL_RUN_TOOL_SHORT_NAME,
+  TOOL_TODO_WRITE_FULL_NAME,
+  TOOL_TODO_WRITE_SHORT_NAME,
+  TURN_NOTICE_PART_TYPE,
+} from "@archestra/shared";
+import type { ChatStatus, DynamicToolUIPart, ToolUIPart } from "ai";
+import { BotIcon, CheckCircleIcon, ClockIcon } from "lucide-react";
+import {
+  type ComponentProps,
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useStickToBottomContext } from "use-stick-to-bottom";
+import { ErrorBoundary } from "@/app/_parts/error-boundary";
+import {
+  Conversation,
+  ConversationContent,
+  ConversationScrollButton,
+} from "@/components/ai-elements/conversation";
+import { Loader } from "@/components/ai-elements/loader";
+import { Message, MessageContent } from "@/components/ai-elements/message";
+import {
+  Reasoning,
+  ReasoningContent,
+  ReasoningTrigger,
+} from "@/components/ai-elements/reasoning";
+import { Response } from "@/components/ai-elements/response";
+import {
+  SectionLabel,
+  Tool,
+  ToolContent,
+  ToolHeader,
+  ToolInput,
+  ToolOutput,
+} from "@/components/ai-elements/tool";
+import {
+  BatteryCredentialsTool,
+  parseBatteryCredentialRequest,
+} from "@/components/chat/battery-credentials-tool";
+import {
+  HookRunChip,
+  type HookRunChipData,
+} from "@/components/chat/hook-run-chip";
+import { McpElicitationCard } from "@/components/chat/mcp-elicitation-card";
+import { isChoiceElicitationRequest } from "@/components/chat/mcp-elicitation-fields";
+import { McpTaskProvider } from "@/components/chat/mcp-task-context";
+import { RuntimeCredentialSetupTool } from "@/components/chat/runtime-credential-setup-tool";
+import { ExecutedAsBadge } from "@/components/executed-as-badge";
+import { McpCatalogIcon } from "@/components/mcp-catalog-icon";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useProfile } from "@/lib/agent.query";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useCancelChatMcpTask, useConversation } from "@/lib/chat/chat.query";
+import { useUpdateChatMessage } from "@/lib/chat/chat-message.query";
+import {
+  getToolErrorText,
+  getToolHeaderState,
+  hasToolRequest,
+} from "@/lib/chat/chat-tools-display.utils";
+import {
+  getMessageFeedback,
+  PERSISTED_MESSAGE_ID_METADATA_KEY,
+} from "@/lib/chat/chat-utils";
+import { isActionAvailableForConversation } from "@/lib/chat/encrypted-chat";
+import { useChatSessionSnapshot } from "@/lib/chat/global-chat.context";
+import {
+  desktopAddPromptCopy,
+  hasToolPartsWithAuthErrors,
+  isInstallAuthAction,
+  isInstallAuthResolved,
+  isNoDeviceError,
+  resolveAssistantTextAuthState,
+  resolveToolAuthState,
+  type ToolAuthState,
+} from "@/lib/chat/mcp-error-ui";
+import { hasThinkingTags, parseThinkingTags } from "@/lib/chat/parse-thinking";
+import type { ModelSource } from "@/lib/chat/use-chat-preferences";
+import { UPSTREAM_IDLE_THRESHOLD_SECONDS } from "@/lib/chat/use-stream-stall";
+import { useAppIconLogo } from "@/lib/hooks/use-app-name";
+import { useStableCallback } from "@/lib/hooks/use-stable-callback";
+import { useArchestraMcpIdentity } from "@/lib/mcp/archestra-mcp-server";
+import { useMcpCatalogDirectory } from "@/lib/mcp/mcp-registry.query";
+import { useMcpInstallOrchestrator } from "@/lib/mcp/use-mcp-install-orchestrator";
+import { useOrganization } from "@/lib/organization.query";
+import { cn } from "@/lib/utils/tailwind";
+import { identifyAskUserGroups } from "./ask-user-groups";
+import { getAskUserOutcome } from "./ask-user-outcome";
+import {
+  AttachmentAudio,
+  AttachmentImage,
+  AttachmentLink,
+  AttachmentVideo,
+} from "./attachment-content";
+import { AuthErrorTool, type AuthErrorToolProps } from "./auth-error-tool";
+import {
+  collectSubagentToolCalls,
+  extractFileAttachments,
+  filterOptimisticToolCalls,
+  getApprovalToolDisplay,
+  getToolCardTitle,
+  hasTextPart,
+  identifyCompactToolGroups,
+  identifyReasoningRuns,
+  isBlankAssistantTextPart,
+  resolveRunToolTargetName,
+  type SubagentChildEntry,
+} from "./chat-messages.utils";
+import {
+  CompactToolGroup,
+  findLatestPolicyChangeKey,
+} from "./compact-tool-call";
+import { EditableAssistantMessage } from "./editable-assistant-message";
+import { EditableUserMessage } from "./editable-user-message";
+import { InlineChatError } from "./inline-chat-error";
+import { hasKnowledgeBaseToolCall } from "./knowledge-graph-citations";
+import { McpAppSection, type McpToolOutput } from "./mcp-app-container";
+import { McpInstallDialogs } from "./mcp-install-dialogs";
+import { NoDeviceToolCard } from "./no-device-tool-card";
+import {
+  isOpenAppaPolicyChange,
+  OpenAppaPolicyChange,
+} from "./openappa-policy-change";
+import { isPolicyChangeTool } from "./openappa-policy-change.utils";
+import {
+  RemedyChainCard,
+  RemedyGuardrailsSteps,
+} from "./openappa-remedy-chain-card";
+import type { RemedyChain } from "./openappa-remedy-chains";
+import { PolicyDiffReferenceCollector } from "./policy-diff-deduplication";
+import {
+  collectPreviewedChanges,
+  PreviewedChangeReview,
+  PreviewedChangesProvider,
+  proposalApprovalText,
+  usePreviewedChange,
+} from "./previewed-policy-change";
+import { withoutProxyTransportArguments } from "./proxy-transport-arguments";
+import { TodoWriteTool } from "./todo-write-tool";
+import { ToolErrorLogsButton } from "./tool-error-logs-button";
+import { buildToolIconMap, type ToolIconMap } from "./tool-icon-map";
+import { ToolStatusRow } from "./tool-status-row";
+import { TranscriptWindowEdge, useTranscriptWindow } from "./transcript-window";
+
+interface ChatMessagesProps {
+  conversationId: string | undefined;
+  /**
+   * The viewer does not own the conversation (e.g. another member's scheduled
+   * run): render the transcript the same way, without edit or regenerate.
+   */
+  readOnly?: boolean;
+  agentId?: string;
+  messages: UIMessage[];
+  status: ChatStatus;
+  optimisticToolCalls?: Array<{
+    toolCallId: string;
+    toolName: string;
+    input: unknown;
+  }>;
+  isLoadingConversation?: boolean;
+  onMessagesUpdate?: (messages: UIMessage[]) => void;
+  /**
+   * Owner-only affordance: when set, assistant messages render thumbs up/down
+   * in their action bar. Callers that can show conversations the viewer does
+   * not own (e.g. scheduled-run detail) must not pass it.
+   */
+  onMessageFeedback?: (
+    messageId: string,
+    feedback: ChatMessageFeedback | null,
+  ) => void;
+  feedbackDisabled?: boolean;
+  onRegenerateUserMessage?: (args: {
+    messageId: string;
+    partIndex: number;
+    text: string;
+  }) => Promise<void>;
+  /** Re-run the original prompt after the user connects a per-user provider. */
+  onProviderConnected?: () => void;
+  /**
+   * Scheduled-run only: clear a persisted chat error and resend the prompt.
+   * When set, the inline error card shows a "Try again" button.
+   */
+  onChatErrorRetry?: () => void | Promise<void>;
+  /** Focuses the composer so a pending question can be answered in free text. */
+  onTypeAnswer?: () => void;
+  error?: Error | null;
+  chatErrors?: archestraApiTypes.GetChatConversationResponses["200"]["chatErrors"];
+  compactions?: archestraApiTypes.GetChatConversationResponses["200"]["compactions"];
+  /** Callback for tool approval responses (approve/deny) */
+  onToolApprovalResponse?: (params: {
+    id: string;
+    approved: boolean;
+    reason?: string;
+  }) => void;
+  agentName?: string;
+  selectedModel?: string;
+  modelSource?: ModelSource | null;
+  isContextCompacting?: boolean;
+  contextCompactionFeedback?: {
+    status: "pending" | "success" | "skipped" | "failed";
+    message: string;
+  } | null;
+  /**
+   * The run is alive but the provider has not produced this turn yet — see
+   * `useStreamStall`. Surfaces a quiet note beside the loading indicator.
+   */
+  isUpstreamIdle?: boolean;
+}
+
+type PersistedChatError =
+  archestraApiTypes.GetChatConversationResponses["200"]["chatErrors"][number];
+
+type TimelineItem =
+  | { kind: "message"; message: UIMessage; messageIndex: number }
+  | { kind: "chat-error"; chatError: PersistedChatError }
+  | {
+      kind: "compaction";
+      compaction: archestraApiTypes.GetChatConversationResponses["200"]["compactions"][number];
+    };
+
+// Type guards for tool parts
+// biome-ignore lint/suspicious/noExplicitAny: AI SDK message parts have dynamic structure
+function isToolPart(part: any): part is {
+  type: string;
+  state?: string;
+  toolCallId?: string;
+  // biome-ignore lint/suspicious/noExplicitAny: Tool inputs are dynamic based on tool schema
+  input?: any;
+  // biome-ignore lint/suspicious/noExplicitAny: Tool outputs are dynamic based on tool execution
+  output?: any;
+  errorText?: string;
+} {
+  return (
+    typeof part === "object" &&
+    part !== null &&
+    "type" in part &&
+    (part.type?.startsWith("tool-") ||
+      part.type?.startsWith("data-tool-ui-start") ||
+      part.type === "dynamic-tool")
+  );
+}
+
+export function ChatMessages({
+  conversationId,
+  readOnly = false,
+  agentId,
+  messages,
+  status,
+  optimisticToolCalls = [],
+  isLoadingConversation = false,
+  onMessagesUpdate,
+  onMessageFeedback,
+  feedbackDisabled = false,
+  onRegenerateUserMessage,
+  onProviderConnected,
+  onChatErrorRetry,
+  onTypeAnswer,
+  error = null,
+  chatErrors = [],
+  compactions = [],
+  onToolApprovalResponse,
+  agentName,
+  selectedModel,
+  modelSource,
+  isContextCompacting = false,
+  contextCompactionFeedback = null,
+  isUpstreamIdle = false,
+}: ChatMessagesProps) {
+  // Track editing by messageId-partIndex to support multiple text parts per message
+  const [editingPartKey, setEditingPartKey] = useState<string | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const { data: canExpandToolCalls } = useHasPermissions({
+    chat: ["full-view"],
+  });
+  const { data: canReadMcpRegistry } = useHasPermissions({
+    mcpRegistry: ["read"],
+  });
+  const { data: organization } = useOrganization();
+  const appIconLogo = useAppIconLogo();
+  const { getToolName, getToolShortName } = useArchestraMcpIdentity();
+  // The install helper loads the registry's issue index, which only an auth
+  // prompt in the transcript reads. Once one has appeared
+  // it stays loaded, so the prompt can flip to connected.
+  const transcriptHasAuthPrompt = useMemo(
+    () => messages.some(messageHasAuthPrompt),
+    [messages],
+  );
+  const [installHelperNeeded, setInstallHelperNeeded] = useState(false);
+  if (transcriptHasAuthPrompt && !installHelperNeeded) {
+    setInstallHelperNeeded(true);
+  }
+  const orchestrator = useMcpInstallOrchestrator({
+    enabled: installHelperNeeded,
+  });
+  const nonCompactToolNames = useMemo(
+    () =>
+      new Set([
+        TOOL_TODO_WRITE_FULL_NAME,
+        getToolName(TOOL_TODO_WRITE_SHORT_NAME),
+        // A question renders as its own answer summary, not a circle.
+        TOOL_ASK_USER_FULL_NAME,
+        getToolName(TOOL_ASK_USER_SHORT_NAME),
+      ]),
+    [getToolName],
+  );
+
+  // Build tool name → icon map from agent tools + catalog data. The agent
+  // detail is already loaded by the chat page and carries no tool schemas.
+  const { data: agent } = useProfile(agentId);
+  const agentTools = agent?.tools;
+  // Names and icons only: the registry's directory, not the full catalog.
+  const { data: catalogItems } = useMcpCatalogDirectory({
+    enabled: !!agentId && !!canReadMcpRegistry,
+  });
+  const toolIconMap = useMemo(
+    () =>
+      buildToolIconMap({
+        agentTools: agentTools ?? [],
+        catalogItems: catalogItems ?? [],
+      }),
+    [agentTools, catalogItems],
+  );
+
+  const updateChatMessageMutation = useUpdateChatMessage(conversationId);
+  // Resolved once for the whole transcript: an encrypted chat's attachments cannot
+  // be copied into a knowledge base, so their chips do not offer it.
+  const { data: messagesConversation } = useConversation(conversationId, {
+    refetchOnMount: false,
+  });
+  const canSaveToKnowledge = isActionAvailableForConversation(
+    messagesConversation,
+    "saveToKnowledge",
+  );
+
+  // Get early UI data from the chat session
+  const session = useChatSessionSnapshot(conversationId);
+  const earlyToolUiStarts = session?.earlyToolUiStarts || {};
+  const contextCompaction = session?.contextCompaction;
+  const pendingMcpElicitations = session?.pendingMcpElicitations ?? [];
+  const hasPendingMcpElicitation = pendingMcpElicitations.length > 0;
+  const toolCallOrderInMessages = useMemo(() => {
+    const order = new Map<string, number>();
+    let index = 0;
+    for (const message of messages) {
+      for (const part of message.parts ?? []) {
+        if (
+          typeof part === "object" &&
+          part !== null &&
+          "toolCallId" in part &&
+          typeof part.toolCallId === "string" &&
+          !order.has(part.toolCallId)
+        ) {
+          order.set(part.toolCallId, index++);
+        }
+      }
+    }
+    return order;
+  }, [messages]);
+  const pendingChoiceElicitations = useMemo(() => {
+    const filtered = pendingMcpElicitations.filter(isChoiceElicitationRequest);
+    return filtered.sort((a, b) => {
+      const aIndex = a.toolCallId
+        ? toolCallOrderInMessages.get(a.toolCallId)
+        : undefined;
+      const bIndex = b.toolCallId
+        ? toolCallOrderInMessages.get(b.toolCallId)
+        : undefined;
+      if (aIndex !== undefined && bIndex !== undefined) {
+        return aIndex - bIndex;
+      }
+      return 0;
+    });
+  }, [pendingMcpElicitations, toolCallOrderInMessages]);
+  const askUserGroupsByMessage = useMemo(
+    () =>
+      new Map(
+        messages.map((message) => [
+          message.id,
+          identifyAskUserGroups({
+            messageId: message.id,
+            parts: message.parts,
+            getToolShortName,
+          }),
+        ]),
+      ),
+    [messages, getToolShortName],
+  );
+  const policyDiffCollector = useMemo(
+    () => new PolicyDiffReferenceCollector(),
+    [],
+  );
+  const policyDiffReferences = useMemo(
+    () => policyDiffCollector.collect(messages, getToolShortName),
+    [messages, getToolShortName, policyDiffCollector],
+  );
+  const previewedChanges = useMemo(
+    () => collectPreviewedChanges(messages, getToolShortName),
+    [messages, getToolShortName],
+  );
+  const groupedAskUserToolCallIds = useMemo(
+    () =>
+      new Set(
+        [...askUserGroupsByMessage.values()].flatMap((groups) =>
+          groups.flatMap((group) =>
+            group.members.map((member) => member.toolCallId),
+          ),
+        ),
+      ),
+    [askUserGroupsByMessage],
+  );
+  const ungroupedPendingChoiceElicitations = pendingChoiceElicitations.filter(
+    (request) =>
+      !request.toolCallId || !groupedAskUserToolCallIds.has(request.toolCallId),
+  );
+  const liveMcpTasks = useMemo(() => session?.mcpTasks ?? {}, [session]);
+
+  /**
+   * Background tasks keyed by the tool call they back, so the tool circle and
+   * its expanded card can show task state in place. Collected across all
+   * messages and keyed by tool call, which also collapses the duplicate a
+   * reload produces (the same task arrives twice — once streamed, once
+   * persisted); the later entry wins, so the newest status shows.
+   */
+  const mcpTasksByToolCallId = useMemo(() => {
+    const byToolCallId = new Map<string, McpTaskPartData>();
+    // Persisted first: what the backend spliced into the turn once it ended.
+    for (const message of messages) {
+      for (const part of message.parts ?? []) {
+        if (part.type !== MCP_TASK_PART_TYPE) continue;
+        const data = (part as { data?: McpTaskPartData }).data;
+        if (data?.toolCallId) {
+          byToolCallId.set(data.toolCallId, data);
+        }
+      }
+    }
+    // Then the live ones, which win — during the turn they are the only source
+    // (the stream sends them transiently, so they never reach message parts),
+    // and afterwards they agree with what was persisted.
+    for (const task of Object.values(liveMcpTasks)) {
+      if (task?.toolCallId) {
+        byToolCallId.set(task.toolCallId, task);
+      }
+    }
+    return byToolCallId;
+  }, [messages, liveMcpTasks]);
+
+  // Cancelling a background task. The request is fire-once per task: the
+  // endpoint answers well before the next poll flips the row, so clearing on
+  // resolve would re-enable the button for a beat and let a second click
+  // through. The id is held until the task actually leaves `working`, and is
+  // released again only if the request failed so the user can retry.
+  const cancelMcpTaskMutation = useCancelChatMcpTask();
+  const [cancelRequestedTaskIds, setCancelRequestedTaskIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
+  const handleCancelMcpTask = useCallback(
+    async (taskId: string) => {
+      let alreadyRequested = false;
+      setCancelRequestedTaskIds((current) => {
+        if (current.has(taskId)) {
+          alreadyRequested = true;
+          return current;
+        }
+        return new Set(current).add(taskId);
+      });
+      if (alreadyRequested) {
+        return;
+      }
+      try {
+        await cancelMcpTaskMutation.mutateAsync(taskId);
+      } catch {
+        setCancelRequestedTaskIds((current) => {
+          const next = new Set(current);
+          next.delete(taskId);
+          return next;
+        });
+      }
+    },
+    [cancelMcpTaskMutation],
+  );
+
+  // Debounce resize mode change when exiting edit mode to let DOM settle
+  const isEditing = editingPartKey !== null;
+  const [instantResize, setInstantResize] = useState(false);
+  // Track initial message load to use instant resize (avoids visible scroll-to-bottom)
+  const hasLoadedMessagesRef = useRef(false);
+  const [initialLoad, setInitialLoad] = useState(true);
+  useLayoutEffect(() => {
+    if (messages.length > 0 && !hasLoadedMessagesRef.current) {
+      hasLoadedMessagesRef.current = true;
+      // Keep instant resize for the first render with messages, then switch to smooth
+      const timeout = setTimeout(() => setInitialLoad(false), 100);
+      return () => clearTimeout(timeout);
+    }
+  }, [messages.length]);
+  useLayoutEffect(() => {
+    if (isEditing) {
+      setInstantResize(true);
+    } else {
+      const timeout = setTimeout(() => setInstantResize(false), 100);
+      return () => clearTimeout(timeout);
+    }
+  }, [isEditing]);
+
+  // Every per-message handler keeps one identity across renders: a streamed
+  // chunk re-renders this list, and a fresh handler would defeat the memoized
+  // message rows below, re-rendering the whole transcript on every token and
+  // starving the composer of main-thread time.
+  const handleStartEdit = useCallback((partKey: string, messageId?: string) => {
+    setEditingPartKey(partKey);
+    // Always reset editingMessageId to prevent stale state when switching
+    // between editing user messages (which pass messageId) and assistant messages (which don't)
+    setEditingMessageId(messageId ?? null);
+  }, []);
+
+  const handleCancelEdit = useCallback(() => {
+    setEditingPartKey(null);
+    setEditingMessageId(null);
+  }, []);
+
+  const handleSaveAssistantMessage = useStableCallback(
+    async (messageId: string, partIndex: number, newText: string) => {
+      const data = await updateChatMessageMutation.mutateAsync({
+        messageId,
+        partIndex,
+        text: newText,
+      });
+
+      // Update local state to reflect the change immediately
+      if (onMessagesUpdate && data?.messages) {
+        onMessagesUpdate(data.messages as UIMessage[]);
+      }
+    },
+  );
+
+  const handleSaveUserMessage = useStableCallback(
+    async (messageId: string, partIndex: number, newText: string) => {
+      await onRegenerateUserMessage?.({ messageId, partIndex, text: newText });
+    },
+  );
+
+  const handleMessageFeedback = useStableCallback(
+    (messageId: string, feedback: ChatMessageFeedback | null) =>
+      onMessageFeedback?.(messageId, feedback),
+  );
+
+  const pendingToolCalls = useMemo(
+    () => filterOptimisticToolCalls(messages, optimisticToolCalls),
+    [messages, optimisticToolCalls],
+  );
+  const isResponseInProgress = status === "streaming" || status === "submitted";
+  // The run goes on while the chat reconnects to it after a dropped stream:
+  // its calls are still running, whatever the stream's status says meanwhile.
+  const isTurnLive = isResponseInProgress || Boolean(session?.isRecovering);
+  const assistantMessageCount = useMemo(
+    () => messages.filter((m) => m.role === "assistant").length,
+    [messages],
+  );
+
+  // A delegated child agent's tool calls, keyed by the delegation call that
+  // spawned them, collected across the whole conversation so a part's storage
+  // location never affects how it nests. A delegation tool call whose id is a
+  // key here renders its children nested beneath it (recursively).
+  const subagentToolCalls = useMemo(
+    () => collectSubagentToolCalls(messages),
+    [messages],
+  );
+  const subagentParentToolCallIds = useMemo(
+    () => new Set(subagentToolCalls.keys()),
+    [subagentToolCalls],
+  );
+  // Shared by the tool cards below, guarded or not.
+  const sendUserText = useCallback(
+    (text: string) => session?.sendOrQueueText(text),
+    [session],
+  );
+  const subagentCallsFor = useCallback(
+    (toolCallId: string | undefined) =>
+      toolCallId && subagentParentToolCallIds.has(toolCallId) ? (
+        <SubagentToolCalls
+          parentToolCallId={toolCallId}
+          subagentToolCalls={subagentToolCalls}
+          canExpandToolCalls={canExpandToolCalls}
+          connectedCatalogIds={orchestrator.connectedCatalogIds}
+          getToolShortName={getToolShortName}
+          toolIconMap={toolIconMap}
+        />
+      ) : null,
+    [
+      subagentParentToolCallIds,
+      subagentToolCalls,
+      canExpandToolCalls,
+      orchestrator.connectedCatalogIds,
+      getToolShortName,
+      toolIconMap,
+    ],
+  );
+
+  const renderCompactAuthCard = useCallback(
+    ({
+      toolName,
+      part,
+      toolResultPart,
+      errorText,
+    }: {
+      toolName: string;
+      part: ToolUIPart | DynamicToolUIPart;
+      toolResultPart: ToolUIPart | DynamicToolUIPart | null;
+      errorText: string | undefined;
+    }) => {
+      const rawOutput = toolResultPart ? toolResultPart.output : part.output;
+      const toolAuthState = resolveToolAuthState({ errorText, rawOutput });
+      return (
+        renderToolAuthPart({
+          toolName,
+          authState: toolAuthState,
+          connectedCatalogIds: orchestrator.connectedCatalogIds,
+          onInstallMcp: orchestrator.triggerInstallByCatalogId,
+          onReauthMcp: orchestrator.triggerReauthByCatalogIdAndServerId,
+          className: "mt-0",
+        }) ??
+        (isNoDeviceError({ errorText, rawOutput }) ? (
+          <NoDeviceToolCard className="mt-0" />
+        ) : null)
+      );
+    },
+    [
+      orchestrator.connectedCatalogIds,
+      orchestrator.triggerInstallByCatalogId,
+      orchestrator.triggerReauthByCatalogIdAndServerId,
+    ],
+  );
+
+  const isStandalonePendingToolCall = useCallback(
+    (toolName: string) => {
+      if (nonCompactToolNames.has(toolName)) return true;
+      const shortName = getToolShortName(toolName);
+      return (
+        shortName === TOOL_TODO_WRITE_SHORT_NAME ||
+        shortName === TOOL_ASK_USER_SHORT_NAME
+      );
+    },
+    [nonCompactToolNames, getToolShortName],
+  );
+  const compactPendingToolCalls = useMemo(
+    () =>
+      pendingToolCalls.filter(
+        (toolCall) => !isStandalonePendingToolCall(toolCall.toolName),
+      ),
+    [pendingToolCalls, isStandalonePendingToolCall],
+  );
+  const nonCompactPendingToolCalls = useMemo(
+    () =>
+      pendingToolCalls.filter((toolCall) =>
+        isStandalonePendingToolCall(toolCall.toolName),
+      ),
+    [pendingToolCalls, isStandalonePendingToolCall],
+  );
+
+  const timelineItems = useMemo(
+    () =>
+      buildMessageTimeline({
+        messages,
+        chatErrors,
+        compactions,
+      }),
+    [messages, chatErrors, compactions],
+  );
+  const transcriptWindow = useTranscriptWindow(timelineItems);
+
+  if (
+    messages.length === 0 &&
+    chatErrors.length === 0 &&
+    !isResponseInProgress
+  ) {
+    // Don't show "start conversation" message while loading - prevents flash of empty state
+    if (isLoadingConversation) {
+      return null;
+    }
+    return null;
+  }
+
+  // Find the index of the message being edited
+  const editingMessageIndex = editingMessageId
+    ? messages.findIndex((m) => m.id === editingMessageId)
+    : -1;
+
+  // Determine which assistant messages are the last in their consecutive sequence
+  // An assistant message is "last in sequence" if:
+  // 1. It's the last message overall, OR
+  // 2. The next message is NOT an assistant message
+  const isLastInAssistantSequence = messages.map((message, idx) => {
+    if (message.role !== "assistant") {
+      return false;
+    }
+
+    // Check if this is the last message overall
+    if (idx === messages.length - 1) {
+      return true;
+    }
+
+    // Check if the next message is not an assistant message
+    const nextMessage = messages[idx + 1];
+    return nextMessage.role !== "assistant";
+  });
+  const liveErrorMessage = error ? getInlineErrorMessage(error) : null;
+  const hasRenderedLiveError =
+    !!error &&
+    chatErrors.some(
+      (chatError) => chatError.error.message === liveErrorMessage,
+    );
+  // Retrying resends the *last* user turn, so only a persisted error with no
+  // message after it (the failed latest turn) may offer a retry — an older error
+  // card between messages would otherwise rerun the wrong turn.
+  const lastMessageTimelineIndex = timelineItems.reduce(
+    (last, item, index) => (item.kind === "message" ? index : last),
+    -1,
+  );
+
+  const conversation = (
+    <McpTaskProvider
+      value={{
+        byToolCallId: mcpTasksByToolCallId,
+        cancel: handleCancelMcpTask,
+        cancelRequestedTaskIds,
+        queuedToolCallIds: session?.queuedToolCallIds,
+      }}
+    >
+      <Conversation
+        className="h-full"
+        resize={instantResize || initialLoad ? "instant" : "smooth"}
+      >
+        <ScrollToBottomOnSubmit status={status} />
+        <ScrollToBottomOnContextCompaction
+          isCompacting={contextCompaction?.isCompacting || isContextCompacting}
+          feedback={contextCompactionFeedback}
+        />
+        <ConversationContent scrollClassName={OPEN_AT_END_SCROLL_CLASS}>
+          <div className="@container/chat max-w-4xl mx-auto relative pb-8">
+            <TranscriptWindowEdge
+              hiddenCount={transcriptWindow.start}
+              onShowEarlier={transcriptWindow.showEarlier}
+              deepLinkedMessageId={transcriptWindow.deepLinkedMessageId}
+            />
+            {timelineItems.map((item, index) => {
+              // Only the end of a long transcript is mounted (see
+              // useTranscriptWindow); earlier items render on scroll-up.
+              if (index < transcriptWindow.start) return null;
+              if (item.kind === "chat-error") {
+                return (
+                  <InlineChatError
+                    key={`chat-error-${item.chatError.id}`}
+                    error={new Error(JSON.stringify(item.chatError.error))}
+                    conversationId={conversationId}
+                    supportMessage={organization?.chatErrorSupportMessage}
+                    slimChatErrorUi={organization?.slimChatErrorUi ?? false}
+                    agentName={agentName}
+                    selectedModel={selectedModel}
+                    modelSource={modelSource}
+                    onProviderConnected={onProviderConnected}
+                    onRetry={
+                      index > lastMessageTimelineIndex
+                        ? onChatErrorRetry
+                        : undefined
+                    }
+                  />
+                );
+              }
+
+              if (item.kind === "compaction") {
+                return (
+                  <ContextCompactionTimelineEvent
+                    key={`compaction-${item.compaction.id}`}
+                    compaction={item.compaction}
+                  />
+                );
+              }
+
+              const { message, messageIndex: idx } = item;
+              const isDimmed =
+                editingMessageIndex !== -1 && idx > editingMessageIndex;
+
+              return (
+                <div
+                  key={message.id || idx}
+                  // Deep-link target (#message-<id>, see useTranscriptWindow).
+                  id={message.id ? `message-${message.id}` : undefined}
+                  className={cn(isDimmed && "opacity-40 transition-opacity")}
+                >
+                  {(() => {
+                    // Guarded calls in the turn still running read as
+                    // running until they settle.
+                    const turnActive =
+                      isTurnLive &&
+                      message.role === "assistant" &&
+                      idx === messages.length - 1;
+                    const { groupMap, consumedIndices, remedyChainCards } =
+                      identifyCompactToolGroups(message.parts, {
+                        role: message.role,
+                        nonCompactToolNames,
+                        getToolShortName,
+                        mcpAppToolCallIds: new Set(
+                          Object.keys(earlyToolUiStarts),
+                        ),
+                      });
+                    const compactEntriesByStartIndex = new Map(
+                      [...groupMap.entries()].map(([startIndex, group]) => [
+                        startIndex,
+                        group.entries.map((entry) =>
+                          entry.kind === "hook"
+                            ? {
+                                kind: "hook" as const,
+                                key: `${message.id}-hook-${entry.partIndex}`,
+                                data: entry.data,
+                              }
+                            : entry.kind === "app"
+                              ? {
+                                  kind: "app" as const,
+                                  key: getToolEntryKey(message.id, entry),
+                                  toolName: entry.toolName,
+                                  part: entry.part,
+                                  toolResultPart: entry.toolResultPart,
+                                  errorText: entry.errorText,
+                                  remedyChain: entry.remedyChain,
+                                }
+                              : {
+                                  kind: "tool" as const,
+                                  key: getToolEntryKey(message.id, entry),
+                                  toolName: entry.toolName,
+                                  part: entry.part,
+                                  toolResultPart: entry.toolResultPart,
+                                  errorText: entry.errorText,
+                                  remedyChain: entry.remedyChain,
+                                  nestedToolCalls: subagentCallsFor(
+                                    entryCallId(entry),
+                                  ),
+                                },
+                        ),
+                      ]),
+                    );
+                    // Only the latest Guardrails policy preview/save in this
+                    // message auto-opens so earlier rows stay compact.
+                    const autoOpenPolicyKey =
+                      findLatestPolicyChangeKey({
+                        entries: [
+                          ...compactEntriesByStartIndex.values(),
+                        ].flat(),
+                        getToolShortName,
+                      }) ?? null;
+                    // Thinking blocks left touching once compact rows fold
+                    // silent tool calls between them merge into one accordion.
+                    const reasoningRuns = identifyReasoningRuns({
+                      parts: message.parts,
+                      role: message.role,
+                      groupMap,
+                      consumedIndices,
+                    });
+                    const askUserGroups =
+                      askUserGroupsByMessage.get(message.id) ?? [];
+                    const askUserGroupStarts = new Map(
+                      askUserGroups.map((group) => [group.firstIndex, group]),
+                    );
+                    const consumedAskUserIndices = new Set(
+                      askUserGroups.flatMap((group) => [
+                        ...group.consumedIndices,
+                      ]),
+                    );
+                    const partKeyTracker = new Map<string, number>();
+                    return message.parts?.map((part, i) => {
+                      const partKey = getMessagePartKey(
+                        message.id,
+                        part,
+                        partKeyTracker,
+                      );
+                      // Render compact group at its start index
+                      if (groupMap.has(i)) {
+                        const group = groupMap.get(i);
+                        const compactTools = compactEntriesByStartIndex.get(i);
+                        if (!group || !compactTools) return null;
+                        return (
+                          <ChatToolGroup
+                            key={getCompactGroupKey(
+                              message.id,
+                              group.startIndex,
+                            )}
+                            tools={compactTools}
+                            toolIconMap={toolIconMap}
+                            canExpandToolCalls={canExpandToolCalls}
+                            onToolApprovalResponse={onToolApprovalResponse}
+                            turnActive={turnActive}
+                            autoOpenPolicyKey={autoOpenPolicyKey}
+                            renderAuthCard={renderCompactAuthCard}
+                            appContext={{
+                              agentId,
+                              earlyToolUiStarts,
+                              onSendMessage: sendUserText,
+                            }}
+                          />
+                        );
+                      }
+
+                      // A guarded call that needs the full card (e.g. an
+                      // approval) still renders as one card of its target.
+                      const remedyChain = remedyChainCards.get(i);
+                      const releasedAttempt = remedyChain?.finalAttempt;
+                      if (remedyChain && releasedAttempt) {
+                        const releasedId = releasedAttempt.part.toolCallId;
+                        return (
+                          <MessageTool
+                            key={partKey}
+                            part={{ ...releasedAttempt.part }}
+                            toolResultPart={releasedAttempt.toolResultPart}
+                            toolName={releasedAttempt.toolName}
+                            agentId={agentId}
+                            canExpandToolCalls={canExpandToolCalls}
+                            onToolApprovalResponse={onToolApprovalResponse}
+                            onInstallMcp={
+                              orchestrator.triggerInstallByCatalogId
+                            }
+                            onReauthMcp={
+                              orchestrator.triggerReauthByCatalogIdAndServerId
+                            }
+                            connectedCatalogIds={
+                              orchestrator.connectedCatalogIds
+                            }
+                            getToolShortName={getToolShortName}
+                            toolIconMap={toolIconMap}
+                            earlyToolUiData={
+                              releasedId
+                                ? earlyToolUiStarts[releasedId]
+                                : undefined
+                            }
+                            onSendMessage={sendUserText}
+                            nestedToolCalls={
+                              <>
+                                <RemedyGuardrailsSteps
+                                  steps={remedyChain.steps}
+                                  onToolApprovalResponse={
+                                    onToolApprovalResponse
+                                  }
+                                />
+                                {subagentCallsFor(releasedId)}
+                              </>
+                            }
+                          />
+                        );
+                      }
+                      if (remedyChain) {
+                        return (
+                          <RemedyChainCard
+                            key={partKey}
+                            chain={remedyChain}
+                            collapsible
+                            turnActive={turnActive}
+                            canExpandToolCalls={canExpandToolCalls}
+                            onToolApprovalResponse={onToolApprovalResponse}
+                          />
+                        );
+                      }
+
+                      const askUserGroup = askUserGroupStarts.get(i);
+                      if (askUserGroup) {
+                        const toolCallIds = new Set(
+                          askUserGroup.members.map(
+                            (member) => member.toolCallId,
+                          ),
+                        );
+                        const memberOrder = new Map(
+                          askUserGroup.members.map((member, index) => [
+                            member.toolCallId,
+                            index,
+                          ]),
+                        );
+                        return (
+                          <ErrorBoundary key={askUserGroup.key}>
+                            <McpElicitationCard
+                              groupId={askUserGroup.key}
+                              members={askUserGroup.members}
+                              terminalIncomplete={
+                                status === "ready" || status === "error"
+                              }
+                              requests={pendingChoiceElicitations
+                                .filter(
+                                  (request) =>
+                                    !!request.toolCallId &&
+                                    toolCallIds.has(request.toolCallId),
+                                )
+                                .sort((a, b) => {
+                                  const aIndex = a.toolCallId
+                                    ? memberOrder.get(a.toolCallId)
+                                    : undefined;
+                                  const bIndex = b.toolCallId
+                                    ? memberOrder.get(b.toolCallId)
+                                    : undefined;
+                                  if (
+                                    aIndex !== undefined &&
+                                    bIndex !== undefined
+                                  ) {
+                                    return aIndex - bIndex;
+                                  }
+                                  return 0;
+                                })}
+                              onRespond={
+                                session?.resolveMcpElicitation ??
+                                (async () => false)
+                              }
+                              onTypeAnswer={onTypeAnswer}
+                            />
+                          </ErrorBoundary>
+                        );
+                      }
+
+                      if (consumedAskUserIndices.has(i)) {
+                        return null;
+                      }
+
+                      // Skip parts consumed by compact groups
+                      if (consumedIndices.has(i)) {
+                        return null;
+                      }
+
+                      // Skip tool result parts that immediately follow a tool invocation with same toolCallId
+                      if (
+                        isToolPart(part) &&
+                        part.state === "output-available" &&
+                        i > 0
+                      ) {
+                        const prevPart = message.parts?.[i - 1];
+                        if (
+                          isToolPart(prevPart) &&
+                          prevPart.state === "input-available" &&
+                          prevPart.toolCallId === part.toolCallId
+                        ) {
+                          return null;
+                        }
+                      }
+
+                      switch (part.type) {
+                        case "text": {
+                          // Skip blank text parts from assistant messages. Models
+                          // routinely stream a whitespace-only chunk (" ", "\n\n")
+                          // right before a tool call, which the AI SDK turns into a
+                          // text part; rendered, it shows as an empty message bubble.
+                          // Trims so whitespace-only — not just "" — is suppressed.
+                          if (isBlankAssistantTextPart(part, message.role)) {
+                            return null;
+                          }
+
+                          // Use editable component for assistant messages
+                          if (message.role === "assistant") {
+                            // A failed tool call in this message already shows
+                            // the auth card. What the model then writes about
+                            // it is its answer, so it stays as text: only a
+                            // message with no such card turns auth text into one.
+                            const authToolPart = hasMessageAuthToolError(
+                              message,
+                            )
+                              ? null
+                              : renderAssistantAuthPart({
+                                  toolName: "authentication",
+                                  authState: resolveAssistantTextAuthState(
+                                    part.text,
+                                  ),
+                                  connectedCatalogIds:
+                                    orchestrator.connectedCatalogIds,
+                                  onInstallMcp:
+                                    orchestrator.triggerInstallByCatalogId,
+                                  onReauthMcp:
+                                    orchestrator.triggerReauthByCatalogIdAndServerId,
+                                });
+                            if (authToolPart) {
+                              return (
+                                <Fragment key={partKey}>
+                                  {authToolPart}
+                                </Fragment>
+                              );
+                            }
+
+                            // Only show actions if this is the last assistant message in sequence
+                            // AND this is the last text part in the message
+                            const isLastAssistantInSequence =
+                              isLastInAssistantSequence[idx];
+
+                            // Find the last text part index in this message
+                            let lastTextPartIndex = -1;
+                            for (
+                              let j = message.parts.length - 1;
+                              j >= 0;
+                              j--
+                            ) {
+                              if (message.parts[j].type === "text") {
+                                lastTextPartIndex = j;
+                                break;
+                              }
+                            }
+
+                            const isLastTextPart = i === lastTextPartIndex;
+                            // Only show streaming animation if this text part is
+                            // actually the last part in the message. When tool
+                            // parts follow the text, the text is already complete
+                            // even though status is still "streaming".
+                            const isLastPartInMessage =
+                              i === message.parts.length - 1;
+                            const isStreamingThisPart =
+                              status === "streaming" &&
+                              idx === messages.length - 1 &&
+                              isLastTextPart &&
+                              isLastPartInMessage;
+                            const showActions =
+                              isLastAssistantInSequence &&
+                              isLastTextPart &&
+                              status !== "streaming";
+                            // Completed earlier turns keep their citations and
+                            // images while a later turn streams. Only suppress
+                            // citations for the response currently in flight to
+                            // avoid them jumping between its tool/text messages.
+                            let citationParts: typeof message.parts | undefined;
+                            if (
+                              isLastAssistantInSequence &&
+                              isLastTextPart &&
+                              (!isResponseInProgress ||
+                                idx < messages.length - 1)
+                            ) {
+                              if (
+                                hasKnowledgeBaseToolCall(message.parts ?? [])
+                              ) {
+                                citationParts = message.parts;
+                              } else {
+                                // Search backwards for KB tool calls within the same
+                                // assistant turn — stop at the next user message to
+                                // avoid showing stale citations from prior turns.
+                                for (
+                                  let prevIdx = idx - 1;
+                                  prevIdx >= 0;
+                                  prevIdx--
+                                ) {
+                                  const prev = messages[prevIdx];
+                                  if (prev.role === "user") break;
+                                  if (
+                                    prev.role === "assistant" &&
+                                    hasKnowledgeBaseToolCall(prev.parts ?? [])
+                                  ) {
+                                    citationParts = prev.parts;
+                                    break;
+                                  }
+                                }
+                              }
+                            }
+
+                            // Check for <think> tags (used by Qwen and similar models)
+                            if (hasThinkingTags(part.text)) {
+                              const parsedParts = parseThinkingTags(part.text);
+                              return (
+                                <Fragment key={partKey}>
+                                  {parsedParts.map((parsedPart, parsedIdx) => {
+                                    const parsedKey = `${partKey}-parsed-${parsedIdx}`;
+                                    if (parsedPart.type === "reasoning") {
+                                      return (
+                                        <Reasoning
+                                          key={parsedKey}
+                                          className="w-full"
+                                        >
+                                          <ReasoningTrigger />
+                                          <ReasoningContent>
+                                            {parsedPart.text}
+                                          </ReasoningContent>
+                                        </Reasoning>
+                                      );
+                                    }
+                                    // Render text parts - show actions only on the last text part
+                                    const isLastParsedTextPart =
+                                      parsedIdx ===
+                                      parsedParts.length -
+                                        1 -
+                                        [...parsedParts]
+                                          .reverse()
+                                          .findIndex((p) => p.type === "text");
+                                    return (
+                                      <EditableAssistantMessage
+                                        key={parsedKey}
+                                        messageId={message.id}
+                                        partIndex={i}
+                                        partKey={partKey}
+                                        text={parsedPart.text}
+                                        policyDiffReferences={policyDiffReferences
+                                          .get(message.id)
+                                          ?.get(i)}
+                                        isEditing={editingPartKey === partKey}
+                                        showActions={
+                                          showActions && isLastParsedTextPart
+                                        }
+                                        citationParts={
+                                          isLastParsedTextPart
+                                            ? citationParts
+                                            : undefined
+                                        }
+                                        isStreaming={
+                                          isStreamingThisPart &&
+                                          isLastParsedTextPart
+                                        }
+                                        editDisabled={isResponseInProgress}
+                                        onStartEdit={
+                                          readOnly ? undefined : handleStartEdit
+                                        }
+                                        onCancelEdit={handleCancelEdit}
+                                        onSave={handleSaveAssistantMessage}
+                                        feedback={getMessageFeedback(message)}
+                                        onFeedbackChange={
+                                          onMessageFeedback
+                                            ? handleMessageFeedback
+                                            : undefined
+                                        }
+                                        feedbackDisabled={feedbackDisabled}
+                                      />
+                                    );
+                                  })}
+                                </Fragment>
+                              );
+                            }
+
+                            return (
+                              <Fragment key={partKey}>
+                                <EditableAssistantMessage
+                                  messageId={message.id}
+                                  partIndex={i}
+                                  partKey={partKey}
+                                  text={part.text}
+                                  policyDiffReferences={policyDiffReferences
+                                    .get(message.id)
+                                    ?.get(i)}
+                                  isEditing={editingPartKey === partKey}
+                                  showActions={showActions}
+                                  citationParts={citationParts}
+                                  isStreaming={isStreamingThisPart}
+                                  editDisabled={isResponseInProgress}
+                                  onStartEdit={
+                                    readOnly ? undefined : handleStartEdit
+                                  }
+                                  onCancelEdit={handleCancelEdit}
+                                  onSave={handleSaveAssistantMessage}
+                                  feedback={getMessageFeedback(message)}
+                                  onFeedbackChange={
+                                    onMessageFeedback
+                                      ? handleMessageFeedback
+                                      : undefined
+                                  }
+                                  feedbackDisabled={feedbackDisabled}
+                                />
+                              </Fragment>
+                            );
+                          }
+
+                          // Use editable component for user messages
+                          if (message.role === "user") {
+                            return (
+                              <Fragment key={partKey}>
+                                <EditableUserMessage
+                                  messageId={message.id}
+                                  partIndex={i}
+                                  partKey={partKey}
+                                  text={part.text}
+                                  isEditing={editingPartKey === partKey}
+                                  editDisabled={isResponseInProgress}
+                                  attachments={getFileAttachments(
+                                    message.parts,
+                                  )}
+                                  conversationId={conversationId}
+                                  canSaveToKnowledge={canSaveToKnowledge}
+                                  skill={getSkillAttribution(message.metadata)}
+                                  onStartEdit={
+                                    readOnly ? undefined : handleStartEdit
+                                  }
+                                  onCancelEdit={handleCancelEdit}
+                                  onSave={handleSaveUserMessage}
+                                />
+                              </Fragment>
+                            );
+                          }
+
+                          // Regular rendering for system messages
+                          return (
+                            <Fragment key={partKey}>
+                              <Message from={message.role}>
+                                <MessageContent>
+                                  {message.role === "system" && (
+                                    <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                                      System Prompt
+                                    </div>
+                                  )}
+                                  <Response>{part.text}</Response>
+                                </MessageContent>
+                              </Message>
+                            </Fragment>
+                          );
+                        }
+
+                        case "reasoning": {
+                          const run = reasoningRuns.get(i);
+                          // No run means nothing renders here: either a
+                          // redacted/signature-only block (empty, kept for
+                          // provider replay, never an empty "Thinking…"
+                          // accordion) or a block already folded into a run that
+                          // rendered at an earlier index.
+                          if (!run) {
+                            return null;
+                          }
+                          const isLastMessage = idx === messages.length - 1;
+                          const isStreamingThisReasoning =
+                            status === "streaming" &&
+                            isLastMessage &&
+                            run.lastIndex === message.parts.length - 1;
+                          return (
+                            <Reasoning
+                              key={partKey}
+                              className="w-full"
+                              isStreaming={isStreamingThisReasoning}
+                              // Nothing has rendered below the run yet, so more
+                              // thinking may still join it — keep reading
+                              // "Thinking…" until something does.
+                              keepOpen={
+                                status === "streaming" &&
+                                isLastMessage &&
+                                run.isTrailing
+                              }
+                            >
+                              <ReasoningTrigger />
+                              <ReasoningContent>{run.text}</ReasoningContent>
+                            </Reasoning>
+                          );
+                        }
+
+                        case "file": {
+                          // User file attachments are normally rendered inside EditableUserMessage
+                          // But if there's no text part, we need to render them here
+                          if (message.role === "user") {
+                            // If there's a text part, files will be rendered with EditableUserMessage
+                            if (hasTextPart(message.parts)) {
+                              return null;
+                            }
+
+                            // For file-only messages, render on the first file part only
+                            const isFirstFilePart =
+                              message.parts?.findIndex(
+                                (p) => p.type === "file",
+                              ) === i;
+
+                            if (!isFirstFilePart) {
+                              return null;
+                            }
+
+                            const partKey = `${message.id}-${i}`;
+
+                            return (
+                              <Fragment key={partKey}>
+                                <EditableUserMessage
+                                  messageId={message.id}
+                                  partIndex={i}
+                                  partKey={partKey}
+                                  text=""
+                                  isEditing={editingPartKey === partKey}
+                                  editDisabled={isResponseInProgress}
+                                  attachments={getFileAttachments(
+                                    message.parts,
+                                  )}
+                                  conversationId={conversationId}
+                                  canSaveToKnowledge={canSaveToKnowledge}
+                                  skill={getSkillAttribution(message.metadata)}
+                                  onStartEdit={
+                                    readOnly ? undefined : handleStartEdit
+                                  }
+                                  onCancelEdit={handleCancelEdit}
+                                  onSave={handleSaveUserMessage}
+                                />
+                              </Fragment>
+                            );
+                          }
+
+                          // Render file attachments for assistant/system messages
+                          const filePart = part as {
+                            type: "file";
+                            url: string;
+                            mediaType: string;
+                            filename?: string;
+                          };
+                          const isImage =
+                            filePart.mediaType?.startsWith("image/");
+                          const isAudio =
+                            filePart.mediaType?.startsWith("audio/");
+                          const isVideo =
+                            filePart.mediaType?.startsWith("video/");
+                          const isPdf =
+                            filePart.mediaType === "application/pdf";
+
+                          return (
+                            <div
+                              key={partKey}
+                              className="mb-4 flex justify-start"
+                            >
+                              <div className="max-w-sm">
+                                {isImage && (
+                                  <AttachmentImage
+                                    url={filePart.url}
+                                    conversationId={conversationId}
+                                    alt={filePart.filename || "Attached image"}
+                                    className="max-w-full max-h-64 rounded-lg object-contain"
+                                  />
+                                )}
+                                {isAudio && (
+                                  <AttachmentAudio
+                                    url={filePart.url}
+                                    conversationId={conversationId}
+                                  />
+                                )}
+                                {isVideo && (
+                                  <AttachmentVideo
+                                    url={filePart.url}
+                                    conversationId={conversationId}
+                                    className="max-w-full max-h-64 rounded-lg"
+                                  />
+                                )}
+                                {isPdf && (
+                                  <AttachmentLink
+                                    url={filePart.url}
+                                    conversationId={conversationId}
+                                    download={filePart.filename}
+                                    className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2 hover:bg-muted transition-colors"
+                                  >
+                                    <svg
+                                      className="h-6 w-6 text-red-500"
+                                      fill="currentColor"
+                                      viewBox="0 0 24 24"
+                                    >
+                                      <title>PDF Document</title>
+                                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zm-3 9h2v2H10v-2zm0 3h2v2H10v-2zm-3-3h2v2H7v-2zm0 3h2v2H7v-2z" />
+                                    </svg>
+                                    <span className="font-medium truncate">
+                                      {filePart.filename || "PDF Document"}
+                                    </span>
+                                  </AttachmentLink>
+                                )}
+                                {!isImage && !isVideo && !isPdf && !isAudio && (
+                                  <AttachmentLink
+                                    url={filePart.url}
+                                    conversationId={conversationId}
+                                    download={filePart.filename}
+                                    className="flex items-center gap-2 text-sm rounded-lg border bg-muted/50 p-2 hover:bg-muted transition-colors"
+                                  >
+                                    <svg
+                                      className="h-5 w-5 text-muted-foreground"
+                                      fill="none"
+                                      stroke="currentColor"
+                                      viewBox="0 0 24 24"
+                                    >
+                                      <title>File Attachment</title>
+                                      <path
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                        strokeWidth={2}
+                                        d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"
+                                      />
+                                    </svg>
+                                    <span className="truncate">
+                                      {filePart.filename || "Attached file"}
+                                    </span>
+                                  </AttachmentLink>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        }
+
+                        case "dynamic-tool": {
+                          if (!isToolPart(part)) return null;
+                          const toolName = part.toolName;
+
+                          // Skip if a data-tool-ui-start already owns this toolCallId
+                          // (it renders the full input/output lifecycle itself).
+                          const tcId = part.toolCallId;
+                          const hasEarlyStart =
+                            tcId &&
+                            (message.parts ?? []).some(
+                              (p) =>
+                                p.type?.startsWith("data-tool-ui-start") &&
+                                (p as { data?: { toolCallId?: string } }).data
+                                  ?.toolCallId === tcId,
+                            );
+                          if (hasEarlyStart) return null;
+
+                          // Look ahead for tool result (same tool call ID)
+                          let toolResultPart = null;
+                          const nextPart = message.parts?.[i + 1];
+                          if (
+                            nextPart &&
+                            isToolPart(nextPart) &&
+                            nextPart.type === "dynamic-tool" &&
+                            nextPart.state === "output-available" &&
+                            nextPart.toolCallId === part.toolCallId
+                          ) {
+                            toolResultPart = nextPart;
+                          }
+
+                          return (
+                            // Shallow-copy so MessageTool's by-value memo
+                            // comparator sees a distinct object: the AI SDK
+                            // mutates a tool part in place (same reference) when
+                            // its result lands, which otherwise hides the
+                            // input-available -> output-available transition.
+                            <MessageTool
+                              part={{ ...part }}
+                              key={partKey}
+                              toolResultPart={toolResultPart}
+                              toolName={toolName}
+                              agentId={agentId}
+                              canExpandToolCalls={canExpandToolCalls}
+                              onToolApprovalResponse={onToolApprovalResponse}
+                              onInstallMcp={
+                                orchestrator.triggerInstallByCatalogId
+                              }
+                              onReauthMcp={
+                                orchestrator.triggerReauthByCatalogIdAndServerId
+                              }
+                              connectedCatalogIds={
+                                orchestrator.connectedCatalogIds
+                              }
+                              getToolShortName={getToolShortName}
+                              toolIconMap={toolIconMap}
+                              earlyToolUiData={
+                                part.toolCallId
+                                  ? earlyToolUiStarts[part.toolCallId]
+                                  : undefined
+                              }
+                              onSendMessage={sendUserText}
+                            />
+                          );
+                        }
+
+                        default: {
+                          // A tool call that detached into a background task.
+                          // Live while it runs (the backend re-emits the part on
+                          // each status change, and the AI SDK reconciles it by
+                          // id), and persisted so the turn still explains itself
+                          // after a reload.
+                          // Background-task state is rendered on the tool call it
+                          // backs (circle dot + expanded card), not as a block of
+                          // its own — a call taking a while is a property of that
+                          // call, not a separate event in the transcript.
+                          if (part.type === MCP_TASK_PART_TYPE) {
+                            return null;
+                          }
+
+                          // Non-fatal notice the backend appends to a reply the
+                          // model ended early (e.g. output limit reached).
+                          if (part.type === TURN_NOTICE_PART_TYPE) {
+                            return (
+                              <InlineChatError
+                                key={partKey}
+                                error={
+                                  new Error(
+                                    JSON.stringify(
+                                      (part as { data?: unknown }).data,
+                                    ),
+                                  )
+                                }
+                                conversationId={conversationId}
+                                slimChatErrorUi={
+                                  organization?.slimChatErrorUi ?? false
+                                }
+                              />
+                            );
+                          }
+
+                          // Inline hook-run debug entry (a model-invisible
+                          // `data-hook-run` part the backend splices into the turn).
+                          if (part.type === HOOK_RUN_PART_TYPE) {
+                            return (
+                              <HookRunChip
+                                key={partKey}
+                                data={(part as { data?: HookRunChipData }).data}
+                              />
+                            );
+                          }
+
+                          // data-tool-ui-start: early MCP App initialisation.
+                          // This is the canonical render for the tool UI. It looks ahead
+                          // in the parts array to find the matching input/output parts so
+                          // a single <MessageTool> covers the full lifecycle.
+                          if (part.type?.startsWith("data-tool-ui-start")) {
+                            // biome-ignore lint/suspicious/noExplicitAny: data-tool-ui-start shape is dynamic
+                            const earlyPart = part as any;
+                            const tcId = earlyPart.data?.toolCallId as
+                              | string
+                              | undefined;
+                            const toolName = earlyPart.data?.toolName as
+                              | string
+                              | undefined;
+                            if (!tcId || !toolName) return null;
+
+                            // Find the matching tool-* parts (may or may not exist yet)
+                            // biome-ignore lint/suspicious/noExplicitAny: part shape varies
+                            const allParts = (message.parts ?? []) as any[];
+                            const inputPart = allParts.find(
+                              (p) =>
+                                isToolPart(p) &&
+                                p.toolCallId === tcId &&
+                                p.state !== "output-available",
+                            ) as ToolUIPart | undefined;
+
+                            const outputPart = (allParts.find(
+                              (p) =>
+                                isToolPart(p) &&
+                                p.toolCallId === tcId &&
+                                p.state === "output-available",
+                            ) ?? null) as ToolUIPart | null;
+
+                            // Synthetic part used until the real tool-* part appears.
+                            // If only outputPart exists (tool already done), borrow its input.
+                            const effectivePart = (inputPart ?? {
+                              type: `tool-${toolName}` as `tool-${string}`,
+                              toolCallId: tcId,
+                              state: outputPart
+                                ? ("output-available" as const)
+                                : ("input-streaming" as const),
+                              input: outputPart?.input ?? {},
+                              output: outputPart?.output,
+                            }) as ToolUIPart;
+
+                            return (
+                              <MessageTool
+                                key={`${message.id}-${tcId}`}
+                                part={effectivePart}
+                                toolResultPart={outputPart}
+                                toolName={toolName}
+                                agentId={agentId}
+                                canExpandToolCalls={canExpandToolCalls}
+                                onToolApprovalResponse={onToolApprovalResponse}
+                                onInstallMcp={
+                                  orchestrator.triggerInstallByCatalogId
+                                }
+                                onReauthMcp={
+                                  orchestrator.triggerReauthByCatalogIdAndServerId
+                                }
+                                connectedCatalogIds={
+                                  orchestrator.connectedCatalogIds
+                                }
+                                getToolShortName={getToolShortName}
+                                toolIconMap={toolIconMap}
+                                onSendMessage={sendUserText}
+                                earlyToolUiData={earlyToolUiStarts[tcId]}
+                              />
+                            );
+                          }
+
+                          // Regular tool-* parts: skip if a data-tool-ui-start already
+                          // rendered this toolCallId (it owns the full lifecycle above).
+                          if (
+                            isToolPart(part) &&
+                            part.type?.startsWith("tool-")
+                          ) {
+                            const tcId = part.toolCallId;
+                            const hasEarlyStart =
+                              tcId &&
+                              (message.parts ?? []).some(
+                                (p) =>
+                                  p.type?.startsWith("data-tool-ui-start") &&
+                                  (p as { data?: { toolCallId?: string } }).data
+                                    ?.toolCallId === tcId,
+                              );
+                            if (hasEarlyStart) return null;
+
+                            const toolName = part.type.replace("tool-", "");
+
+                            // Look ahead for tool result (same tool call ID)
+                            // biome-ignore lint/suspicious/noExplicitAny: Tool result structure varies by tool type
+                            let toolResultPart: any = null;
+                            const nextPart = message.parts?.[i + 1];
+                            if (
+                              nextPart &&
+                              isToolPart(nextPart) &&
+                              nextPart.type?.startsWith("tool-") &&
+                              nextPart.state === "output-available" &&
+                              nextPart.toolCallId === part.toolCallId
+                            ) {
+                              toolResultPart = nextPart;
+                            }
+
+                            return (
+                              // Shallow-copy so MessageTool's by-value memo
+                              // comparator sees a distinct object: the AI SDK
+                              // mutates a tool part in place (same reference)
+                              // when its result lands, which otherwise hides the
+                              // input-available -> output-available transition.
+                              <MessageTool
+                                key={partKey}
+                                part={{ ...part }}
+                                toolResultPart={toolResultPart}
+                                toolName={toolName}
+                                agentId={agentId}
+                                canExpandToolCalls={canExpandToolCalls}
+                                onToolApprovalResponse={onToolApprovalResponse}
+                                onInstallMcp={
+                                  orchestrator.triggerInstallByCatalogId
+                                }
+                                onReauthMcp={
+                                  orchestrator.triggerReauthByCatalogIdAndServerId
+                                }
+                                connectedCatalogIds={
+                                  orchestrator.connectedCatalogIds
+                                }
+                                getToolShortName={getToolShortName}
+                                toolIconMap={toolIconMap}
+                                earlyToolUiData={
+                                  tcId ? earlyToolUiStarts[tcId] : undefined
+                                }
+                                onSendMessage={sendUserText}
+                                nestedToolCalls={subagentCallsFor(tcId)}
+                              />
+                            );
+                          }
+
+                          // Skip step-start and other non-renderable parts
+                          return null;
+                        }
+                      }
+                    });
+                  })()}
+                </div>
+              );
+            })}
+            {/* Inline error display */}
+            {error && !hasRenderedLiveError && (
+              <InlineChatError
+                error={error}
+                conversationId={conversationId}
+                supportMessage={organization?.chatErrorSupportMessage}
+                slimChatErrorUi={organization?.slimChatErrorUi ?? false}
+                agentName={agentName}
+                selectedModel={selectedModel}
+                modelSource={modelSource}
+                onProviderConnected={onProviderConnected}
+                onRetry={onChatErrorRetry}
+              />
+            )}
+            {compactPendingToolCalls.length > 0 && (
+              <ChatToolGroup
+                key="optimistic-compact-tools"
+                tools={compactPendingToolCalls.map((toolCall) => ({
+                  kind: "tool" as const,
+                  key: `optimistic-tool-${toolCall.toolCallId}`,
+                  toolName: toolCall.toolName,
+                  part: {
+                    type: "dynamic-tool",
+                    toolName: toolCall.toolName,
+                    toolCallId: toolCall.toolCallId,
+                    state: "input-available",
+                    input: toolCall.input,
+                  },
+                  toolResultPart: null,
+                  errorText: undefined,
+                }))}
+                toolIconMap={toolIconMap}
+                canExpandToolCalls={canExpandToolCalls}
+                onToolApprovalResponse={onToolApprovalResponse}
+                turnActive={isTurnLive}
+                autoOpenPolicyKey={null}
+                renderAuthCard={renderCompactAuthCard}
+              />
+            )}
+            {nonCompactPendingToolCalls.map((toolCall) => (
+              <MessageTool
+                part={{
+                  type: "dynamic-tool",
+                  toolName: toolCall.toolName,
+                  toolCallId: toolCall.toolCallId,
+                  state: "input-available",
+                  input: toolCall.input,
+                }}
+                key={`optimistic-tool-${toolCall.toolCallId}`}
+                toolResultPart={null}
+                toolName={toolCall.toolName}
+                agentId={agentId}
+                canExpandToolCalls={canExpandToolCalls}
+                onToolApprovalResponse={onToolApprovalResponse}
+                onInstallMcp={orchestrator.triggerInstallByCatalogId}
+                onReauthMcp={orchestrator.triggerReauthByCatalogIdAndServerId}
+                connectedCatalogIds={orchestrator.connectedCatalogIds}
+                getToolShortName={getToolShortName}
+                toolIconMap={toolIconMap}
+              />
+            ))}
+            {session && ungroupedPendingChoiceElicitations.length > 0 ? (
+              <McpElicitationCard
+                requests={ungroupedPendingChoiceElicitations}
+                onRespond={session.resolveMcpElicitation}
+                onTypeAnswer={onTypeAnswer}
+              />
+            ) : null}
+            <ContextCompactionStatus
+              isCompacting={
+                contextCompaction?.isCompacting || isContextCompacting
+              }
+              feedback={contextCompactionFeedback}
+            />
+            {isUpstreamIdle && <UpstreamIdleNotice />}
+            {isResponseInProgress && !hasPendingMcpElicitation && (
+              <div className="absolute bottom-[-10] left-0">
+                <Message from="assistant">
+                  <img
+                    src={appIconLogo}
+                    alt="Loading logo"
+                    className="h-6 w-auto object-contain [animation:archestra-chat-logo-bounce_700ms_ease-in-out_200ms_infinite]"
+                  />
+                </Message>
+              </div>
+            )}
+          </div>
+        </ConversationContent>
+        {/* After the scroller: React attaches a host element's ref after its
+            children's layout effects, and before a later sibling's. */}
+        <OpenAtEnd />
+        <ChatScrollButton assistantMessageCount={assistantMessageCount} />
+        <McpInstallDialogs orchestrator={orchestrator} />
+      </Conversation>
+    </McpTaskProvider>
+  );
+
+  return (
+    <PreviewedChangesProvider value={previewedChanges}>
+      {conversation}
+    </PreviewedChangesProvider>
+  );
+}
+
+/** The call whose subagent tool calls nest under an entry: a guarded call's released attempt. */
+function entryCallId(entry: {
+  part: DynamicToolUIPart | ToolUIPart;
+  remedyChain?: RemedyChain;
+}): string | undefined {
+  return (
+    entry.remedyChain?.finalAttempt?.part.toolCallId ?? entry.part.toolCallId
+  );
+}
+
+function getCompactGroupKey(messageId: string, startIndex: number): string {
+  return `${messageId}-compact-${startIndex}`;
+}
+
+function getToolEntryKey(
+  messageId: string,
+  entry: {
+    toolName: string;
+    part: DynamicToolUIPart | ToolUIPart;
+  },
+): string {
+  return `${messageId}-${entry.part.toolCallId ?? entry.toolName}`;
+}
+
+function getMessagePartKey(
+  messageId: string,
+  part: UIMessage["parts"][number],
+  keyTracker: Map<string, number>,
+): string {
+  const signature = getMessagePartSignature(part);
+  const occurrence = keyTracker.get(signature) ?? 0;
+  keyTracker.set(signature, occurrence + 1);
+  return `${messageId}-${signature}-${occurrence}`;
+}
+
+function getMessagePartSignature(part: UIMessage["parts"][number]): string {
+  if (isToolPart(part)) {
+    return `tool:${part.toolCallId ?? part.type}`;
+  }
+
+  switch (part.type) {
+    case "text":
+      return "text";
+    case "reasoning":
+      return "reasoning";
+    case "file":
+      return `file:${part.url}:${part.mediaType}:${part.filename ?? ""}`;
+    default:
+      return `part:${JSON.stringify(part)}`;
+  }
+}
+
+/**
+ * The transcript in the server's HTML opens at its end: until the page takes
+ * over, its scroller lays out bottom-up, which browsers scroll to the end (the
+ * auto bottom margin keeps a short transcript at the top and collapses once
+ * it overflows). The HTML streams in hidden segments, so a script could not
+ * scroll it, and stick-to-bottom only starts after hydration. The scroller is
+ * `overflow-y-auto` from the HTML on, rather than from stick-to-bottom's mount
+ * effect, so the HTML scrolls it.
+ */
+const OPEN_AT_END_SCROLL_CLASS =
+  "overflow-y-auto [&:not([data-taken-over])]:flex [&:not([data-taken-over])]:flex-col-reverse [&:not([data-taken-over])>*]:shrink-0 [&:not([data-taken-over])>*]:mb-auto";
+
+/**
+ * Hands the scroller to stick-to-bottom as the transcript hydrates: the
+ * bottom-up layout is dropped and the end kept in view, before the first
+ * client paint. This marks the element instead of re-rendering: an update
+ * reaching the transcript's message boundaries before they finish hydrating
+ * would make React discard their server HTML and render them again.
+ */
+function OpenAtEnd() {
+  const { scrollRef } = useStickToBottomContext();
+  useLayoutEffect(() => {
+    const scroller = scrollRef.current;
+    if (!scroller || "takenOver" in scroller.dataset) return;
+    scroller.dataset.takenOver = "";
+    if (!window.location.hash.startsWith("#message-")) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }, [scrollRef]);
+  return null;
+}
+
+/**
+ * The chat's circle row. A click on a circle is the person reading that call,
+ * so the chat stops following its own bottom: the row they clicked stays
+ * where it is while the card opens or closes under it. The chat follows the
+ * bottom again once they scroll back down to it.
+ */
+function ChatToolGroup(props: ComponentProps<typeof CompactToolGroup>) {
+  const { stopScroll } = useStickToBottomContext();
+  return <CompactToolGroup {...props} onBeforeToggle={stopScroll} />;
+}
+
+// Re-engage stick-to-bottom when the user sends a new message.
+// If the user has scrolled up, the library keeps state.isAtBottom=false and
+// won't auto-scroll on content resize — this resets it on the submit transition.
+function ScrollToBottomOnSubmit({ status }: { status: ChatStatus }) {
+  const { scrollToBottom } = useStickToBottomContext();
+  const prevStatusRef = useRef(status);
+
+  useEffect(() => {
+    if (status === "submitted" && prevStatusRef.current !== "submitted") {
+      scrollToBottom();
+    }
+
+    prevStatusRef.current = status;
+  }, [status, scrollToBottom]);
+
+  return null;
+}
+
+function ScrollToBottomOnContextCompaction({
+  isCompacting,
+  feedback,
+}: {
+  isCompacting: boolean;
+  feedback: ChatMessagesProps["contextCompactionFeedback"];
+}) {
+  const { scrollToBottom } = useStickToBottomContext();
+  const statusKey = isCompacting
+    ? "pending"
+    : feedback
+      ? `${feedback.status}:${feedback.message}`
+      : null;
+
+  useEffect(() => {
+    if (statusKey) {
+      scrollToBottom();
+    }
+  }, [scrollToBottom, statusKey]);
+
+  return null;
+}
+
+// Scroll-to-bottom FAB with a "New messages" label when a new assistant
+// message has arrived while the user is scrolled up.
+function ChatScrollButton({
+  assistantMessageCount,
+}: {
+  assistantMessageCount: number;
+}) {
+  const { isAtBottom } = useStickToBottomContext();
+  const lastSeenCountRef = useRef(assistantMessageCount);
+
+  useEffect(() => {
+    if (isAtBottom) {
+      lastSeenCountRef.current = assistantMessageCount;
+    }
+  }, [isAtBottom, assistantMessageCount]);
+
+  const hasNewMessages =
+    !isAtBottom && assistantMessageCount > lastSeenCountRef.current;
+
+  return (
+    <ConversationScrollButton
+      label={hasNewMessages ? "New messages" : undefined}
+    />
+  );
+}
+
+const MessageTool = memo(
+  function MessageTool({
+    part,
+    toolResultPart,
+    toolName,
+    agentId,
+    canExpandToolCalls = true,
+    onToolApprovalResponse,
+    onInstallMcp,
+    onReauthMcp,
+    connectedCatalogIds,
+    getToolShortName,
+    onSendMessage,
+    earlyToolUiData,
+    toolIconMap,
+    nestedToolCalls,
+  }: {
+    part: ToolUIPart | DynamicToolUIPart;
+    toolResultPart: ToolUIPart | DynamicToolUIPart | null;
+    toolName: string;
+    agentId?: string;
+    canExpandToolCalls?: boolean;
+    onToolApprovalResponse?: (params: {
+      id: string;
+      approved: boolean;
+      reason?: string;
+    }) => void;
+    onInstallMcp?: (catalogId: string) => void;
+    onReauthMcp?: (catalogId: string, serverId: string) => void;
+    connectedCatalogIds: ReadonlySet<string>;
+    getToolShortName: (toolName: string) => ArchestraToolShortName | null;
+    onSendMessage?: (text: string) => void;
+    toolIconMap?: ToolIconMap;
+    // Delegation cards only: the surfaced subagent tool calls, rendered between
+    // this card's Request and Result so the delegation reads in causal order
+    // (prompt in -> child tools run -> answer out).
+    nestedToolCalls?: React.ReactNode;
+    earlyToolUiData?: {
+      uiResourceUri: string;
+      html?: string;
+      csp?: { connectDomains?: string[]; resourceDomains?: string[] };
+      permissions?: {
+        camera?: boolean;
+        microphone?: boolean;
+        geolocation?: boolean;
+        clipboardWrite?: boolean;
+      };
+    };
+  }) {
+    const rawOutput = toolResultPart ? toolResultPart.output : part.output;
+    const mcpOutput = rawOutput as McpToolOutput | undefined;
+    const uiMeta = mcpOutput?._meta?.ui as
+      | { resourceUri?: string; mcpServerId?: string }
+      | undefined;
+    const uiResourceUri = uiMeta?.resourceUri ?? earlyToolUiData?.uiResourceUri;
+    // Whose credential the gateway used against the upstream server. Present
+    // only once the call has run, so the badge appears with the result.
+    const executedAs = extractMcpExecutedAs(mcpOutput);
+    // A server-scoped deep link (apps-page open-in-chat) stamps the concrete
+    // install so the chat mounts against it instead of the agent gateway.
+    const uiMcpServerId = uiMeta?.mcpServerId;
+    // An owned app's own render (e.g. its `__open` launch tool) carries a
+    // `ui://archestra-app/<appId>` URI; bind it so the app runs against the
+    // app-bound endpoint (/api/mcp/app/:appId), not the agent gateway.
+    const uiAppId = uiResourceUri
+      ? parseArchestraAppResourceUri(uiResourceUri)
+      : null;
+
+    // When the model dispatched through run_tool, the MCP App belongs to the
+    // *target* tool. Unwrap so the app receives the target tool's name (for the
+    // sandbox origin and tool callbacks) and its real arguments (e.g. Excalidraw
+    // elements) instead of the run_tool wrapper.
+    const runToolInput =
+      getToolShortName(toolName) === TOOL_RUN_TOOL_SHORT_NAME
+        ? (part.input as {
+            tool_name?: string;
+            tool_args?: Record<string, unknown>;
+          } | null)
+        : null;
+    const mcpAppToolName = resolveRunToolTargetName(part, toolName, {
+      getToolShortName,
+    });
+    const mcpAppToolInput =
+      runToolInput?.tool_args ?? (part.input as Record<string, unknown>);
+
+    const errorText = getToolErrorText({ part, toolResultPart });
+    const policyToolName = parseFullToolName(mcpAppToolName).toolName;
+    const validationChange = [
+      "preview_guardrails_validation_change",
+      "update_guardrails_validation",
+    ].includes(getToolShortName(mcpAppToolName) ?? "");
+    const policyChange =
+      (validationChange || isPolicyChangeTool(policyToolName)) &&
+      !errorText &&
+      isOpenAppaPolicyChange(rawOutput, validationChange, part.input);
+
+    const isApprovalRequested = part.state === "approval-requested";
+    const isToolDenied = part.state === "output-denied";
+    const approvalDisplay = getApprovalToolDisplay({
+      toolName,
+      input: part.input,
+      isApprovalRequested,
+      getToolShortName,
+    });
+    const displayToolName = approvalDisplay.toolName;
+    const displayInput = withoutProxyTransportArguments({
+      toolName: displayToolName,
+      shortName: getToolShortName(displayToolName),
+      input: approvalDisplay.input,
+    });
+    const hasInput = hasToolRequest(displayInput);
+    const hasNestedToolCalls = Boolean(nestedToolCalls);
+    const hasContent = Boolean(
+      hasInput ||
+        errorText ||
+        isApprovalRequested ||
+        hasNestedToolCalls ||
+        (toolResultPart && Boolean(toolResultPart.output)) ||
+        (!toolResultPart && Boolean(part.output)),
+    );
+    const credentialSetup =
+      getToolShortName(toolName) === "request_runtime_credential_setup" &&
+      !errorText &&
+      (part.state === "output-available" || Boolean(toolResultPart));
+    const batteryCredentials =
+      getToolShortName(toolName) ===
+        TOOL_REQUEST_BATTERY_CREDENTIALS_SHORT_NAME && !errorText
+        ? parseBatteryCredentialRequest(rawOutput)
+        : null;
+    const shouldDefaultOpen =
+      isApprovalRequested ||
+      policyChange ||
+      credentialSetup ||
+      batteryCredentials !== null;
+
+    // Hooks must be called before any early returns
+    const { data: session } = useSession();
+    // A proposal of a file this conversation previewed: the person approving
+    // it reads that preview's diff, not the raw file a second time.
+    const previewed = usePreviewedChange(part.toolCallId);
+    const previewedChange =
+      previewed &&
+      !policyChange &&
+      !errorText &&
+      !toolResultPart &&
+      !part.output
+        ? previewed
+        : null;
+    const viewerUserId = session?.user?.id;
+    const [isOpen, setIsOpen] = useState(shouldDefaultOpen);
+    const [userDenied, setUserDenied] = useState(false);
+    const [userHasInteracted, setUserHasInteracted] = useState(false);
+    const prevShouldDefaultOpenRef = useRef(shouldDefaultOpen);
+
+    useEffect(() => {
+      const prev = prevShouldDefaultOpenRef.current;
+      if (!userHasInteracted) {
+        setIsOpen(shouldDefaultOpen);
+      } else if (shouldDefaultOpen && !prev) {
+        // shouldDefaultOpen changed from false to true -> auto-open
+        setIsOpen(true);
+      }
+      prevShouldDefaultOpenRef.current = shouldDefaultOpen;
+    }, [shouldDefaultOpen, userHasInteracted]);
+    const handleOpenChange = useCallback(
+      (open: boolean) => {
+        setIsOpen(open);
+        if (open !== shouldDefaultOpen) {
+          setUserHasInteracted(true);
+        }
+      },
+      [shouldDefaultOpen],
+    );
+
+    const toolAuthState = resolveToolAuthState({
+      errorText,
+      rawOutput,
+    });
+
+    const authToolBody =
+      renderToolAuthPart({
+        toolName,
+        authState: toolAuthState,
+        connectedCatalogIds,
+        onInstallMcp,
+        onReauthMcp,
+      }) ??
+      // A desktop MCP tool with no device to run on: offer the MCP bridge.
+      (isNoDeviceError({ errorText, rawOutput }) ? <NoDeviceToolCard /> : null);
+
+    if (getToolShortName(toolName) === TOOL_TODO_WRITE_SHORT_NAME) {
+      return (
+        <TodoWriteTool
+          part={part}
+          toolResultPart={toolResultPart}
+          errorText={errorText}
+          onToolApprovalResponse={onToolApprovalResponse}
+        />
+      );
+    }
+
+    // Normal questions are consumed by identifyAskUserGroups. When a later
+    // unreadable/error part cannot form a group, suppress its earlier pending
+    // input so the generic renderer shows only the terminal part.
+    if (
+      getToolShortName(toolName) === TOOL_ASK_USER_SHORT_NAME &&
+      !errorText &&
+      getAskUserOutcome({ part, toolResultPart })?.status === "waiting"
+    ) {
+      return null;
+    }
+
+    if (authToolBody) {
+      // Unwrap run_tool so the circle carries the target tool's server icon.
+      const shortName = parseFullToolName(mcpAppToolName).toolName.replace(
+        /_/g,
+        " ",
+      );
+      const iconInfo = toolIconMap?.get(mcpAppToolName);
+
+      return (
+        <div className="mb-1">
+          <div className="flex items-center gap-1.5">
+            <TooltipProvider delayDuration={200}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <div className="relative inline-flex size-8 items-center justify-center rounded-full border bg-background">
+                    {iconInfo?.icon || iconInfo?.catalogId ? (
+                      <McpCatalogIcon
+                        icon={iconInfo.icon}
+                        catalogId={iconInfo.catalogId}
+                        size={16}
+                      />
+                    ) : (
+                      <BotIcon className="size-3.5 text-muted-foreground" />
+                    )}
+                    <span className="absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-background bg-destructive" />
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs">
+                  {shortName} (error)
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </div>
+          {authToolBody}
+        </div>
+      );
+    }
+
+    // Show logs button for failed tool calls
+    const logsButton = errorText ? (
+      <ToolErrorLogsButton toolName={toolName} />
+    ) : null;
+
+    const isExpandable =
+      hasContent && (canExpandToolCalls || isApprovalRequested);
+
+    return (
+      <Tool
+        className={isExpandable ? "cursor-pointer" : ""}
+        open={isOpen}
+        onOpenChange={handleOpenChange}
+        defaultOpen={shouldDefaultOpen}
+      >
+        <ToolHeader
+          type={`tool-${displayToolName}`}
+          title={getToolCardTitle(
+            displayToolName,
+            getToolShortName(displayToolName),
+          )}
+          state={getHeaderState({
+            state: part.state || "input-available",
+            toolResultPart,
+            errorText,
+            output: rawOutput,
+          })}
+          isCollapsible={isExpandable}
+          actionButton={logsButton}
+          identityBadge={
+            executedAs ? (
+              <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                Called as
+                <ExecutedAsBadge
+                  executedAs={executedAs}
+                  meUserId={viewerUserId}
+                />
+              </span>
+            ) : undefined
+          }
+        />
+        <ToolContent forceMount={uiResourceUri ? true : undefined}>
+          {hasInput ? <ToolInput input={displayInput} /> : null}
+          {previewedChange ? (
+            <PreviewedChangeReview
+              previewed={previewedChange}
+              input={displayInput}
+            />
+          ) : null}
+          {nestedToolCalls}
+          {isApprovalRequested &&
+            onToolApprovalResponse &&
+            "approval" in part &&
+            part.approval?.id && (
+              <ToolStatusRow
+                icon={
+                  <ClockIcon className="mt-0.5 size-4 flex-none text-amber-600" />
+                }
+                title="Approval required"
+                description={
+                  previewedChange
+                    ? proposalApprovalText(previewedChange)
+                    : "Review this tool call before it can continue."
+                }
+                actions={[
+                  {
+                    label: "Approve",
+                    variant: "secondary",
+                    icon: <CheckCircleIcon className="size-4" />,
+                    onClick: () =>
+                      onToolApprovalResponse({
+                        id: (part as { approval: { id: string } }).approval.id,
+                        approved: true,
+                      }),
+                  },
+                  {
+                    label: "Decline",
+                    variant: "outline",
+                    onClick: () => {
+                      setUserDenied(true);
+                      onToolApprovalResponse({
+                        id: (part as { approval: { id: string } }).approval.id,
+                        approved: false,
+                        reason: "User denied",
+                      });
+                    },
+                  },
+                ]}
+              />
+            )}
+          {authToolBody}
+          {credentialSetup && (
+            <RuntimeCredentialSetupTool
+              ready
+              toolCallId={part.toolCallId}
+              onSendMessage={onSendMessage}
+            />
+          )}
+          {batteryCredentials && (
+            <BatteryCredentialsTool
+              request={batteryCredentials}
+              toolCallId={part.toolCallId}
+              onSendMessage={onSendMessage}
+            />
+          )}
+
+          {/* Standard MCP Apps flow: tool definition has _meta.ui.resourceUri → AppBridge + AppFrame */}
+          {!isApprovalRequested &&
+            !isToolDenied &&
+            !userDenied &&
+            !errorText &&
+            uiResourceUri &&
+            agentId && (
+              <McpAppSection
+                uiResourceUri={uiResourceUri}
+                mcpServerId={uiMcpServerId}
+                appId={uiAppId ?? undefined}
+                agentId={agentId}
+                toolName={mcpAppToolName}
+                toolCallId={part.toolCallId}
+                toolInput={mcpAppToolInput}
+                rawOutput={mcpOutput}
+                preloadedResource={
+                  earlyToolUiData?.html
+                    ? {
+                        html: earlyToolUiData.html,
+                        csp: earlyToolUiData.csp,
+                        permissions: earlyToolUiData.permissions,
+                      }
+                    : undefined
+                }
+                onSendMessage={onSendMessage}
+              />
+            )}
+          {/* A failed call shows its error once, in one section, with or
+              without a result beside it and whatever UI it would have had. */}
+          {!authToolBody && errorText ? (
+            <ToolOutput
+              label="Error"
+              output={rawOutput}
+              errorText={errorText}
+            />
+          ) : null}
+          {/* A policy change's result reads as its diff. */}
+          {!authToolBody && policyChange && (
+            <>
+              <div className="px-3 pt-2">
+                <SectionLabel accent="bg-emerald-400">Result</SectionLabel>
+              </div>
+              <OpenAppaPolicyChange
+                output={rawOutput}
+                validationChange={validationChange}
+                input={part.input}
+              />
+            </>
+          )}
+          {/* Show the result when NOT rendering a UI resource. The whole
+              result goes in, so its images render beside its text. */}
+          {!authToolBody &&
+            !errorText &&
+            !uiResourceUri &&
+            !policyChange &&
+            (toolResultPart || Boolean(part.output)) && (
+              <ToolOutput label="Result" output={rawOutput} />
+            )}
+        </ToolContent>
+      </Tool>
+    );
+  },
+  (prev, next) =>
+    // Delegation cards carry freshly-built nested subagent content the by-value
+    // checks below can't see; never skip their renders or late-arriving child
+    // tool calls would be dropped.
+    !prev.nestedToolCalls &&
+    !next.nestedToolCalls &&
+    // Skip re-render unless identity, state, or UI-relevant data actually changed.
+    // Compare by value, not reference: the AI SDK sometimes mutates a tool part
+    // in place when its result lands, so render sites pass a shallow copy (see
+    // MessageTool usages) to keep these by-value checks meaningful. During
+    // input-streaming, also re-render on input growth.
+    prev.toolName === next.toolName &&
+    prev.agentId === next.agentId &&
+    prev.part.toolCallId === next.part.toolCallId &&
+    prev.part.state === next.part.state &&
+    (prev.part.state !== "input-streaming" ||
+      prev.part.input === next.part.input) &&
+    prev.toolResultPart?.state === next.toolResultPart?.state &&
+    prev.earlyToolUiData?.uiResourceUri ===
+      next.earlyToolUiData?.uiResourceUri &&
+    !!prev.earlyToolUiData?.html === !!next.earlyToolUiData?.html &&
+    prev.toolIconMap === next.toolIconMap,
+);
+
+const getHeaderState = ({
+  state,
+  toolResultPart,
+  errorText,
+  output,
+}: {
+  state: ToolUIPart["state"] | DynamicToolUIPart["state"];
+  toolResultPart: ToolUIPart | DynamicToolUIPart | null;
+  errorText: string | undefined;
+  output: unknown;
+}) => {
+  return getToolHeaderState({ state, toolResultPart, errorText, output });
+};
+
+/** Synthesize a tool UI part from a surfaced subagent call so the existing tool card renders it. */
+function synthesizeSubagentToolPart(
+  entry: SubagentChildEntry,
+): ToolUIPart | DynamicToolUIPart {
+  const state = entry.errorText
+    ? "output-error"
+    : (entry.state ?? "output-available");
+  return {
+    type: `tool-${entry.toolName}`,
+    toolCallId: entry.toolCallId,
+    state,
+    input: entry.input,
+    output: entry.output,
+    ...(entry.errorText ? { errorText: entry.errorText } : {}),
+  } as ToolUIPart;
+}
+
+// Guards against a malformed parent/child map producing unbounded recursion;
+// real toolCallIds are unique, so a well-formed map is always a finite tree.
+const MAX_SUBAGENT_NESTING_DEPTH = 16;
+
+/**
+ * Render a delegation call's surfaced subagent tool calls as an indented rail.
+ * The caller places this between the delegation card's Request and Result, so the
+ * card reads in causal order. Each child reuses the standard tool card; a child
+ * that is itself a delegation (its id has its own children) recurses into that
+ * child's own Request/Result, mirroring the delegation chain. Renders nothing
+ * when the delegation produced no surfaced tool calls.
+ */
+function SubagentToolCalls({
+  parentToolCallId,
+  subagentToolCalls,
+  depth = 0,
+  canExpandToolCalls,
+  connectedCatalogIds,
+  getToolShortName,
+  toolIconMap,
+}: {
+  parentToolCallId: string;
+  subagentToolCalls: Map<string, SubagentChildEntry[]>;
+  depth?: number;
+  canExpandToolCalls?: boolean;
+  connectedCatalogIds: ReadonlySet<string>;
+  getToolShortName: (toolName: string) => ArchestraToolShortName | null;
+  toolIconMap?: ToolIconMap;
+}) {
+  const children = subagentToolCalls.get(parentToolCallId);
+  if (!children?.length || depth >= MAX_SUBAGENT_NESTING_DEPTH) {
+    return null;
+  }
+  return (
+    <div className="pt-2 space-y-1.5">
+      <div className="px-3">
+        <SectionLabel accent="bg-violet-400">Tools</SectionLabel>
+      </div>
+      <div className="px-3 space-y-1">
+        {children.map((child) => (
+          /* Display-only: a subagent's calls are completed, autonomous child
+           activity. agentId and the approval/auth/install callbacks are
+           intentionally omitted so an agent-scoped action can't fire against
+           the parent agent (the child ran the tool, not the parent). A child
+           that is itself a delegation nests its own children between its
+           Request and Result, recursing the same layout. */
+          <MessageTool
+            key={child.toolCallId}
+            part={synthesizeSubagentToolPart(child)}
+            toolResultPart={null}
+            toolName={child.toolName}
+            canExpandToolCalls={canExpandToolCalls}
+            connectedCatalogIds={connectedCatalogIds}
+            getToolShortName={getToolShortName}
+            toolIconMap={toolIconMap}
+            nestedToolCalls={
+              subagentToolCalls.has(child.toolCallId) ? (
+                <SubagentToolCalls
+                  parentToolCallId={child.toolCallId}
+                  subagentToolCalls={subagentToolCalls}
+                  depth={depth + 1}
+                  canExpandToolCalls={canExpandToolCalls}
+                  connectedCatalogIds={connectedCatalogIds}
+                  getToolShortName={getToolShortName}
+                  toolIconMap={toolIconMap}
+                />
+              ) : null
+            }
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Names which credential expired on the re-authentication card. The returned
+// subject is grammatically the plural "credentials" so it reads naturally with
+// the "… have expired or are invalid" copy that follows. Falls back to the
+// scope-less "Your credentials" when the resolved scope is unknown (text-parsed
+// errors, or chat history predating the structured field).
+function expiredCredentialSubject(params: {
+  scope?: ResourceVisibilityScope;
+  teamName?: string | null;
+}): React.ReactNode {
+  const { scope, teamName } = params;
+
+  if (scope === "personal") {
+    return (
+      <>
+        Your <span className="font-medium">personal</span> credentials
+      </>
+    );
+  }
+
+  if (scope === "team") {
+    return teamName ? (
+      <>
+        The <span className="font-medium">{teamName}</span> team&rsquo;s
+        credentials
+      </>
+    ) : (
+      <>
+        Your <span className="font-medium">team&rsquo;s</span> credentials
+      </>
+    );
+  }
+
+  if (scope === "org") {
+    return (
+      <>
+        The <span className="font-medium">organization&rsquo;s</span>{" "}
+        credentials
+      </>
+    );
+  }
+
+  return <>Your credentials</>;
+}
+
+function authCardProps(params: {
+  toolName: string;
+  authState: ToolAuthState | null;
+  connectedCatalogIds: ReadonlySet<string>;
+  onInstall?: () => void;
+  onReauth?: () => void;
+}): AuthErrorToolProps | null {
+  const { authState, toolName, connectedCatalogIds, onInstall, onReauth } =
+    params;
+
+  // Once the user connects a server for this catalog, the install prompt is
+  // resolved — flip it to a connected state instead of an outstanding error.
+  if (
+    authState?.kind === "auth-required" &&
+    isInstallAuthResolved({ authState, connectedCatalogIds })
+  ) {
+    if (authState.action === "add_desktop_mcp_server") {
+      return {
+        ...desktopAddPromptCopy({
+          catalogName: authState.catalogName,
+          resolved: true,
+        }),
+        variant: "success",
+      };
+    }
+    return {
+      title: "Authentication successful",
+      description: <>Connected to &ldquo;{authState.catalogName}&rdquo;.</>,
+      variant: "success",
+    };
+  }
+
+  switch (authState?.kind) {
+    case "auth-expired": {
+      const displayName = authState.catalogName || toolName || "this tool";
+      return {
+        title: "Expired / Invalid Authentication",
+        description: (
+          <>
+            {expiredCredentialSubject({
+              scope: authState.credentialScope,
+              teamName: authState.credentialTeamName,
+            })}{" "}
+            for &ldquo;{displayName}&rdquo; have expired or are invalid.
+            Re-authenticate to continue using this tool.
+          </>
+        ),
+        buttonText: onReauth ? "Re-authenticate" : "Manage credentials",
+        buttonUrl: authState.reauthUrl,
+        onAction: onReauth,
+        actionTooltipText: onReauth
+          ? `This will redirect you to ${displayName} to authorize access, then return you to this chat.`
+          : undefined,
+      };
+    }
+    case "assigned-credential-unavailable":
+      return {
+        title: "Expired / Invalid Authentication",
+        description: (
+          <>
+            credentials for &ldquo;{authState.catalogName}&rdquo; have expired
+            or are invalid. Re-authenticate to continue using this tool. Ask the
+            agent owner or an admin to re-authenticate.
+          </>
+        ),
+      };
+    case "auth-required": {
+      // A desktop MCP server has no credentials: the user adds it to their
+      // computer, in the registry's dialog for that.
+      if (authState.action === "add_desktop_mcp_server") {
+        return {
+          ...desktopAddPromptCopy({
+            catalogName: authState.catalogName,
+            resolved: false,
+          }),
+          buttonUrl: authState.actionUrl,
+          onAction: onInstall,
+          openInNewTab: true,
+        };
+      }
+      const isIdentityProviderConnect =
+        authState.action === "connect_identity_provider";
+      const providerName = authState.providerId ?? "identity provider";
+      return {
+        title: "Authentication Required",
+        description: isIdentityProviderConnect ? (
+          `Connect ${providerName}. This deployment can then request the downstream credential for "${authState.catalogName}".`
+        ) : (
+          <>
+            No credentials found for &ldquo;{authState.catalogName}&rdquo;. Set
+            up your credentials to use this tool.
+          </>
+        ),
+        buttonText: isIdentityProviderConnect
+          ? `Connect ${providerName}`
+          : "Set up credentials",
+        buttonUrl: authState.actionUrl,
+        onAction: isIdentityProviderConnect ? undefined : onInstall,
+        openInNewTab: !isIdentityProviderConnect,
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+function resolveAuthActions(params: {
+  authState: ToolAuthState | null;
+  onInstallMcp?: (catalogId: string) => void;
+  onReauthMcp?: (catalogId: string, serverId: string) => void;
+}): { onInstall?: () => void; onReauth?: () => void } {
+  const { authState, onInstallMcp, onReauthMcp } = params;
+
+  if (authState?.kind === "auth-expired") {
+    const { catalogId, serverId } = authState;
+    return {
+      onReauth:
+        onReauthMcp && catalogId && serverId
+          ? () => onReauthMcp(catalogId, serverId)
+          : undefined,
+    };
+  }
+
+  if (authState?.kind === "auth-required") {
+    const { catalogId } = authState;
+    return {
+      onInstall:
+        isInstallAuthAction(authState.action) && onInstallMcp && catalogId
+          ? () => onInstallMcp(catalogId)
+          : undefined,
+    };
+  }
+
+  return {};
+}
+
+function renderToolAuthPart(params: {
+  toolName: string;
+  authState: ReturnType<typeof resolveToolAuthState>;
+  connectedCatalogIds: ReadonlySet<string>;
+  onInstallMcp?: (catalogId: string) => void;
+  onReauthMcp?: (catalogId: string, serverId: string) => void;
+  className?: string;
+}) {
+  const {
+    authState,
+    toolName,
+    connectedCatalogIds,
+    onInstallMcp,
+    onReauthMcp,
+    className,
+  } = params;
+  const actions = resolveAuthActions({ authState, onInstallMcp, onReauthMcp });
+  const props = authCardProps({
+    toolName,
+    authState,
+    connectedCatalogIds,
+    ...actions,
+  });
+  return props ? <AuthErrorTool {...props} className={className} /> : null;
+}
+
+function renderAssistantAuthPart(params: {
+  toolName: string;
+  authState: ReturnType<typeof resolveAssistantTextAuthState>;
+  connectedCatalogIds: ReadonlySet<string>;
+  onInstallMcp?: (catalogId: string) => void;
+  onReauthMcp?: (catalogId: string, serverId: string) => void;
+}) {
+  return renderToolAuthPart(params);
+}
+
+/** Whether a message renders an install or re-auth prompt. */
+function messageHasAuthPrompt(message: UIMessage): boolean {
+  return (
+    hasMessageAuthToolError(message) ||
+    (message.role === "assistant" &&
+      (message.parts ?? []).some(
+        (part) =>
+          part.type === "text" && !!resolveAssistantTextAuthState(part.text),
+      ))
+  );
+}
+
+function hasMessageAuthToolError(message: UIMessage): boolean {
+  return hasToolPartsWithAuthErrors(
+    (message.parts ?? []).flatMap((part) => {
+      if (!isToolPart(part)) {
+        return [];
+      }
+
+      return [
+        {
+          output: part.output,
+          errorText: getToolErrorText({ part, toolResultPart: null }),
+        },
+      ];
+    }),
+  );
+}
+
+function buildMessageTimeline(params: {
+  messages: UIMessage[];
+  chatErrors: PersistedChatError[];
+  compactions: ChatMessagesProps["compactions"];
+}): TimelineItem[] {
+  const sortedChatErrors = [...params.chatErrors].sort(
+    (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt),
+  );
+  const compactionsByBoundary = new Map<
+    string,
+    NonNullable<ChatMessagesProps["compactions"]>
+  >();
+  const unanchoredCompactions: NonNullable<ChatMessagesProps["compactions"]> =
+    [];
+  for (const compaction of params.compactions ?? []) {
+    if (compaction.compactedThroughMessageId) {
+      const existing =
+        compactionsByBoundary.get(compaction.compactedThroughMessageId) ?? [];
+      existing.push(compaction);
+      compactionsByBoundary.set(compaction.compactedThroughMessageId, existing);
+    } else {
+      unanchoredCompactions.push(compaction);
+    }
+  }
+
+  const timelineItems: TimelineItem[] = [];
+  let errorIndex = 0;
+
+  params.messages.forEach((message, messageIndex) => {
+    const messageCreatedAt = getMessageCreatedAt(message);
+    while (
+      errorIndex < sortedChatErrors.length &&
+      messageCreatedAt !== null &&
+      Date.parse(sortedChatErrors[errorIndex].createdAt) <= messageCreatedAt
+    ) {
+      timelineItems.push({
+        kind: "chat-error",
+        chatError: sortedChatErrors[errorIndex],
+      });
+      errorIndex++;
+    }
+
+    timelineItems.push({ kind: "message", message, messageIndex });
+    for (const boundaryId of getMessageCompactionBoundaryIds(message)) {
+      for (const compaction of compactionsByBoundary.get(boundaryId) ?? []) {
+        timelineItems.push({ kind: "compaction", compaction });
+      }
+    }
+  });
+
+  for (; errorIndex < sortedChatErrors.length; errorIndex++) {
+    timelineItems.push({
+      kind: "chat-error",
+      chatError: sortedChatErrors[errorIndex],
+    });
+  }
+
+  for (const compaction of unanchoredCompactions) {
+    timelineItems.push({ kind: "compaction", compaction });
+  }
+
+  return timelineItems;
+}
+
+function getMessageCompactionBoundaryIds(message: UIMessage): string[] {
+  const ids = [message.id];
+  const metadata = message.metadata;
+  if (
+    typeof metadata === "object" &&
+    metadata !== null &&
+    PERSISTED_MESSAGE_ID_METADATA_KEY in metadata &&
+    typeof metadata[PERSISTED_MESSAGE_ID_METADATA_KEY] === "string" &&
+    metadata[PERSISTED_MESSAGE_ID_METADATA_KEY] !== message.id
+  ) {
+    ids.push(metadata[PERSISTED_MESSAGE_ID_METADATA_KEY]);
+  }
+
+  return ids;
+}
+
+function getMessageCreatedAt(message: UIMessage): number | null {
+  const metadata = message.metadata;
+  if (
+    typeof metadata === "object" &&
+    metadata !== null &&
+    "createdAt" in metadata &&
+    typeof metadata.createdAt === "string"
+  ) {
+    const createdAt = Date.parse(metadata.createdAt);
+    return Number.isNaN(createdAt) ? null : createdAt;
+  }
+
+  return null;
+}
+
+function getInlineErrorMessage(error: Error): string {
+  try {
+    const parsed = JSON.parse(error.message);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "message" in parsed &&
+      typeof parsed.message === "string"
+    ) {
+      return parsed.message;
+    }
+  } catch {
+    // Plain client-side errors are not JSON-encoded.
+  }
+
+  return error.message;
+}
+
+/**
+ * Quiet counterpart to `StreamTimeoutWarning`: the run is healthy, the provider
+ * is just slow to start. It rides next to the loading indicator instead of
+ * taking a full-width banner at the top of the chat, because nothing is wrong
+ * yet — the user is only being told why the wait is long and that stopping is
+ * an option.
+ */
+function UpstreamIdleNotice() {
+  return (
+    <div className="mb-4 flex justify-center">
+      <div className="inline-flex items-center gap-2 rounded-full border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
+        <ClockIcon className="size-4 flex-none" />
+        <span>
+          Still waiting on the provider — no response yet after{" "}
+          {UPSTREAM_IDLE_THRESHOLD_SECONDS} seconds. You can keep waiting, or
+          stop and retry.
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ContextCompactionStatus({
+  isCompacting,
+  feedback,
+}: {
+  isCompacting: boolean;
+  feedback: ChatMessagesProps["contextCompactionFeedback"];
+}) {
+  if (isCompacting || feedback?.status === "pending") {
+    return (
+      <div className="mb-4 flex justify-center">
+        <div className="inline-flex items-center gap-2 rounded-full border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
+          <Loader size={16} />
+          <span>Compacting conversation context...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!feedback) {
+    return null;
+  }
+
+  const icon =
+    feedback.status === "success" ? (
+      <CheckCircleIcon className="size-4 text-emerald-500" />
+    ) : (
+      <ClockIcon className="size-4 text-muted-foreground" />
+    );
+
+  return (
+    <div className="mb-4 flex justify-center">
+      <div className="inline-flex items-center gap-2 rounded-full border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
+        {icon}
+        <span>{feedback.message}</span>
+      </div>
+    </div>
+  );
+}
+
+function ContextCompactionTimelineEvent({
+  compaction,
+}: {
+  compaction: NonNullable<ChatMessagesProps["compactions"]>[number];
+}) {
+  const createdAt = new Date(compaction.createdAt);
+  const timestamp = Number.isNaN(createdAt.getTime())
+    ? null
+    : createdAt.toLocaleString(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      });
+
+  return (
+    <div className="my-4 flex justify-center">
+      <div className="inline-flex max-w-full items-center gap-2 rounded-full border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
+        <CheckCircleIcon className="size-4 text-emerald-500" />
+        <span>Conversation context compacted</span>
+        {timestamp && (
+          <span className="text-muted-foreground/70">{timestamp}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Derived per-message props are cached by the message's own (immutable) parts
+// and metadata objects, so an untouched message hands its memoized row the
+// same references on every streamed chunk instead of fresh, equal copies.
+const fileAttachmentsByParts = new WeakMap<
+  UIMessage["parts"],
+  ReturnType<typeof extractFileAttachments>
+>();
+
+function getFileAttachments(parts: UIMessage["parts"] | undefined) {
+  if (!parts) return undefined;
+  if (!fileAttachmentsByParts.has(parts)) {
+    fileAttachmentsByParts.set(parts, extractFileAttachments(parts));
+  }
+  return fileAttachmentsByParts.get(parts);
+}
+
+type SkillAttribution = { name: string; href?: string } | undefined;
+const skillAttributionByMetadata = new WeakMap<object, SkillAttribution>();
+
+function getSkillAttribution(metadata: unknown): SkillAttribution {
+  if (typeof metadata !== "object" || metadata === null) {
+    return parseSkillAttribution(metadata);
+  }
+  if (!skillAttributionByMetadata.has(metadata)) {
+    skillAttributionByMetadata.set(metadata, parseSkillAttribution(metadata));
+  }
+  return skillAttributionByMetadata.get(metadata);
+}
+
+function parseSkillAttribution(metadata: unknown): SkillAttribution {
+  const parsed = ChatMessageMetadataSchema.safeParse(metadata).data;
+  if (parsed?.skill) return parsed.skill;
+  return parsed?.externalMcpSkill
+    ? {
+        name: parsed.externalMcpSkill.displayName,
+        href: `/skills/external/${parsed.externalMcpSkill.id}?mcpServerId=${parsed.externalMcpSkill.mcpServerId}`,
+      }
+    : undefined;
+}

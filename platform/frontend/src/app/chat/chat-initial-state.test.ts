@@ -1,0 +1,539 @@
+// @vitest-environment node
+
+import { BUILT_IN_AGENT_IDS } from "@archestra/shared";
+import { describe, expect, test } from "vitest";
+import { autoModelChoice } from "@/lib/chat/auto-model";
+import {
+  buildCreateConversationInput,
+  isAutoSendHandoffInProgress,
+  resolveChatModelState,
+  resolveInitialAgentSelection,
+  resolveInitialAgentState,
+  resolvePreferredModelForProvider,
+  shouldResetInitialChatState,
+} from "./chat-initial-state";
+
+// Mock LlmModel: `id` is the provider model string, `dbId` the models.id UUID.
+const model = (id: string, dbId: string, provider: string, isBest = false) =>
+  ({ id, dbId, provider, isBest }) as never;
+
+describe("resolveInitialAgentState", () => {
+  test("returns org default model for an agent without its own model", () => {
+    const result = resolveInitialAgentState({
+      agent: { id: "agent-1" },
+      modelsByProvider: {
+        openai: [model("gpt-4.1", "uuid-gpt", "openai")],
+      },
+      chatApiKeys: [{ id: "key-1", provider: "openai" }],
+      organization: {
+        defaultModelId: "uuid-gpt",
+        defaultLlmApiKeyId: "key-1",
+      },
+    });
+
+    expect(result).toEqual({
+      agentId: "agent-1",
+      modelId: "uuid-gpt",
+      apiKeyId: "key-1",
+    });
+  });
+
+  test("returns agent-configured model when available", () => {
+    const result = resolveInitialAgentState({
+      agent: {
+        id: "agent-1",
+        modelId: "uuid-sonnet",
+        llmApiKeyId: "key-2",
+      },
+      modelsByProvider: {
+        anthropic: [model("claude-3-5-sonnet", "uuid-sonnet", "anthropic")],
+      },
+      chatApiKeys: [{ id: "key-2", provider: "anthropic" }],
+      organization: {
+        defaultModelId: "uuid-gpt",
+        defaultLlmApiKeyId: "key-1",
+      },
+    });
+
+    expect(result).toEqual({
+      agentId: "agent-1",
+      modelId: "uuid-sonnet",
+      apiKeyId: "key-2",
+    });
+  });
+});
+
+describe("resolveInitialAgentSelection", () => {
+  test("allows the built-in SRE agent as a pinned project default", () => {
+    const sre = {
+      id: "sre",
+      builtIn: true,
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.SRE },
+    };
+    expect(
+      resolveInitialAgentSelection({
+        agents: [sre],
+        projectDefaultAgentId: sre.id,
+        canUseSavedAgent: true,
+      }),
+    ).toMatchObject({ agent: sre, source: "project" });
+  });
+  test("a fresh chat prefers the personal assistant over the built-in and organization agents", () => {
+    const personal = { id: "personal", scope: "personal", builtIn: false };
+    expect(
+      resolveInitialAgentSelection({
+        agents: [
+          { id: "builtin", builtIn: true },
+          { id: "org", scope: "org" },
+          personal,
+        ],
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: personal,
+      source: "fallback",
+      fromProjectDefault: false,
+    });
+  });
+
+  test("stale built-in defaults and saved picks cannot select a system agent", () => {
+    const personal = { id: "personal", builtIn: false };
+    expect(
+      resolveInitialAgentSelection({
+        agents: [{ id: "builtin", builtIn: true }, personal],
+        projectDefaultAgentId: "builtin",
+        memberDefaultAgentId: "builtin",
+        organizationDefaultAgentId: "builtin",
+        savedAgentId: "builtin",
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: personal,
+      source: "fallback",
+      fromProjectDefault: false,
+    });
+    expect(
+      resolveInitialAgentSelection({
+        agents: [{ id: "builtin", builtIn: true }],
+        canUseSavedAgent: true,
+      }),
+    ).toBeNull();
+  });
+  const agents = [
+    { id: "first-agent" },
+    { id: "member-default" },
+    { id: "saved-agent" },
+    { id: "org-default" },
+    { id: "project-default" },
+  ];
+
+  test("prefers the member's personal default over the organization default and the saved pick", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        organizationDefaultAgentId: "org-default",
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: "member-default",
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "member-default" },
+      source: "member",
+      fromProjectDefault: false,
+    });
+  });
+
+  test("prefers the organization default over the saved pick when the member has no personal default", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        organizationDefaultAgentId: "org-default",
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: null,
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "org-default" },
+      source: "organization",
+      fromProjectDefault: false,
+    });
+  });
+
+  test("prefers the project default over the organization default", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        projectDefaultAgentId: "project-default",
+        organizationDefaultAgentId: "org-default",
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: "member-default",
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "project-default" },
+      source: "project",
+      fromProjectDefault: true,
+    });
+  });
+
+  test("falls through to the rest of the chain when the project's pinned agent is not accessible", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        projectDefaultAgentId: "agent-the-caller-cannot-see",
+        organizationDefaultAgentId: "org-default",
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: null,
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "org-default" },
+      source: "organization",
+      fromProjectDefault: false,
+    });
+  });
+
+  test("a null project default leaves the rest of the chain untouched", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        projectDefaultAgentId: null,
+        organizationDefaultAgentId: null,
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: null,
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "saved-agent" },
+      source: "saved",
+      fromProjectDefault: false,
+    });
+  });
+
+  test("the project default outranks the saved pick even when the picker is available", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        projectDefaultAgentId: "project-default",
+        organizationDefaultAgentId: null,
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: "member-default",
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "project-default" },
+      source: "project",
+      fromProjectDefault: true,
+    });
+  });
+
+  test("uses the saved agent when the member has no personal default and the picker is available", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        organizationDefaultAgentId: null,
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: null,
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "saved-agent" },
+      source: "saved",
+      fromProjectDefault: false,
+    });
+  });
+
+  test("ignores saved agent when the picker is hidden", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        organizationDefaultAgentId: null,
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: null,
+        canUseSavedAgent: false,
+      }),
+    ).toEqual({
+      agent: { id: "first-agent" },
+      source: "fallback",
+      fromProjectDefault: false,
+    });
+  });
+
+  test("returns null when no agents are available", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents: [],
+        projectDefaultAgentId: "project-default",
+        organizationDefaultAgentId: "org-default",
+        savedAgentId: "saved-agent",
+        memberDefaultAgentId: "member-default",
+        canUseSavedAgent: true,
+      }),
+    ).toBeNull();
+  });
+
+  test("falls back to the first agent when no defaults match", () => {
+    expect(
+      resolveInitialAgentSelection({
+        agents,
+        organizationDefaultAgentId: null,
+        savedAgentId: "missing-saved-agent",
+        memberDefaultAgentId: "missing-member-default",
+        canUseSavedAgent: true,
+      }),
+    ).toEqual({
+      agent: { id: "first-agent" },
+      source: "fallback",
+      fromProjectDefault: false,
+    });
+  });
+});
+
+describe("resolveChatModelState", () => {
+  test("resolves the agent's model and api key", () => {
+    const result = resolveChatModelState({
+      agent: { id: "agent-1", modelId: "uuid-gpt", llmApiKeyId: "key-1" },
+      modelsByProvider: {
+        openai: [model("gpt-4.1", "uuid-gpt", "openai")],
+      },
+      chatApiKeys: [{ id: "key-1", provider: "openai" }],
+      organization: null,
+    });
+
+    expect(result).toEqual({
+      modelId: "uuid-gpt",
+      apiKeyId: "key-1",
+    });
+  });
+});
+
+describe("resolvePreferredModelForProvider", () => {
+  test("prefers the best model for a provider", () => {
+    expect(
+      resolvePreferredModelForProvider({
+        provider: "openai",
+        modelsByProvider: {
+          openai: [
+            model("gpt-4.1-mini", "uuid-mini", "openai"),
+            model("gpt-4.1", "uuid-gpt", "openai", true),
+          ],
+        },
+      }),
+    ).toEqual({
+      modelId: "uuid-gpt",
+      provider: "openai",
+    });
+  });
+
+  test("returns null when the provider has no models", () => {
+    expect(
+      resolvePreferredModelForProvider({
+        provider: "openai",
+        modelsByProvider: {},
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("buildCreateConversationInput", () => {
+  test("does not serialize a preview pair for a chat inheriting its configuration", () => {
+    expect(
+      buildCreateConversationInput({
+        agentId: "agent-1",
+        followDefaults: true,
+        modelId: "fallback-model",
+        chatApiKeyId: "fallback-key",
+      }),
+    ).toEqual({ agentId: "agent-1" });
+    expect(
+      buildCreateConversationInput({
+        agentId: "agent-1",
+        followDefaults: false,
+        modelId: "fallback-model",
+        chatApiKeyId: "fallback-key",
+      }),
+    ).toMatchObject({
+      modelId: "fallback-model",
+      chatApiKeyId: "fallback-key",
+      strictModelSelection: true,
+    });
+  });
+
+  test("sends the picked auto router in place of the key and model", () => {
+    expect(
+      buildCreateConversationInput({
+        agentId: "agent-1",
+        modelId: "uuid-gpt",
+        chatApiKeyId: "key-1",
+        modelPoolId: autoModelChoice("router-b"),
+      }),
+    ).toEqual({ agentId: "agent-1", autoRouterId: "router-b" });
+  });
+
+  test("builds the payload from the selected initial chat state", () => {
+    expect(
+      buildCreateConversationInput({
+        agentId: "agent-1",
+        modelId: "uuid-gpt",
+        chatApiKeyId: "key-1",
+      }),
+    ).toEqual({
+      agentId: "agent-1",
+      modelId: "uuid-gpt",
+      chatApiKeyId: "key-1",
+    });
+  });
+
+  test("builds a minimal payload when model selectors are unavailable", () => {
+    expect(
+      buildCreateConversationInput({
+        agentId: "agent-1",
+        modelId: "",
+        chatApiKeyId: null,
+      }),
+    ).toEqual({
+      agentId: "agent-1",
+      modelId: undefined,
+      chatApiKeyId: undefined,
+    });
+  });
+
+  test("returns null when the initial selection is incomplete", () => {
+    expect(
+      buildCreateConversationInput({
+        agentId: null,
+        modelId: "",
+        chatApiKeyId: null,
+      }),
+    ).toBeNull();
+  });
+
+  test("carries a thinking effort chosen before the conversation existed", () => {
+    expect(
+      buildCreateConversationInput({
+        agentId: "agent-1",
+        modelId: "uuid-gemini",
+        chatApiKeyId: "key-1",
+        thinkingEffort: "high",
+      }),
+    ).toEqual({
+      agentId: "agent-1",
+      modelId: "uuid-gemini",
+      chatApiKeyId: "key-1",
+      thinkingEffort: "high",
+    });
+  });
+
+  test("carries an unset depth through as null rather than dropping it", () => {
+    // A new chat with no depth chosen has to reach the row that way. Dropping it
+    // would instead rely on the column's own default agreeing.
+    expect(
+      buildCreateConversationInput({
+        agentId: "agent-1",
+        modelId: "uuid-gemini",
+        chatApiKeyId: "key-1",
+        thinkingEffort: null,
+      }),
+    ).toMatchObject({ thinkingEffort: null });
+  });
+});
+
+describe("shouldResetInitialChatState", () => {
+  test("does not reset when mounting directly on the initial chat route", () => {
+    expect(
+      shouldResetInitialChatState({
+        previousRouteConversationId: undefined,
+        routeConversationId: undefined,
+      }),
+    ).toBe(false);
+  });
+
+  test("resets when leaving a conversation route for the initial chat route", () => {
+    expect(
+      shouldResetInitialChatState({
+        previousRouteConversationId: "conv-1",
+        routeConversationId: undefined,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("isAutoSendHandoffInProgress", () => {
+  const base = {
+    conversationId: undefined,
+    initialUserPrompt: undefined,
+    hasAttachmentsMarker: false,
+    hasPendingHandoffFiles: false,
+    autoSendTriggered: false,
+  };
+
+  test("true on first render of a prompt handoff (before the send fires)", () => {
+    // The frame that used to flash the empty New Chat splash: /chat mounted with
+    // a user_prompt, no conversation yet, auto-send not triggered.
+    expect(
+      isAutoSendHandoffInProgress({
+        ...base,
+        initialUserPrompt: "Say hello",
+      }),
+    ).toBe(true);
+  });
+
+  test("stays true after user_prompt is stripped from the URL (latched via ref)", () => {
+    // clearUserPromptQueryParam has run, so initialUserPrompt is gone, but the
+    // conversation is still being created — the ref keeps the splash suppressed.
+    expect(
+      isAutoSendHandoffInProgress({
+        ...base,
+        initialUserPrompt: undefined,
+        autoSendTriggered: true,
+      }),
+    ).toBe(true);
+  });
+
+  test("false during an interactive submit (no handoff signals)", () => {
+    // Pressing Enter on the splash runs the same create mutation, but the
+    // splash must stay visible: its composer keeps focus and is the old half
+    // of the shared-element morph into the conversation view. Handoffs are
+    // identified by their own signals, never by the mutation being pending.
+    expect(isAutoSendHandoffInProgress(base)).toBe(false);
+  });
+
+  test("true for a files-only handoff whose stashed files are still in memory", () => {
+    expect(
+      isAutoSendHandoffInProgress({
+        ...base,
+        hasAttachmentsMarker: true,
+        hasPendingHandoffFiles: true,
+      }),
+    ).toBe(true);
+  });
+
+  test("false for a files-only handoff whose stashed files were lost (reload)", () => {
+    // No prompt and no pending files: nothing will auto-send, so the composer
+    // must show rather than a permanently blank pane.
+    expect(
+      isAutoSendHandoffInProgress({
+        ...base,
+        hasAttachmentsMarker: true,
+        hasPendingHandoffFiles: false,
+      }),
+    ).toBe(false);
+  });
+
+  test("false on the plain /chat new-chat page (no handoff)", () => {
+    expect(isAutoSendHandoffInProgress(base)).toBe(false);
+  });
+
+  test("false once a conversation exists, even mid-handoff signals", () => {
+    // After navigating to /chat/<id> the conversation view owns the screen; the
+    // suppression must not linger and blank out a real conversation.
+    expect(
+      isAutoSendHandoffInProgress({
+        ...base,
+        conversationId: "conv-1",
+        initialUserPrompt: "Say hello",
+        autoSendTriggered: true,
+      }),
+    ).toBe(false);
+  });
+});

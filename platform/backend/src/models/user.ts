@@ -1,0 +1,448 @@
+import {
+  ADMIN_ROLE_NAME,
+  DEFAULT_ADMIN_EMAIL,
+  type Permissions,
+  type PredefinedRoleName,
+} from "@archestra/shared";
+import {
+  and,
+  count,
+  eq,
+  getTableColumns,
+  inArray,
+  isNotNull,
+  isNull,
+  sql,
+} from "drizzle-orm";
+import config from "@/config";
+import db, { schema, type Transaction } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
+import logger from "@/logging";
+import type { UpdateUser } from "@/types";
+import AgentModel from "./agent";
+import InteractionUserActivityModel from "./interaction-user-activity";
+import McpServerModel from "./mcp-server";
+import MemberModel from "./member";
+import { port } from "./ports";
+import RoleCompositionModel from "./role-composition";
+import SkillModel from "./skill";
+
+class UserModel {
+  static async createOrGetExistingDefaultAdminUser({
+    email = config.auth.adminDefaultEmail,
+    password = config.auth.adminDefaultPassword,
+    role = ADMIN_ROLE_NAME,
+    name = "Admin",
+  }: {
+    email?: string;
+    password?: string;
+    role?: PredefinedRoleName;
+    name?: string;
+  } = {}) {
+    logger.debug(
+      { email, role, name },
+      "UserModel.createOrGetExistingDefaultAdminUser: starting",
+    );
+    try {
+      const existing = await db
+        .select()
+        .from(schema.usersTable)
+        .where(eq(schema.usersTable.email, email));
+      if (existing.length > 0) {
+        logger.debug(
+          { email },
+          "UserModel.createOrGetExistingDefaultAdminUser: user already exists",
+        );
+        return existing[0];
+      }
+
+      // Through a port, loaded on first use, so that merely importing
+      // UserModel does not construct the Better Auth instance (which eagerly
+      // initializes its context and requires the auth secret). This keeps
+      // UserModel usable from standalone scripts that never sign anyone up.
+      const result = await (await port("authAccounts")).signUpEmail({
+        body: {
+          email,
+          password,
+          name,
+        },
+      });
+      if (result) {
+        await db
+          .update(schema.usersTable)
+          .set({
+            role,
+            emailVerified: true,
+          })
+          .where(eq(schema.usersTable.email, email));
+
+        logger.debug(
+          { email },
+          "UserModel.createOrGetExistingDefaultAdminUser: user created successfully",
+        );
+      }
+      return result.user;
+    } catch (err) {
+      logger.error(
+        { err },
+        "UserModel.createOrGetExistingDefaultAdminUser: failed to create user",
+      );
+    }
+  }
+
+  /**
+   * Get a user by ID with their organization membership.
+   *
+   * This is what resolves `request.organizationId` for both session and
+   * API-key auth (auth/fastify-plugin/middleware.ts), so the membership picked
+   * here decides which org a request is scoped to.
+   *
+   * The ordering is load-bearing for users who belong to more than one org:
+   * `limit(1)` on an unordered join lets Postgres return a different membership
+   * across queries or plans, which would make org-scoped results flicker. It
+   * matches `MemberModel.getFirstMembershipForUser` exactly so the org resolved
+   * here agrees with the `activeOrganizationId` better-auth stamps on the
+   * session (auth/better-auth.ts session-create hook).
+   */
+  static async getById(id: string) {
+    logger.trace("UserModel.getById: fetching user");
+    const [row] = await UserModel.byId.get().execute({ id });
+    logger.trace({ found: !!row }, "UserModel.getById: completed");
+    if (!row) return row;
+    const { membership, ...user } = row;
+    // The user's first membership is also their first in its organization,
+    // the row MemberModel.getByUserId reads there; a read request keeps it.
+    MemberModel.remember(membership);
+    return user;
+  }
+
+  /** The proxy's acting user and membership, read together for this request. */
+  static async getProxyIdentity(userId: string, organizationId: string) {
+    const [row] = await UserModel.proxyIdentity
+      .get()
+      .execute({ userId, organizationId });
+    if (!row) return null;
+    const { membership, ...user } = row;
+    MemberModel.remember(membership);
+    return user;
+  }
+
+  /**
+   * Email only, with no membership requirement (unlike getById's join) —
+   * used to label per-user storage folders.
+   */
+  static async getEmailById(id: string): Promise<string | null> {
+    const [row] = await db
+      .select({ email: schema.usersTable.email })
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.id, id))
+      .limit(1);
+    return row?.email ?? null;
+  }
+
+  /** Display names for several users in one query, keyed by user id. */
+  static async getNamesByIds(ids: string[]): Promise<Map<string, string>> {
+    if (ids.length === 0) return new Map();
+    const rows = await db
+      .select({ id: schema.usersTable.id, name: schema.usersTable.name })
+      .from(schema.usersTable)
+      .where(inArray(schema.usersTable.id, ids));
+    return new Map(rows.map((row) => [row.id, row.name]));
+  }
+
+  /**
+   * Number of users who are not soft-deleted. Used by the enterprise-tier
+   * service to apply the small-team free tier: banned users and users who have
+   * not signed up yet count, users the identity provider removed do not.
+   */
+  static async countNotSoftDeleted(): Promise<number> {
+    const [row] = await db
+      .select({ count: count() })
+      .from(schema.usersTable)
+      .where(isNull(schema.usersTable.softDeleted));
+    return row?.count ?? 0;
+  }
+
+  /**
+   * Find a user by their email address
+   */
+  /**
+   * Emails are stored lowercase, so the lookup lowercases its input: an IdP
+   * such as Entra sends the email claim with the directory's capitals.
+   */
+  static async findByEmail(email: string) {
+    logger.debug({ email }, "UserModel.findByEmail: fetching user");
+    const [user] = await db
+      .select()
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.email, email.toLowerCase()))
+      .limit(1);
+    logger.debug({ email, found: !!user }, "UserModel.findByEmail: completed");
+    return user;
+  }
+
+  /** When the user was soft-deleted, or `null` when they are active. */
+  static async getSoftDeleted(userId: string): Promise<Date | null> {
+    const [row] = await db
+      .select({ softDeleted: schema.usersTable.softDeleted })
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.id, userId))
+      .limit(1);
+    return row?.softDeleted ?? null;
+  }
+
+  /** Which of the given users are soft-deleted. */
+  static async findSoftDeletedIds(userIds: string[]): Promise<Set<string>> {
+    if (userIds.length === 0) return new Set();
+    const rows = await db
+      .select({ id: schema.usersTable.id })
+      .from(schema.usersTable)
+      .where(
+        and(
+          inArray(schema.usersTable.id, userIds),
+          isNotNull(schema.usersTable.softDeleted),
+        ),
+      );
+    return new Set(rows.map((row) => row.id));
+  }
+
+  /** The given users, by user id. */
+  static async findByIds(userIds: string[]) {
+    const rows =
+      userIds.length === 0
+        ? []
+        : await db
+            .select()
+            .from(schema.usersTable)
+            .where(inArray(schema.usersTable.id, userIds));
+    return new Map(rows.map((row) => [row.id, row] as const));
+  }
+
+  /** Set when the user was soft-deleted, or `null` to make them active again. */
+  static async setSoftDeleted(params: {
+    userId: string;
+    softDeleted: Date | null;
+  }) {
+    await db
+      .update(schema.usersTable)
+      .set({ softDeleted: params.softDeleted, updatedAt: new Date() })
+      .where(eq(schema.usersTable.id, params.userId));
+  }
+
+  /**
+   * Create a user with no `account` row: no password and no linked identity
+   * provider yet. The first SSO sign-in with the same email links onto this
+   * user (see `accountLinking` in better-auth.ts). Throws on a duplicate email.
+   */
+  static async createWithoutAccount(params: {
+    name: string;
+    email: string;
+    /** Marks the user as created by SCIM provisioning. */
+    scimProvisioned?: boolean;
+  }) {
+    const now = new Date();
+    const [user] = await db
+      .insert(schema.usersTable)
+      .values({
+        id: crypto.randomUUID(),
+        name: params.name,
+        email: params.email.toLowerCase(),
+        emailVerified: false,
+        createdAt: now,
+        updatedAt: now,
+        scimProvisioned: params.scimProvisioned ? now : null,
+      })
+      .returning();
+    return user;
+  }
+
+  /**
+   * Get all permissions for a user
+   */
+  static async getUserPermissions(
+    userId: string,
+    organizationId: string,
+  ): Promise<Permissions> {
+    return RoleCompositionModel.getUserPermissions({ userId, organizationId });
+  }
+
+  /**
+   * Get the default admin user by email
+   */
+  static async getUserWithByDefaultEmail() {
+    logger.debug(
+      { email: DEFAULT_ADMIN_EMAIL },
+      "UserModel.getUserWithByDefaultEmail: fetching default admin user",
+    );
+    const [adminUser] = await db
+      .select()
+      .from(schema.usersTable)
+      .where(eq(schema.usersTable.email, DEFAULT_ADMIN_EMAIL))
+      .limit(1);
+    logger.debug(
+      { found: !!adminUser },
+      "UserModel.getUserWithByDefaultEmail: completed",
+    );
+    return adminUser;
+  }
+
+  /**
+   * Update a user with partial data
+   */
+  static async patch(
+    userId: string,
+    data: Partial<UpdateUser>,
+    tx?: Transaction,
+  ) {
+    logger.debug({ userId, data }, "UserModel.patch: updating user");
+    const dbOrTx = tx ?? db;
+    const result = await dbOrTx
+      .update(schema.usersTable)
+      .set(data)
+      .where(eq(schema.usersTable.id, userId));
+    logger.debug({ userId }, "UserModel.patch: completed");
+    return result;
+  }
+
+  /**
+   * Delete a user by ID, along with the personal resources that must not
+   * outlive them.
+   *
+   * The cleanup lives HERE and not in better-auth's `user.delete.before`
+   * database hook: every real deletion path (member removal, pending-member
+   * delete, linked-IdP auth, rejected-SSO cleanup) calls this method, and a
+   * raw Drizzle delete does not run better-auth hooks. Cleanup placed in that
+   * hook looks correct and never fires.
+   *
+   * Runs before the delete because it resolves rows through `owner_id`, which
+   * the `set null` FK would clear.
+   */
+  static async delete(userId: string, tx?: Transaction): Promise<boolean> {
+    logger.debug("UserModel.delete: deleting user");
+
+    if (tx) {
+      await InteractionUserActivityModel.lifecycleFence(tx);
+      // Inside a caller's transaction the cleanup MUST run on the same
+      // executor: a base-db query under an open transaction deadlocks the
+      // single-connection test database, and base-db cleanup would escape the
+      // caller's rollback. No best-effort swallowing here either — after a
+      // failed statement the transaction is aborted, so the transaction is
+      // the unit of success.
+      await McpServerModel.purgePersonalServersForUserInTransaction(userId, tx);
+      await AgentModel.deletePersonalMcpGatewaysForUser(userId, tx);
+      await AgentModel.deletePersonalAgentsForUser({ userId, tx });
+      await SkillModel.deletePersonalSkillsForUser(userId, tx);
+      const result = await tx
+        .delete(schema.usersTable)
+        .where(eq(schema.usersTable.id, userId))
+        .returning();
+      const deleted = result.length > 0;
+      logger.debug({ deleted }, "UserModel.delete: completed");
+      return deleted;
+    }
+
+    // Personal MCP installs hold the user's own credentials (OAuth tokens,
+    // prompted secrets). `mcp_server.owner_id` is `set null`, so without this
+    // the install survives ownerless with its secret bag intact.
+    try {
+      await McpServerModel.purgePersonalServersForUser(userId);
+    } catch (error) {
+      // Don't block the deletion on cleanup failure — a user who asked to be
+      // removed must still be removed. Individual install failures are already
+      // swallowed one level down; this catches a total failure of the query.
+      logger.error(
+        { err: error, userId },
+        "UserModel.delete: failed to purge personal MCP servers",
+      );
+    }
+
+    // Personal gateways/proxies are agents the deletion guard in
+    // routes/agent.ts refuses to delete while `is_personal_gateway` is true,
+    // so an orphan here is undeletable. better-auth's hook also does this, for
+    // the paths that go through better-auth; both are idempotent.
+    try {
+      await AgentModel.deletePersonalMcpGatewaysForUser(userId);
+    } catch (error) {
+      logger.error(
+        { err: error, userId },
+        "UserModel.delete: failed to delete personal MCP gateways",
+      );
+    }
+
+    try {
+      await AgentModel.deletePersonalAgentsForUser({ userId });
+    } catch (error) {
+      logger.error(
+        { err: error, userId },
+        "UserModel.delete: failed to delete personal agents",
+      );
+    }
+
+    // Personal skills would otherwise survive as active orphans:
+    // `skills.author_id` is `set null`, and a personal row without an author
+    // has no author URI segment, so no `skill://` URI can name it and no one
+    // can see or edit it. Soft-deleted, so nothing here can fail on a FK.
+    try {
+      await SkillModel.deletePersonalSkillsForUser(userId);
+    } catch (error) {
+      logger.error(
+        { err: error, userId },
+        "UserModel.delete: failed to delete personal skills",
+      );
+    }
+
+    const result = await db
+      .delete(schema.usersTable)
+      .where(eq(schema.usersTable.id, userId))
+      .returning();
+    const deleted = result.length > 0;
+    logger.debug({ deleted }, "UserModel.delete: completed");
+    return deleted;
+  }
+  private static readonly byId = new PreparedQuery((database) =>
+    database
+      .select({
+        ...getTableColumns(schema.usersTable),
+        organizationId: schema.membersTable.organizationId,
+        membership: getTableColumns(schema.membersTable),
+      })
+      .from(schema.usersTable)
+      .innerJoin(
+        schema.membersTable,
+        eq(schema.usersTable.id, schema.membersTable.userId),
+      )
+      .where(eq(schema.usersTable.id, sql.placeholder("id")))
+      .orderBy(schema.membersTable.createdAt, schema.membersTable.id)
+      .limit(1)
+      .prepare("archestra_user_by_id_with_membership"),
+  );
+
+  private static readonly proxyIdentity = new PreparedQuery((database) =>
+    database
+      .select({
+        id: schema.usersTable.id,
+        email: schema.usersTable.email,
+        name: schema.usersTable.name,
+        membership: getTableColumns(schema.membersTable),
+      })
+      .from(schema.usersTable)
+      .innerJoin(
+        schema.membersTable,
+        eq(schema.usersTable.id, schema.membersTable.userId),
+      )
+      .where(
+        and(
+          eq(schema.usersTable.id, sql.placeholder("userId")),
+          eq(
+            schema.membersTable.organizationId,
+            sql.placeholder("organizationId"),
+          ),
+        ),
+      )
+      .orderBy(schema.membersTable.createdAt, schema.membersTable.id)
+      .limit(1)
+      .prepare("archestra_proxy_user_identity"),
+  );
+}
+
+export default UserModel;

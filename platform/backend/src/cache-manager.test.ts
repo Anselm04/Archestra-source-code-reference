@@ -1,0 +1,764 @@
+import KeyvPostgres from "@keyv/postgres";
+import { sql } from "drizzle-orm";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import db from "@/database";
+
+// Use vi.hoisted() to create mock functions that can be accessed in vi.mock
+const { mockGet, mockSet, mockDelete, mockDisconnect, mockOn } = vi.hoisted(
+  () => ({
+    mockGet: vi.fn(),
+    mockSet: vi.fn(),
+    mockDelete: vi.fn(),
+    mockDisconnect: vi.fn(),
+    mockOn: vi.fn(),
+  }),
+);
+
+// Mock Keyv using the hoisted mock functions
+vi.mock("keyv", async (importOriginal) => {
+  const { default: Keyv } = await importOriginal<typeof import("keyv")>();
+  const codec = new Keyv();
+  return {
+    default: class MockKeyv {
+      constructor(readonly opts: { store: unknown }) {}
+
+      get = mockGet;
+      set = mockSet;
+      delete = mockDelete;
+      disconnect = mockDisconnect;
+      on = mockOn;
+      serializeData = codec.serializeData.bind(codec);
+      deserializeData = codec.deserializeData.bind(codec);
+    },
+  };
+});
+
+vi.mock("@keyv/postgres", () => ({
+  default: class MockKeyvPostgres {
+    async query() {
+      return [];
+    }
+  },
+}));
+
+// Import after mocks are set up
+import {
+  type AllowedCacheKey,
+  CacheKey,
+  cacheManager,
+  LRUCacheManager,
+} from "./cache-manager";
+
+// Alias for convenience in tests
+const mockKeyv = {
+  get: mockGet,
+  set: mockSet,
+  delete: mockDelete,
+  disconnect: mockDisconnect,
+  on: mockOn,
+};
+
+/**
+ * Helper to ensure keyv_cache table exists for SQL-based tests.
+ * This table is normally created by @keyv/postgres but we mock that.
+ * Note: Keyv stores expiration INSIDE the JSON value, not as a separate column.
+ */
+async function ensureKeyvCacheTable() {
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS keyv_cache (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+}
+
+/**
+ * Helper to insert a value directly into keyv_cache for testing.
+ * Mimics how Keyv stores data with the "keyv:" prefix.
+ * Keyv wraps values as: {"value": <actual-value>, "expires": <timestamp>}
+ */
+async function insertKeyvEntry(
+  key: string,
+  value: unknown,
+  expiresAt?: number,
+) {
+  const keyvKey = `keyv:${key}`;
+  // Keyv wraps the value with expiration inside the JSON
+  const keyvPayload = {
+    value,
+    ...(expiresAt !== undefined && { expires: expiresAt }),
+  };
+  const jsonValue = JSON.stringify(keyvPayload);
+  await db.execute(
+    sql`INSERT INTO keyv_cache (key, value) VALUES (${keyvKey}, ${jsonValue})
+        ON CONFLICT (key) DO UPDATE SET value = ${jsonValue}`,
+  );
+}
+
+/**
+ * Helper to check if a key exists in keyv_cache.
+ */
+async function keyvEntryExists(key: string): Promise<boolean> {
+  const keyvKey = `keyv:${key}`;
+  const result = await db.execute<{ count: string }>(
+    sql`SELECT COUNT(*) as count FROM keyv_cache WHERE key = ${keyvKey}`,
+  );
+  return Number.parseInt(result.rows[0]?.count ?? "0", 10) > 0;
+}
+
+/**
+ * Helper to clear all entries from keyv_cache.
+ */
+async function clearKeyvCache() {
+  await db.execute(sql`DELETE FROM keyv_cache`);
+}
+
+describe("CacheManager", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Reset the cacheManager state for each test by calling shutdown
+    cacheManager.shutdown();
+  });
+
+  afterEach(() => {
+    cacheManager.shutdown();
+  });
+
+  describe("withLock", () => {
+    const scope = `${CacheKey.OpenAppaHitlRuling}-transaction` as const;
+    const key = `${CacheKey.OpenAppaHitlReview}-transaction` as const;
+
+    beforeEach(async () => {
+      cacheManager.start();
+      await ensureKeyvCacheTable();
+    });
+
+    test("waits for the PostgreSQL adapter to create its table before locked SQL", async () => {
+      await db.execute(sql`DROP TABLE keyv_cache`);
+      const initialize = vi
+        .spyOn(KeyvPostgres.prototype, "query")
+        .mockImplementationOnce(async () => {
+          await ensureKeyvCacheTable();
+          return [];
+        });
+      try {
+        await cacheManager.withLock(scope, async (cache) => {
+          await cache.set(key, { initialized: true }, 60_000);
+          expect(await cache.getAndDelete(key)).toEqual({ initialized: true });
+        });
+      } finally {
+        initialize.mockRestore();
+      }
+    });
+
+    test("rolls back both removal and a new ruling when the transaction fails", async () => {
+      await insertKeyvEntry(key, { offerId: "offer" }, Date.now() + 60_000);
+      await expect(
+        cacheManager.withLock(scope, async (cache) => {
+          expect(await cache.getAndDelete(key)).toEqual({ offerId: "offer" });
+          await cache.set(scope, { ruling: "approve" }, 60_000);
+          throw new Error("abort ruling");
+        }),
+      ).rejects.toThrow("abort ruling");
+      expect(await keyvEntryExists(key)).toBe(true);
+      expect(await keyvEntryExists(scope)).toBe(false);
+      expect(
+        await cacheManager.withLock(scope, (cache) => cache.get(key)),
+      ).toEqual({ offerId: "offer" });
+    });
+
+    test("uses Keyv serialization and TTL for locked reads, writes, and consume-once", async () => {
+      const value = { body: ":encoded", bytes: Buffer.from("value") };
+      await cacheManager.withLock(scope, (cache) =>
+        cache.set(key, value, 60_000),
+      );
+      expect(
+        await cacheManager.withLock(scope, (cache) => cache.get(key)),
+      ).toEqual(value);
+      expect(await cacheManager.getAndDeleteMany([key])).toEqual([
+        { key, value },
+      ]);
+      expect(
+        await cacheManager.withLock(scope, (cache) => cache.getAndDelete(key)),
+      ).toBeUndefined();
+      await insertKeyvEntry(key, { expired: true }, Date.now() - 1);
+      await cacheManager.withLock(scope, async (cache) => {
+        expect(await cache.get(key)).toBeUndefined();
+        expect(await cache.getAndDeleteMany([key])).toEqual([]);
+      });
+      expect(await keyvEntryExists(key)).toBe(false);
+      await cacheManager.withLock(scope, async (cache) => {
+        await cache.set(key, value, 0);
+        expect(await cache.getAndDelete(key)).toEqual(value);
+      });
+    });
+  });
+
+  describe("start", () => {
+    test("initializes Keyv connection", () => {
+      cacheManager.start();
+
+      // Should register error handler
+      expect(mockKeyv.on).toHaveBeenCalledWith("error", expect.any(Function));
+    });
+
+    test("does not reinitialize if already started", () => {
+      cacheManager.start();
+      const firstCallCount = mockKeyv.on.mock.calls.length;
+
+      cacheManager.start();
+      // Should not add another error handler
+      expect(mockKeyv.on.mock.calls.length).toBe(firstCallCount);
+    });
+  });
+
+  describe("get", () => {
+    test("returns value from cache", async () => {
+      cacheManager.start();
+      mockKeyv.get.mockResolvedValue({ foo: "bar" });
+
+      const result = await cacheManager.get<{ foo: string }>(
+        "test-key" as AllowedCacheKey,
+      );
+
+      expect(result).toEqual({ foo: "bar" });
+      expect(mockKeyv.get).toHaveBeenCalledWith("test-key");
+    });
+
+    test("returns undefined when key does not exist", async () => {
+      cacheManager.start();
+      mockKeyv.get.mockResolvedValue(undefined);
+
+      const result = await cacheManager.get("missing-key" as AllowedCacheKey);
+
+      expect(result).toBeUndefined();
+    });
+
+    test("returns undefined when not started", async () => {
+      const result = await cacheManager.get("test-key" as AllowedCacheKey);
+
+      expect(result).toBeUndefined();
+      expect(mockKeyv.get).not.toHaveBeenCalled();
+    });
+
+    test("returns undefined on error", async () => {
+      cacheManager.start();
+      mockKeyv.get.mockRejectedValue(new Error("Connection failed"));
+
+      const result = await cacheManager.get("test-key" as AllowedCacheKey);
+
+      expect(result).toBeUndefined();
+    });
+
+    test("distinguishes a failed strict read from a cache miss", async () => {
+      cacheManager.start();
+      mockKeyv.get.mockRejectedValueOnce(new Error("Connection failed"));
+
+      await expect(
+        cacheManager.get("test-key" as AllowedCacheKey, { throwOnError: true }),
+      ).rejects.toThrow("Connection failed");
+
+      mockKeyv.get.mockResolvedValueOnce(undefined);
+      await expect(
+        cacheManager.get("test-key" as AllowedCacheKey, { throwOnError: true }),
+      ).resolves.toBeUndefined();
+    });
+
+    test("rejects strict reads before startup", async () => {
+      await expect(
+        cacheManager.get("test-key" as AllowedCacheKey, { throwOnError: true }),
+      ).rejects.toThrow("CacheManager: Not started");
+    });
+  });
+
+  describe("set", () => {
+    test("sets value with default TTL", async () => {
+      cacheManager.start();
+      mockKeyv.set.mockResolvedValue(true);
+
+      const value = { foo: "bar" };
+      const result = await cacheManager.set(
+        "test-key" as AllowedCacheKey,
+        value,
+      );
+
+      expect(result).toEqual(value);
+      expect(mockKeyv.set).toHaveBeenCalledWith(
+        "test-key",
+        value,
+        3600000, // 1 hour default TTL
+      );
+    });
+
+    test("throws when not started", async () => {
+      await expect(
+        cacheManager.set("test-key" as AllowedCacheKey, { foo: "bar" }),
+      ).rejects.toThrow("CacheManager: Not started");
+    });
+
+    test("throws on error", async () => {
+      cacheManager.start();
+      mockKeyv.set.mockRejectedValue(new Error("Write failed"));
+
+      await expect(
+        cacheManager.set("test-key" as AllowedCacheKey, { foo: "bar" }),
+      ).rejects.toThrow("Write failed");
+    });
+  });
+
+  describe("delete", () => {
+    test("deletes key from cache", async () => {
+      cacheManager.start();
+      mockKeyv.delete.mockResolvedValue(true);
+
+      const result = await cacheManager.delete("test-key" as AllowedCacheKey);
+
+      expect(result).toBe(true);
+      expect(mockKeyv.delete).toHaveBeenCalledWith("test-key");
+    });
+
+    test("returns false when not started", async () => {
+      const result = await cacheManager.delete("test-key" as AllowedCacheKey);
+
+      expect(result).toBe(false);
+      expect(mockKeyv.delete).not.toHaveBeenCalled();
+    });
+
+    test("returns false on error", async () => {
+      cacheManager.start();
+      mockKeyv.delete.mockRejectedValue(new Error("Delete failed"));
+
+      const result = await cacheManager.delete("test-key" as AllowedCacheKey);
+
+      expect(result).toBe(false);
+    });
+
+    test("throws on error when cleanup must fail closed", async () => {
+      cacheManager.start();
+      mockKeyv.delete.mockRejectedValue(new Error("Delete failed"));
+
+      await expect(
+        cacheManager.delete("test-key" as AllowedCacheKey, {
+          throwOnError: true,
+        }),
+      ).rejects.toThrow("Delete failed");
+    });
+  });
+
+  describe("getAndDelete", () => {
+    // These tests use real database calls since getAndDelete uses raw SQL
+    // for atomic delete-and-return semantics
+
+    beforeEach(async () => {
+      await ensureKeyvCacheTable();
+      await clearKeyvCache();
+    });
+
+    test("gets and deletes value atomically", async () => {
+      cacheManager.start();
+
+      // Insert test data directly into keyv_cache
+      await insertKeyvEntry("test-key", { foo: "bar" });
+
+      const result = await cacheManager.getAndDelete<{ foo: string }>(
+        "test-key" as AllowedCacheKey,
+      );
+
+      expect(result).toEqual({ foo: "bar" });
+
+      // Verify the entry was deleted
+      const exists = await keyvEntryExists("test-key");
+      expect(exists).toBe(false);
+    });
+
+    test("returns undefined if key does not exist", async () => {
+      cacheManager.start();
+
+      const result = await cacheManager.getAndDelete(
+        "missing-key" as AllowedCacheKey,
+      );
+
+      expect(result).toBeUndefined();
+    });
+
+    test("returns undefined for expired entries", async () => {
+      cacheManager.start();
+
+      // Insert an expired entry (expires in the past)
+      await insertKeyvEntry("expired-key", { foo: "bar" }, Date.now() - 1000);
+
+      const result = await cacheManager.getAndDelete(
+        "expired-key" as AllowedCacheKey,
+      );
+
+      expect(result).toBeUndefined();
+    });
+
+    test("returns value for non-expired entries", async () => {
+      cacheManager.start();
+
+      // Insert an entry that expires in the future
+      await insertKeyvEntry("valid-key", { foo: "bar" }, Date.now() + 60000);
+
+      const result = await cacheManager.getAndDelete<{ foo: string }>(
+        "valid-key" as AllowedCacheKey,
+      );
+
+      expect(result).toEqual({ foo: "bar" });
+    });
+
+    test("returns undefined when not started", async () => {
+      const result = await cacheManager.getAndDelete(
+        "test-key" as AllowedCacheKey,
+      );
+
+      expect(result).toBeUndefined();
+    });
+
+    test("keeps a failed strict claim retryable instead of reporting a miss", async () => {
+      cacheManager.start();
+      const key = `${CacheKey.ChatMcpElicitationPending}-retry` as const;
+      await insertKeyvEntry(key, { conversationId: "conversation" });
+      await db.execute(
+        sql`ALTER TABLE keyv_cache RENAME TO keyv_cache_unavailable`,
+      );
+      try {
+        await expect(
+          cacheManager.getAndDelete(key, { throwOnError: true }),
+        ).rejects.toThrow();
+        await expect(cacheManager.getAndDelete(key)).resolves.toBeUndefined();
+      } finally {
+        await db.execute(
+          sql`ALTER TABLE keyv_cache_unavailable RENAME TO keyv_cache`,
+        );
+      }
+
+      await expect(
+        cacheManager.getAndDelete(key, { throwOnError: true }),
+      ).resolves.toEqual({ conversationId: "conversation" });
+      await expect(
+        cacheManager.getAndDelete(key, { throwOnError: true }),
+      ).resolves.toBeUndefined();
+    });
+
+    test("rejects strict claims before startup", async () => {
+      await expect(
+        cacheManager.getAndDelete("test-key" as AllowedCacheKey, {
+          throwOnError: true,
+        }),
+      ).rejects.toThrow("CacheManager: Not started");
+    });
+  });
+
+  describe("shared response mailboxes", () => {
+    const key = `${CacheKey.LegacySseMessages}-stream-a` as const;
+    const otherKey = `${CacheKey.LegacySseMessages}-stream-b` as const;
+
+    beforeEach(async () => {
+      await ensureKeyvCacheTable();
+      await clearKeyvCache();
+      cacheManager.start();
+    });
+
+    test("preserves concurrent responses and consumes each mailbox once", async () => {
+      await Promise.all(
+        Array.from({ length: 12 }, (_, id) =>
+          cacheManager.appendToList({
+            key,
+            value: { id, text: ":result" },
+            ttl: 60_000,
+          }),
+        ),
+      );
+      await cacheManager.appendToList({
+        key: otherKey,
+        value: { id: 99 },
+        ttl: 60_000,
+      });
+
+      const consumers = await Promise.all([
+        cacheManager.getAndDeleteMany<Array<{ id: number; text: string }>>([
+          key,
+        ]),
+        cacheManager.getAndDeleteMany<Array<{ id: number; text: string }>>([
+          key,
+        ]),
+      ]);
+      const responses = consumers.flat().flatMap((entry) => entry.value);
+      expect(
+        responses.map((response) => response.id).sort((a, b) => a - b),
+      ).toEqual(Array.from({ length: 12 }, (_, id) => id));
+      expect(responses.every((response) => response.text === ":result")).toBe(
+        true,
+      );
+      expect(await cacheManager.getAndDeleteMany([key])).toEqual([]);
+      expect(await cacheManager.getAndDeleteMany([otherKey])).toEqual([
+        { key: otherKey, value: [{ id: 99 }] },
+      ]);
+    });
+
+    test("does not revive expired responses when another reply arrives", async () => {
+      await insertKeyvEntry(key, [{ id: 1 }], Date.now() - 1_000);
+      await cacheManager.appendToList({ key, value: { id: 2 }, ttl: 60_000 });
+      expect(await cacheManager.getAndDeleteMany([key])).toEqual([
+        { key, value: [{ id: 2 }] },
+      ]);
+      await insertKeyvEntry(key, [{ id: 3 }], Date.now() - 1_000);
+      expect(await cacheManager.getAndDeleteMany([key])).toEqual([]);
+      expect(await keyvEntryExists(key)).toBe(false);
+    });
+
+    test("sweeps abandoned entries without removing live or unrelated cache values", async () => {
+      await insertKeyvEntry(key, [{ id: 1 }], Date.now() - 1_000);
+      await cacheManager.appendToList({
+        key: otherKey,
+        value: { id: 2 },
+        ttl: 60_000,
+      });
+      await insertKeyvEntry(
+        "unrelated-key",
+        { keep: true },
+        Date.now() - 1_000,
+      );
+      await cacheManager.deleteExpiredByPrefix(CacheKey.LegacySseMessages);
+      expect(await keyvEntryExists(key)).toBe(false);
+      expect(await keyvEntryExists(otherKey)).toBe(true);
+      expect(await keyvEntryExists("unrelated-key")).toBe(true);
+    });
+  });
+
+  describe("deleteByPrefix", () => {
+    // These tests use real database calls since deleteByPrefix uses raw SQL
+
+    beforeEach(async () => {
+      await ensureKeyvCacheTable();
+      await clearKeyvCache();
+    });
+
+    test("deletes all entries matching prefix", async () => {
+      cacheManager.start();
+
+      // Insert multiple entries with same prefix
+      await insertKeyvEntry("chat-mcp-tools-agent1", { tools: ["a"] });
+      await insertKeyvEntry("chat-mcp-tools-agent2", { tools: ["b"] });
+      await insertKeyvEntry("chat-mcp-tools-agent3", { tools: ["c"] });
+      // Insert entry with different prefix
+      await insertKeyvEntry("other-key", { data: "keep" });
+
+      const deletedCount = await cacheManager.deleteByPrefix(
+        "chat-mcp-tools" as AllowedCacheKey,
+      );
+
+      expect(deletedCount).toBe(3);
+
+      // Verify the matching entries were deleted
+      expect(await keyvEntryExists("chat-mcp-tools-agent1")).toBe(false);
+      expect(await keyvEntryExists("chat-mcp-tools-agent2")).toBe(false);
+      expect(await keyvEntryExists("chat-mcp-tools-agent3")).toBe(false);
+
+      // Verify the non-matching entry still exists
+      expect(await keyvEntryExists("other-key")).toBe(true);
+    });
+
+    test("returns 0 when no entries match prefix", async () => {
+      cacheManager.start();
+
+      await insertKeyvEntry("other-key", { data: "value" });
+
+      const deletedCount = await cacheManager.deleteByPrefix(
+        "non-existent-prefix" as AllowedCacheKey,
+      );
+
+      expect(deletedCount).toBe(0);
+    });
+
+    test("treats LIKE metacharacters in the prefix as literals", async () => {
+      cacheManager.start();
+
+      await insertKeyvEntry("cache_%literal", { keep: false });
+      await insertKeyvEntry("cache_xliteral", { keep: true });
+
+      const deletedCount = await cacheManager.deleteByPrefix(
+        "cache_%" as AllowedCacheKey,
+      );
+
+      expect(deletedCount).toBe(1);
+      expect(await keyvEntryExists("cache_%literal")).toBe(false);
+      expect(await keyvEntryExists("cache_xliteral")).toBe(true);
+    });
+
+    test("returns 0 when not started", async () => {
+      const deletedCount = await cacheManager.deleteByPrefix(
+        "test-prefix" as AllowedCacheKey,
+      );
+
+      expect(deletedCount).toBe(0);
+    });
+  });
+
+  describe("shutdown", () => {
+    test("disconnects Keyv and clears state", () => {
+      cacheManager.start();
+      cacheManager.shutdown();
+
+      expect(mockKeyv.disconnect).toHaveBeenCalled();
+    });
+
+    test("handles shutdown when not started", () => {
+      // Should not throw
+      expect(() => cacheManager.shutdown()).not.toThrow();
+    });
+  });
+});
+
+describe("LRUCacheManager", () => {
+  test("runs eviction callback when an expired entry is read", () => {
+    vi.useFakeTimers();
+
+    try {
+      const onEviction = vi.fn();
+      const cache = new LRUCacheManager<string>({
+        maxSize: 10,
+        defaultTtl: 1_000,
+        onEviction,
+      });
+
+      cache.set("client-1", "value");
+      vi.advanceTimersByTime(1_001);
+
+      expect(cache.get("client-1")).toBeUndefined();
+      expect(onEviction).toHaveBeenCalledWith("client-1", "value");
+      expect(cache.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("runs eviction callback when an expired entry is checked with has()", () => {
+    vi.useFakeTimers();
+
+    try {
+      const onEviction = vi.fn();
+      const cache = new LRUCacheManager<string>({
+        maxSize: 10,
+        defaultTtl: 1_000,
+        onEviction,
+      });
+
+      cache.set("client-1", "value");
+      vi.advanceTimersByTime(1_001);
+
+      expect(cache.has("client-1")).toBe(false);
+      expect(onEviction).toHaveBeenCalledWith("client-1", "value");
+      expect(cache.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("has() does not promote an entry's LRU recency", () => {
+    const cache = new LRUCacheManager<string>({ maxSize: 2 });
+
+    cache.set("A", "a");
+    cache.set("B", "b");
+    // A pure existence check — must not count as a use of A.
+    expect(cache.has("A")).toBe(true);
+    cache.set("C", "c");
+    cache.set("D", "d");
+
+    // With get-based has(), A would have been promoted and survived both
+    // rotations; with peek it ages out like any untouched entry.
+    expect(cache.has("A")).toBe(false);
+    expect(cache.has("C")).toBe(true);
+    expect(cache.has("D")).toBe(true);
+  });
+
+  test("evicts oldest entries until the retained total fits maxBytes", () => {
+    // Entry count is deliberately generous — bytes are what should bind here.
+    const cache = new LRUCacheManager<string>({
+      maxSize: 100,
+      maxBytes: 30,
+      sizeOf: (value) => value.length,
+    });
+
+    cache.set("A", "a".repeat(10));
+    cache.set("B", "b".repeat(10));
+    cache.set("C", "c".repeat(10));
+    expect(cache.retainedBytes).toBe(30);
+    expect(cache.size).toBe(3);
+
+    // Pushes the total to 40 against a 30 budget, so the oldest entry goes even
+    // though the cache is nowhere near its 100-entry ceiling.
+    cache.set("D", "d".repeat(10));
+
+    expect(cache.retainedBytes).toBe(30);
+    expect(cache.has("A")).toBe(false);
+    expect(cache.has("B")).toBe(true);
+    expect(cache.has("C")).toBe(true);
+    expect(cache.has("D")).toBe(true);
+  });
+
+  test("byte eviction is oldest-written-first and ignores read recency", () => {
+    const cache = new LRUCacheManager<string>({
+      maxSize: 100,
+      maxBytes: 30,
+      sizeOf: (value) => value.length,
+    });
+
+    cache.set("A", "a".repeat(10));
+    cache.set("B", "b".repeat(10));
+    cache.set("C", "c".repeat(10));
+    // Reading A does NOT protect it. QuickLRU only reorders when an entry is
+    // promoted out of its older generation, which cannot happen while the cache
+    // is far below maxSize — so within a generation, reads are invisible to
+    // eviction order. This mirrors QuickLRU's own count-based eviction rather
+    // than adding a second, stricter policy on top of it.
+    expect(cache.get("A")).toBe("a".repeat(10));
+
+    cache.set("D", "d".repeat(10));
+
+    expect(cache.has("A")).toBe(false);
+    expect(cache.has("D")).toBe(true);
+  });
+
+  test("drops a value that is larger than the whole budget", () => {
+    const onEviction = vi.fn();
+    const cache = new LRUCacheManager<string>({
+      maxSize: 100,
+      maxBytes: 30,
+      sizeOf: (value) => value.length,
+      onEviction,
+    });
+
+    cache.set("huge", "x".repeat(100));
+
+    // A cache that cannot retain a value must not pretend it did, so callers
+    // cannot treat set() as making the value readable afterwards.
+    expect(cache.get("huge")).toBeUndefined();
+    expect(cache.retainedBytes).toBe(0);
+    expect(onEviction).toHaveBeenCalledWith("huge", "x".repeat(100));
+  });
+
+  test("leaves entry-count eviction alone when maxBytes is not configured", () => {
+    const cache = new LRUCacheManager<string>({ maxSize: 3 });
+
+    cache.set("A", "a".repeat(10_000));
+    cache.set("B", "b".repeat(10_000));
+
+    // No budget configured: sizes are not measured and nothing is byte-evicted.
+    expect(cache.retainedBytes).toBe(0);
+    expect(cache.size).toBe(2);
+    expect(cache.get("A")).toBe("a".repeat(10_000));
+  });
+
+  test("ignores maxBytes when no sizeOf is supplied", () => {
+    // Without a way to measure values a byte budget cannot be enforced, so the
+    // cache must fall back to entry-count behavior rather than evict blindly.
+    const cache = new LRUCacheManager<string>({ maxSize: 10, maxBytes: 1 });
+
+    cache.set("A", "a".repeat(10_000));
+
+    expect(cache.get("A")).toBe("a".repeat(10_000));
+    expect(cache.size).toBe(1);
+  });
+});

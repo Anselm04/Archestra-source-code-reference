@@ -1,0 +1,875 @@
+"use client";
+
+import {
+  type archestraApiTypes,
+  isPlaywrightCatalogItem,
+} from "@archestra/shared";
+import { KeyRound } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { Components } from "react-markdown";
+import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
+import { StandardFormDialog } from "@/components/standard-dialog";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { SecretInput, SecretTextarea } from "@/components/ui/secret-input";
+import { Separator } from "@/components/ui/separator";
+import { useEnvironments } from "@/lib/environment.query";
+import { useMcpCatalogCredentialPreflight } from "@/lib/mcp/internal-mcp-catalog.query";
+import { MCP_CONFIG_AUTOCOMPLETE } from "@/lib/mcp/mcp-form-autocomplete";
+import { useDefaultEnvironment } from "@/lib/organization.query";
+import {
+  compileValidationRegex,
+  toFieldValueType,
+  validateFieldAgainstRegex,
+} from "./environment-validation-helpers";
+import { InlineCredentialFormShell } from "./inline-credential-form-shell";
+import { getLocalInstallationCopy } from "./local-installation-copy";
+import { McpCredentialBlockers } from "./mcp-credential-blockers";
+import {
+  type McpServerInstallScope,
+  SelectMcpServerCredentialTypeAndTeams,
+} from "./select-mcp-server-credential-type-and-teams";
+
+type CatalogItem =
+  archestraApiTypes.GetInternalMcpCatalogResponses["200"][number];
+type UserConfigType = NonNullable<CatalogItem["userConfig"]>;
+
+// Shared markdown components for consistent styling
+const markdownComponents: Components = {
+  p: (props) => (
+    <p className="text-muted-foreground leading-relaxed text-xs" {...props} />
+  ),
+  strong: (props) => (
+    <strong className="font-semibold text-foreground" {...props} />
+  ),
+  code: (props) => (
+    <code
+      className="bg-muted text-foreground px-1 py-0.5 rounded text-xs font-mono"
+      {...props}
+    />
+  ),
+  a: (props) => (
+    <a
+      className="text-primary hover:underline"
+      target="_blank"
+      rel="noopener noreferrer"
+      {...props}
+    />
+  ),
+  ul: (props) => <ul className="my-2 list-disc space-y-1 pl-5" {...props} />,
+  ol: (props) => <ol className="my-2 list-decimal space-y-1 pl-5" {...props} />,
+  li: (props) => <li className="text-muted-foreground" {...props} />,
+  h1: (props) => (
+    <h1
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
+  h2: (props) => (
+    <h2
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
+  h3: (props) => (
+    <h3
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
+  h4: (props) => (
+    <h4
+      className="mt-3 mb-1 font-semibold text-foreground text-sm"
+      {...props}
+    />
+  ),
+};
+
+export interface LocalServerInstallResult {
+  /** Catalog id to install from. */
+  catalogId: string;
+  environmentValues: Record<string, string>;
+  userConfigValues?: Record<string, string>;
+  /** Installation scope (personal, team, org) */
+  scope: McpServerInstallScope;
+  /** Team ID to assign the MCP server to (only when scope is "team") */
+  teamId?: string | null;
+}
+
+interface LocalServerInstallDialogProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: (result: LocalServerInstallResult) => Promise<void>;
+  catalogItem: CatalogItem | null;
+  isInstalling: boolean;
+  /** When true, shows "Reinstall" instead of "Install" in the dialog */
+  isReinstall?: boolean;
+  /** The team ID of the existing server being reinstalled (null = personal/org) */
+  existingTeamId?: string | null;
+  /** The scope of the existing server being reinstalled */
+  existingScope?: McpServerInstallScope;
+  /** When true, shows re-authentication mode (info banner, different title) */
+  isReauth?: boolean;
+  /** Pre-select a specific team in the credential type selector */
+  preselectedTeamId?: string | null;
+  /** When true, only personal installation is allowed */
+  personalOnly?: boolean;
+  /** When true, only organization-wide installation is allowed */
+  orgOnly?: boolean;
+  presentation?: "dialog" | "inline";
+}
+
+export function LocalServerInstallDialog({
+  isOpen,
+  onClose,
+  onConfirm,
+  catalogItem,
+  isInstalling,
+  isReinstall = false,
+  existingTeamId,
+  existingScope,
+  isReauth = false,
+  preselectedTeamId,
+  personalOnly: personalOnlyProp = false,
+  orgOnly = false,
+  presentation = "dialog",
+}: LocalServerInstallDialogProps) {
+  const lockToExistingScope = isReinstall || isReauth;
+  const [selectedTeamId, setSelectedTeamId] = useState<string | null>(
+    lockToExistingScope ? (existingTeamId ?? null) : null,
+  );
+  const [scope, setScope] = useState<McpServerInstallScope>(
+    lockToExistingScope
+      ? (existingScope ?? (existingTeamId ? "team" : "personal"))
+      : orgOnly
+        ? "org"
+        : "personal",
+  );
+  const [canInstall, setCanInstall] = useState(true);
+  const userConfig =
+    (catalogItem?.userConfig as UserConfigType | null | undefined) || {};
+  const promptableUserConfig = Object.fromEntries(
+    Object.entries(userConfig).filter(([_fieldName, fieldConfig]) => {
+      return fieldConfig.promptOnInstallation !== false;
+    }),
+  );
+  // Extract environment variables that need prompting during installation.
+  // Multi-tenant catalogs share one deployment, so env vars are catalog-level
+  // (set once by an admin). Per-caller install never prompts for env values.
+  const promptedEnvVars = catalogItem?.multitenant
+    ? []
+    : catalogItem?.localConfig?.environment?.filter(
+        (env) => env.promptOnInstallation !== false,
+      ) || [];
+
+  // Separate secret vs non-secret env vars
+  // Secret env vars can be loaded from vault, non-secret must be entered manually
+  // Note: 'mounted' field is added in schema but types may not be regenerated yet
+  const secretEnvVars = promptedEnvVars.filter(
+    (env) =>
+      env.type === "secret" &&
+      env.promptOnInstallation !== false &&
+      !(env as { mounted?: boolean }).mounted,
+  );
+  const secretFileVars = promptedEnvVars.filter(
+    (env) =>
+      env.type === "secret" &&
+      env.promptOnInstallation !== false &&
+      (env as { mounted?: boolean }).mounted === true,
+  );
+  const personalOnly =
+    personalOnlyProp ||
+    (catalogItem ? isPlaywrightCatalogItem(catalogItem.id) : false);
+  // Saved credentials the server is configured with and this person cannot
+  // supply. Install would fail on them, so the dialog says why up front.
+  const credentialBlockers =
+    useMcpCatalogCredentialPreflight({
+      catalogId: catalogItem?.id,
+      scope: personalOnly ? "personal" : scope,
+      enabled: isOpen && !isReauth,
+    }).data ?? [];
+  // Only a personal-only credential is cured by picking another owner; any
+  // other blocker stands at every scope, so the owner picker and the config
+  // fields have nothing to offer.
+  const blockedAtEveryScope = credentialBlockers.some(
+    (blocker) => blocker.reason !== "personal_only",
+  );
+  const hasPromptedConfiguration =
+    promptedEnvVars.length > 0 || Object.keys(promptableUserConfig).length > 0;
+  const nonSecretEnvVars = promptedEnvVars.filter(
+    (env) => env.type !== "secret",
+  );
+
+  const [environmentValues, setEnvironmentValues] = useState<
+    Record<string, string>
+  >(() =>
+    promptedEnvVars.reduce<Record<string, string>>((acc, env) => {
+      const defaultValue = env.default !== undefined ? String(env.default) : "";
+      acc[env.key] = env.value || defaultValue;
+      return acc;
+    }, {}),
+  );
+  const [userConfigValues, setUserConfigValues] = useState<
+    Record<string, string>
+  >(() =>
+    Object.entries(promptableUserConfig).reduce<Record<string, string>>(
+      (acc, [fieldName, fieldConfig]) => {
+        if (
+          typeof fieldConfig.default === "string" ||
+          typeof fieldConfig.default === "number" ||
+          typeof fieldConfig.default === "boolean"
+        ) {
+          acc[fieldName] = String(fieldConfig.default);
+        } else {
+          acc[fieldName] = "";
+        }
+        return acc;
+      },
+      {},
+    ),
+  );
+
+  // Sync vaultTeamId from selectedTeamId when in team mode, reset when switching to personal
+
+  const handleEnvVarChange = (key: string, value: string) => {
+    setEnvironmentValues((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleUserConfigChange = (key: string, value: string) => {
+    setUserConfigValues((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleInstall = async () => {
+    if (!catalogItem) return;
+
+    // personalOnly is a security/product invariant, not merely selector UI.
+    // Enforce it again at the payload boundary so async dialog state cannot
+    // submit a stale team/org scope (notably for the Playwright preview).
+    const submittedScope = personalOnly ? "personal" : scope;
+    const finalEnvironmentValues: Record<string, string> = {};
+    const finalUserConfigValues: Record<string, string> = {};
+
+    // Add non-secret env var values (always from form)
+    for (const env of nonSecretEnvVars) {
+      if (environmentValues[env.key]) {
+        finalEnvironmentValues[env.key] = environmentValues[env.key];
+      }
+    }
+
+    // Add secret env var values
+    for (const env of secretEnvVars) {
+      if (environmentValues[env.key]) {
+        finalEnvironmentValues[env.key] = environmentValues[env.key];
+      }
+    }
+
+    // Add secret file values
+    for (const env of secretFileVars) {
+      if (environmentValues[env.key]) {
+        finalEnvironmentValues[env.key] = environmentValues[env.key];
+      }
+    }
+
+    for (const fieldName of Object.keys(promptableUserConfig)) {
+      const value = userConfigValues[fieldName];
+      if (value !== undefined && value !== "") {
+        finalUserConfigValues[fieldName] = value;
+      }
+    }
+
+    await onConfirm({
+      catalogId: catalogItem.id,
+      environmentValues: finalEnvironmentValues,
+      userConfigValues: finalUserConfigValues,
+      scope: submittedScope,
+      teamId: submittedScope === "team" ? selectedTeamId : null,
+    });
+
+    // Reset form
+    resetForm();
+  };
+
+  const resetForm = () => {
+    setEnvironmentValues(
+      promptedEnvVars.reduce<Record<string, string>>((acc, env) => {
+        acc[env.key] = env.value || String(env.default ?? "");
+        return acc;
+      }, {}),
+    );
+    setUserConfigValues(
+      Object.entries(promptableUserConfig).reduce<Record<string, string>>(
+        (acc, [fieldName, fieldConfig]) => {
+          if (
+            typeof fieldConfig.default === "string" ||
+            typeof fieldConfig.default === "number" ||
+            typeof fieldConfig.default === "boolean"
+          ) {
+            acc[fieldName] = String(fieldConfig.default);
+          } else {
+            acc[fieldName] = "";
+          }
+          return acc;
+        },
+        {},
+      ),
+    );
+    setSelectedTeamId(isReinstall ? (existingTeamId ?? null) : null);
+    setScope(
+      isReinstall
+        ? (existingScope ?? (existingTeamId ? "team" : "personal"))
+        : orgOnly
+          ? "org"
+          : "personal",
+    );
+  };
+
+  const handleClose = () => {
+    resetForm();
+    onClose();
+  };
+
+  // Check if non-secret env vars are valid (always required)
+  const isNonSecretValid = nonSecretEnvVars.every((env) => {
+    if (!env.required) return true;
+    const value = environmentValues[env.key];
+    if (env.type === "boolean") {
+      return !!value;
+    }
+    return !!value?.trim();
+  });
+
+  // Check if secrets are valid:
+  const allSecrets = [...secretEnvVars, ...secretFileVars];
+  const isSecretsValid =
+    allSecrets.length === 0 ||
+    allSecrets.every((env) => {
+      if (!env.required) return true;
+      const value = environmentValues[env.key];
+      return !!value?.trim();
+    });
+
+  const isValid = isNonSecretValid && isSecretsValid;
+  const sensitiveRequiredUserConfig = Object.entries(
+    promptableUserConfig,
+  ).filter(([_, cfg]) => cfg.required && cfg.sensitive);
+  const nonSensitiveRequiredUserConfig = Object.entries(
+    promptableUserConfig,
+  ).filter(([_, cfg]) => cfg.required && !cfg.sensitive);
+  const isNonSensitiveUserConfigValid = nonSensitiveRequiredUserConfig.every(
+    ([fieldName, fieldConfig]) => {
+      const value = userConfigValues[fieldName];
+      if (fieldConfig.type === "boolean") {
+        return !!value;
+      }
+      return !!value?.trim();
+    },
+  );
+  const isSensitiveUserConfigValid = sensitiveRequiredUserConfig.every(
+    ([fieldName]) => userConfigValues[fieldName]?.trim(),
+  );
+  const hasPromptedUserConfig = Object.keys(promptableUserConfig).length > 0;
+  const isUserConfigValid =
+    isNonSensitiveUserConfigValid && isSensitiveUserConfigValid;
+
+  // Resolve the governing environment's allowlist regex (the env the catalog
+  // item is bound to, or the org default when unbound) and compile it once.
+  const { data: environmentList } = useEnvironments();
+  const defaultEnvironment = useDefaultEnvironment();
+  const boundEnvironment = catalogItem?.environmentId
+    ? environmentList?.environments.find(
+        (e) => e.id === catalogItem.environmentId,
+      )
+    : null;
+  const environmentName = boundEnvironment?.name ?? defaultEnvironment.name;
+  const validationRegex = compileValidationRegex(
+    boundEnvironment
+      ? boundEnvironment.validationRegex
+      : defaultEnvironment.validationRegex,
+  );
+  const envVarRegexError = (key: string, type: string): string | null =>
+    validateFieldAgainstRegex({
+      value: environmentValues[key] ?? "",
+      regex: validationRegex,
+      valueType: toFieldValueType(type),
+      environmentName,
+    });
+  const userConfigRegexError = (
+    key: string,
+    type: string | undefined,
+  ): string | null =>
+    validateFieldAgainstRegex({
+      value: userConfigValues[key] ?? "",
+      regex: validationRegex,
+      valueType: toFieldValueType(type),
+      environmentName,
+    });
+  const hasRegexErrors =
+    nonSecretEnvVars.some(
+      (env) => envVarRegexError(env.key, env.type) !== null,
+    ) ||
+    Object.entries(promptableUserConfig).some(
+      ([fieldName, cfg]) =>
+        !cfg.sensitive && userConfigRegexError(fieldName, cfg.type) !== null,
+    );
+  const FormShell =
+    presentation === "inline" ? InlineCredentialFormShell : StandardFormDialog;
+
+  return (
+    <FormShell
+      open={isOpen}
+      onOpenChange={handleClose}
+      title={
+        <span>
+          {isReauth ? "Re-authenticate" : isReinstall ? "Reinstall" : "Install"}{" "}
+          - {catalogItem?.name}
+        </span>
+      }
+      description={
+        catalogItem?.instructions ? (
+          <div className="text-sm text-muted-foreground">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm, remarkBreaks]}
+              components={markdownComponents}
+            >
+              {catalogItem.instructions}
+            </ReactMarkdown>
+          </div>
+        ) : undefined
+      }
+      size={
+        blockedAtEveryScope || !hasPromptedConfiguration ? "small" : "medium"
+      }
+      bodyClassName="space-y-4"
+      onSubmit={handleInstall}
+      footer={
+        canInstall ? (
+          <>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleClose}
+              disabled={isInstalling}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              disabled={
+                !(isValid && isUserConfigValid) ||
+                hasRegexErrors ||
+                credentialBlockers.length > 0 ||
+                isInstalling
+              }
+            >
+              {isInstalling
+                ? isReauth
+                  ? "Updating..."
+                  : isReinstall
+                    ? "Reinstalling..."
+                    : "Installing..."
+                : isReauth
+                  ? "Update Credentials"
+                  : isReinstall
+                    ? "Reinstall"
+                    : "Install"}
+            </Button>
+          </>
+        ) : null
+      }
+    >
+      {isReauth && (
+        <InlineNotice variant="neutral">
+          <KeyRound />
+          <InlineNoticeText>
+            Replace credentials for this existing connection only. Tool
+            assignments and policies stay unchanged. Use Manage credentials to
+            add or remove connections.
+          </InlineNoticeText>
+        </InlineNotice>
+      )}
+
+      {!isReauth &&
+        personalOnly &&
+        !hasPromptedConfiguration &&
+        credentialBlockers.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            This server needs no credentials or configuration.{" "}
+            {
+              getLocalInstallationCopy(catalogItem?.multitenant === true)
+                .installForMe
+            }
+          </p>
+        )}
+
+      {!isReauth && <McpCredentialBlockers blockers={credentialBlockers} />}
+
+      {!blockedAtEveryScope && (
+        <SelectMcpServerCredentialTypeAndTeams
+          onTeamChange={setSelectedTeamId}
+          catalogId={isReinstall || isReauth ? undefined : catalogItem?.id}
+          onScopeChange={setScope}
+          onCanInstallChange={setCanInstall}
+          isReinstall={isReinstall}
+          isReauth={isReauth}
+          existingTeamId={existingTeamId}
+          existingScope={existingScope}
+          personalOnly={personalOnly}
+          orgOnly={orgOnly}
+          preselectedTeamId={preselectedTeamId}
+        />
+      )}
+
+      {canInstall && !blockedAtEveryScope && (
+        <div className="space-y-6">
+          {/* Non-secret Environment Variables (always editable) */}
+          {nonSecretEnvVars.length > 0 && (
+            <div className="space-y-4">
+              <h3 className="text-sm font-medium">Environment Variables</h3>
+              {nonSecretEnvVars.map((env) => (
+                <div key={env.key} className="space-y-2">
+                  {env.type === "boolean" ? (
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id={`env-${env.key}`}
+                        checked={environmentValues[env.key] === "true"}
+                        onCheckedChange={(checked) =>
+                          handleEnvVarChange(
+                            env.key,
+                            checked ? "true" : "false",
+                          )
+                        }
+                        disabled={isInstalling}
+                      />
+                      <Label
+                        htmlFor={`env-${env.key}`}
+                        className="cursor-pointer"
+                      >
+                        {env.key}
+                        {env.required && (
+                          <span className="text-destructive ml-1">*</span>
+                        )}
+                      </Label>
+                    </div>
+                  ) : (
+                    <Label htmlFor={`env-${env.key}`}>
+                      {env.key}
+                      {env.required && (
+                        <span className="text-destructive ml-1">*</span>
+                      )}
+                    </Label>
+                  )}
+                  {env.description && (
+                    <div className="text-xs text-muted-foreground">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm, remarkBreaks]}
+                        components={markdownComponents}
+                      >
+                        {env.description}
+                      </ReactMarkdown>
+                    </div>
+                  )}
+
+                  {env.type === "boolean" ? null : env.type === "number" ? (
+                    <Input
+                      id={`env-${env.key}`}
+                      type="number"
+                      value={environmentValues[env.key] || ""}
+                      onChange={(e) =>
+                        handleEnvVarChange(env.key, e.target.value)
+                      }
+                      placeholder={
+                        env.default !== undefined ? String(env.default) : "0"
+                      }
+                      className="font-mono"
+                      autoComplete={MCP_CONFIG_AUTOCOMPLETE}
+                      disabled={isInstalling}
+                    />
+                  ) : (
+                    <Input
+                      id={`env-${env.key}`}
+                      type="text"
+                      value={environmentValues[env.key] || ""}
+                      onChange={(e) =>
+                        handleEnvVarChange(env.key, e.target.value)
+                      }
+                      placeholder={`Enter value for ${env.key}`}
+                      className="font-mono"
+                      autoComplete={MCP_CONFIG_AUTOCOMPLETE}
+                      disabled={isInstalling}
+                      aria-invalid={
+                        envVarRegexError(env.key, env.type) ? true : undefined
+                      }
+                    />
+                  )}
+                  {envVarRegexError(env.key, env.type) && (
+                    <p className="text-xs text-destructive">
+                      {envVarRegexError(env.key, env.type)}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Secrets Section (env vars and files) */}
+          {(secretEnvVars.length > 0 || secretFileVars.length > 0) && (
+            <>
+              {nonSecretEnvVars.length > 0 && <Separator />}
+
+              <div className="space-y-4">
+                <h3 className="text-sm font-medium">Secrets</h3>
+
+                {/* Secret Environment Variables */}
+                {secretEnvVars.length > 0 && (
+                  <div className="space-y-4">
+                    <h4 className="text-sm font-medium text-muted-foreground">
+                      Environment Variables
+                    </h4>
+                    {secretEnvVars.map((env) => (
+                      <div key={env.key} className="space-y-2">
+                        <Label htmlFor={`env-${env.key}`}>
+                          {env.key}
+                          {env.required && (
+                            <span className="text-destructive ml-1">*</span>
+                          )}
+                        </Label>
+                        {env.description && (
+                          <div className="text-xs text-muted-foreground">
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm, remarkBreaks]}
+                              components={markdownComponents}
+                            >
+                              {env.description}
+                            </ReactMarkdown>
+                          </div>
+                        )}
+
+                        {
+                          <SecretInput
+                            id={`env-${env.key}`}
+                            value={environmentValues[env.key] || ""}
+                            onChange={(e) =>
+                              handleEnvVarChange(env.key, e.target.value)
+                            }
+                            placeholder={`Enter value for ${env.key}`}
+                            className="font-mono"
+                            disabled={isInstalling}
+                          />
+                        }
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Secret Files (mounted as files at /secrets/<key>) */}
+                {secretFileVars.length > 0 && (
+                  <div className="space-y-4">
+                    {secretEnvVars.length > 0 && <Separator />}
+                    <h4 className="text-sm font-medium text-muted-foreground">
+                      Files
+                    </h4>
+
+                    {secretFileVars.map((env) => (
+                      <div key={env.key} className="space-y-2">
+                        <Label htmlFor={`env-${env.key}`}>
+                          {env.key}
+                          {env.required && (
+                            <span className="text-destructive ml-1">*</span>
+                          )}
+                        </Label>
+                        {env.description && (
+                          <div className="text-xs text-muted-foreground">
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm, remarkBreaks]}
+                              components={markdownComponents}
+                            >
+                              {env.description}
+                            </ReactMarkdown>
+                          </div>
+                        )}
+
+                        {
+                          <AutoResizeTextarea
+                            id={`env-${env.key}`}
+                            value={environmentValues[env.key] || ""}
+                            onChange={(value) =>
+                              handleEnvVarChange(env.key, value)
+                            }
+                            disabled={isInstalling}
+                          />
+                        }
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+
+          {hasPromptedUserConfig && (
+            <>
+              {(nonSecretEnvVars.length > 0 ||
+                secretEnvVars.length > 0 ||
+                secretFileVars.length > 0) && <Separator />}
+
+              <div className="space-y-4">
+                <h3 className="text-sm font-medium">
+                  {Object.values(promptableUserConfig).every(
+                    (field) => field.headerName,
+                  )
+                    ? "Additional Headers"
+                    : "Connection Settings"}
+                </h3>
+
+                {Object.entries(promptableUserConfig).map(
+                  ([fieldName, fieldConfig]) => (
+                    <div key={fieldName} className="space-y-2">
+                      <Label htmlFor={`user-config-${fieldName}`}>
+                        {fieldConfig.title || fieldName}
+                        {fieldConfig.required && (
+                          <span className="text-destructive ml-1">*</span>
+                        )}
+                      </Label>
+                      {fieldConfig.description && (
+                        <div className="text-xs text-muted-foreground">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm, remarkBreaks]}
+                            components={markdownComponents}
+                          >
+                            {fieldConfig.description}
+                          </ReactMarkdown>
+                        </div>
+                      )}
+
+                      {fieldConfig.type === "boolean" ? (
+                        <div className="flex items-center gap-2">
+                          <Checkbox
+                            id={`user-config-${fieldName}`}
+                            checked={userConfigValues[fieldName] === "true"}
+                            onCheckedChange={(checked) =>
+                              handleUserConfigChange(
+                                fieldName,
+                                checked ? "true" : "false",
+                              )
+                            }
+                            disabled={isInstalling}
+                          />
+                          <Label
+                            htmlFor={`user-config-${fieldName}`}
+                            className="cursor-pointer"
+                          >
+                            {fieldConfig.title || fieldName}
+                          </Label>
+                        </div>
+                      ) : fieldConfig.type === "number" ? (
+                        <Input
+                          id={`user-config-${fieldName}`}
+                          type="number"
+                          value={userConfigValues[fieldName] || ""}
+                          onChange={(e) =>
+                            handleUserConfigChange(fieldName, e.target.value)
+                          }
+                          placeholder={
+                            fieldConfig.default !== undefined
+                              ? String(fieldConfig.default)
+                              : "0"
+                          }
+                          className="font-mono"
+                          autoComplete={MCP_CONFIG_AUTOCOMPLETE}
+                          disabled={isInstalling}
+                        />
+                      ) : fieldConfig.sensitive ? (
+                        <SecretInput
+                          id={`user-config-${fieldName}`}
+                          value={userConfigValues[fieldName] || ""}
+                          onChange={(e) =>
+                            handleUserConfigChange(fieldName, e.target.value)
+                          }
+                          placeholder={`Enter value for ${fieldConfig.title || fieldName}`}
+                          className="font-mono"
+                          disabled={isInstalling}
+                        />
+                      ) : (
+                        <Input
+                          id={`user-config-${fieldName}`}
+                          type="text"
+                          value={userConfigValues[fieldName] || ""}
+                          onChange={(e) =>
+                            handleUserConfigChange(fieldName, e.target.value)
+                          }
+                          placeholder={`Enter value for ${fieldConfig.title || fieldName}`}
+                          className="font-mono"
+                          autoComplete={MCP_CONFIG_AUTOCOMPLETE}
+                          disabled={isInstalling}
+                          aria-invalid={
+                            !fieldConfig.sensitive &&
+                            userConfigRegexError(fieldName, fieldConfig.type)
+                              ? true
+                              : undefined
+                          }
+                        />
+                      )}
+                      {!fieldConfig.sensitive &&
+                        userConfigRegexError(fieldName, fieldConfig.type) && (
+                          <p className="text-xs text-destructive">
+                            {userConfigRegexError(fieldName, fieldConfig.type)}
+                          </p>
+                        )}
+                    </div>
+                  ),
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </FormShell>
+  );
+}
+
+const MAX_TEXTAREA_HEIGHT = 200;
+
+function AutoResizeTextarea({
+  id,
+  value,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const adjustHeight = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.min(textarea.scrollHeight, MAX_TEXTAREA_HEIGHT)}px`;
+    }
+  }, []);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Re-adjust height when value changes
+  useEffect(() => {
+    adjustHeight();
+  }, [value, adjustHeight]);
+
+  return (
+    <SecretTextarea
+      ref={textareaRef}
+      id={id}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="font-mono text-xs resize-none min-h-10 max-h-[200px] overflow-y-auto"
+      rows={1}
+      onInput={adjustHeight}
+      disabled={disabled}
+    />
+  );
+}

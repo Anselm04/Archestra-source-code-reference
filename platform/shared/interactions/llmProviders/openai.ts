@@ -1,0 +1,392 @@
+import type * as archestraApiTypes from "../../hey-api/clients/api/types.gen";
+import type { PartialUIMessage } from "../types";
+import type {
+  Interaction,
+  InteractionUtils,
+  RequestedToolCall,
+} from "./common";
+import { tryParseJson } from "./json";
+import {
+  audioMediaType,
+  inlineMediaPart,
+  linkedMediaPart,
+  mediaFormatLabel,
+  missingAudioReason,
+  missingMediaPart,
+  pcm16ToWav,
+} from "./media";
+
+class OpenAiChatCompletionInteraction implements InteractionUtils {
+  private request: archestraApiTypes.OpenAiChatCompletionRequest;
+  private response: archestraApiTypes.OpenAiChatCompletionResponse;
+  modelName: string;
+
+  constructor(interaction: Interaction) {
+    this.request =
+      interaction.request as archestraApiTypes.OpenAiChatCompletionRequest;
+    this.response =
+      interaction.response as archestraApiTypes.OpenAiChatCompletionResponse;
+    this.modelName = interaction.model ?? this.request.model;
+  }
+
+  isLastMessageToolCall(): boolean {
+    const messages = this.request.messages;
+
+    if (messages.length === 0) {
+      return false;
+    }
+
+    const lastMessage = messages[messages.length - 1];
+    return lastMessage.role === "tool";
+  }
+
+  getLastToolCallId(): string | null {
+    const messages = this.request.messages;
+    if (messages.length === 0) {
+      return null;
+    }
+
+    const lastMessage = messages[messages.length - 1];
+    if (lastMessage.role === "tool") {
+      return lastMessage.tool_call_id;
+    }
+    return null;
+  }
+
+  getToolNamesUsed(): string[] {
+    const toolsUsed = new Set<string>();
+    for (const message of this.request.messages) {
+      if (message.role === "assistant" && message.tool_calls) {
+        for (const toolCall of message.tool_calls) {
+          if ("function" in toolCall) {
+            toolsUsed.add(toolCall.function.name);
+          }
+        }
+      }
+    }
+    return Array.from(toolsUsed);
+  }
+
+  getToolCallsRequested(): RequestedToolCall[] {
+    return this.response.choices.flatMap((choice) =>
+      (choice.message.tool_calls ?? []).flatMap((toolCall) => {
+        if (!toolCall.id) return [];
+        if ("function" in toolCall) {
+          return [{ id: toolCall.id, name: toolCall.function.name }];
+        }
+        // Custom (freeform) tools, such as a coding agent's apply_patch.
+        if (toolCall.type === "custom") {
+          return [{ id: toolCall.id, name: toolCall.custom.name }];
+        }
+        return [];
+      }),
+    );
+  }
+
+  getToolNamesRequested(): string[] {
+    const toolsRequested = new Set<string>();
+
+    // Check the response for tool calls (tools that LLM wants to execute)
+    for (const choice of this.response.choices) {
+      if (Array.isArray(choice.message.tool_calls)) {
+        for (const toolCall of choice.message.tool_calls) {
+          if ("function" in toolCall) {
+            toolsRequested.add(toolCall.function.name);
+          }
+        }
+      }
+    }
+
+    return Array.from(toolsRequested);
+  }
+
+  getLastUserMessage(): string {
+    const reversedMessages = [...this.request.messages].reverse();
+    for (const message of reversedMessages) {
+      if (message.role !== "user") {
+        continue;
+      }
+      if (typeof message.content === "string") {
+        return message.content;
+      }
+      if (message.content?.[0]?.type === "text") {
+        return message.content[0].text;
+      }
+    }
+    return "";
+  }
+
+  getLastAssistantResponse(): string {
+    const message = this.response.choices[0]?.message;
+    return message?.content ?? audioTranscriptOf(message) ?? "";
+  }
+
+  private mapToUiMessage(
+    message:
+      | archestraApiTypes.OpenAiChatCompletionRequest["messages"][number]
+      | archestraApiTypes.OpenAiChatCompletionResponse["choices"][number]["message"],
+  ): PartialUIMessage {
+    const parts: PartialUIMessage["parts"] = [];
+    const { content, role } = message;
+
+    if (role === "assistant") {
+      const { tool_calls: toolCalls } = message;
+      const refusal = message.refusal;
+
+      if (Array.isArray(toolCalls)) {
+        // Handle assistant messages with tool calls
+
+        // Add text content if present
+        if (typeof content === "string" && content) {
+          parts.push({ type: "text", text: content });
+        } else if (Array.isArray(content)) {
+          for (const part of content) {
+            if (part.type === "text") {
+              parts.push({ type: "text", text: part.text });
+            } else if (part.type === "refusal") {
+              parts.push({ type: "text", text: part.refusal });
+            }
+          }
+        }
+
+        // Add tool invocation parts
+        for (const toolCall of toolCalls) {
+          if (toolCall.type === "function") {
+            parts.push({
+              type: "dynamic-tool",
+              toolName: toolCall.function.name,
+              toolCallId: toolCall.id,
+              state: "input-available",
+              input: tryParseJson(toolCall.function.arguments),
+            });
+          } else if (toolCall.type === "custom") {
+            parts.push({
+              type: "dynamic-tool",
+              toolName: toolCall.custom.name,
+              toolCallId: toolCall.id,
+              state: "input-available",
+              input: tryParseJson(toolCall.custom.input),
+            });
+          }
+        }
+      } else if (refusal) {
+        parts.push({ type: "text", text: refusal });
+      } else {
+        // Plain text assistant message (no tool calls, no refusal)
+        if (typeof content === "string" && content) {
+          parts.push({ type: "text", text: content });
+        } else if (Array.isArray(content)) {
+          for (const part of content) {
+            if (part.type === "text") {
+              parts.push({ type: "text", text: part.text });
+            } else if (part.type === "refusal") {
+              parts.push({ type: "text", text: part.refusal });
+            }
+          }
+        }
+      }
+      // A spoken reply (gpt-audio, the audio-preview models) has no text
+      // content: it plays, and its transcript stands in for the text.
+      const transcript = audioTranscriptOf(message);
+      if (transcript && !parts.some((part) => part.type === "text")) {
+        parts.unshift({ type: "text", text: transcript });
+      }
+      const spoken = this.spokenReplyPart(message);
+      if (spoken) parts.unshift(spoken);
+    } else if (message.role === "tool") {
+      // Handle tool response messages
+      const toolContent = message.content;
+      const toolCallId = message.tool_call_id;
+
+      // Resolve the tool name from the corresponding assistant tool call
+      let resolvedToolName = "tool-result";
+      for (const m of this.request.messages) {
+        if ("tool_calls" in m && Array.isArray(m.tool_calls)) {
+          const tc = m.tool_calls.find((t) => t.id === toolCallId);
+          if (tc) {
+            resolvedToolName =
+              tc.type === "function"
+                ? tc.function.name
+                : tc.type === "custom"
+                  ? tc.custom.name
+                  : "tool-result";
+            break;
+          }
+        }
+      }
+
+      // Parse the tool output
+      let output: unknown;
+      try {
+        output =
+          typeof toolContent === "string"
+            ? JSON.parse(toolContent)
+            : toolContent;
+      } catch {
+        output = toolContent;
+      }
+
+      parts.push({
+        type: "dynamic-tool",
+        toolName: resolvedToolName,
+        toolCallId,
+        state: "output-available",
+        input: {},
+        output,
+      });
+    } else {
+      // Handle regular content
+      if (typeof content === "string") {
+        parts.push({ type: "text", text: content });
+      } else if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part.type === "text") {
+            parts.push({ type: "text", text: part.text });
+          } else if (part.type === "image_url") {
+            parts.push(
+              linkedMediaPart({
+                mediaType: "image/*",
+                url: part.image_url.url,
+              }),
+            );
+          } else if (part.type === "input_audio") {
+            const { data, format } = (
+              part as { input_audio?: { data?: unknown; format?: string } }
+            ).input_audio ?? { data: undefined };
+            if (typeof data === "string" && data)
+              parts.push(
+                inlineMediaPart({
+                  mediaType: audioMediaType(format),
+                  data,
+                  caption: `Audio, ${mediaFormatLabel(audioMediaType(format))}`,
+                }),
+              );
+          }
+          // Note: file parts from the API would need additional handling
+        }
+      }
+    }
+
+    // Map role to UIMessage role (only system, user, assistant are allowed)
+    const openAiRoleToUIMessageRoleMap: Record<
+      archestraApiTypes.OpenAiChatCompletionRequest["messages"][number]["role"],
+      PartialUIMessage["role"]
+    > = {
+      developer: "system",
+      system: "system",
+      function: "assistant",
+      tool: "assistant",
+      user: "user",
+      assistant: "assistant",
+    };
+
+    return {
+      role: openAiRoleToUIMessageRoleMap[role],
+      parts,
+    };
+  }
+
+  private mapRequestToUiMessages(): PartialUIMessage[] {
+    const messages = this.request.messages;
+    const uiMessages: PartialUIMessage[] = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+
+      // Skip tool messages - they'll be merged with their assistant message
+      if (msg.role === "tool") {
+        continue;
+      }
+
+      const uiMessage = this.mapToUiMessage(msg);
+
+      // If this is an assistant message with tool_calls, look ahead for tool results
+      if (msg.role === "assistant" && "tool_calls" in msg && msg.tool_calls) {
+        const toolCallParts: PartialUIMessage["parts"] = [...uiMessage.parts];
+
+        // For each tool call, find its corresponding tool result
+        for (const toolCall of msg.tool_calls) {
+          // Find the tool result message
+          const toolResultMsg = messages
+            .slice(i + 1)
+            .find(
+              (m) =>
+                m.role === "tool" &&
+                "tool_call_id" in m &&
+                m.tool_call_id === toolCall.id,
+            );
+
+          if (toolResultMsg && toolResultMsg.role === "tool") {
+            // Map the tool result to a UI part
+            const toolResultUiMsg = this.mapToUiMessage(toolResultMsg);
+            toolCallParts.push(...toolResultUiMsg.parts);
+          }
+        }
+
+        uiMessages.push({
+          ...uiMessage,
+          parts: toolCallParts,
+        });
+      } else {
+        uiMessages.push(uiMessage);
+      }
+    }
+
+    return uiMessages;
+  }
+
+  private mapResponseToUiMessages(): PartialUIMessage[] {
+    return this.response.choices.map((choice) =>
+      this.mapToUiMessage(choice.message),
+    );
+  }
+
+  mapToUiMessages(): PartialUIMessage[] {
+    return [
+      ...this.mapRequestToUiMessages(),
+      ...this.mapResponseToUiMessages(),
+    ];
+  }
+
+  /**
+   * The audio of a spoken reply, to play above its transcript. Streamed
+   * replies arrive as raw PCM, which is wrapped as WAV to play.
+   */
+  private spokenReplyPart(
+    message: unknown,
+  ): PartialUIMessage["parts"][number] | undefined {
+    const audio = (message as { audio?: unknown } | null)?.audio;
+    if (typeof audio !== "object" || audio === null) return undefined;
+    const { data, data_omitted: omitted } = audio as {
+      data?: unknown;
+      data_omitted?: unknown;
+    };
+    const format = (this.request as { audio?: { format?: string } }).audio
+      ?.format;
+    if (typeof data !== "string" || !data) {
+      return missingMediaPart({
+        kind: "audio",
+        label: "Spoken reply",
+        reason: missingAudioReason(omitted),
+      });
+    }
+    const pcm = format === "pcm16";
+    const mediaType = pcm ? "audio/wav" : audioMediaType(format);
+    return inlineMediaPart({
+      mediaType,
+      data: pcm ? pcm16ToWav(data) : data,
+      caption: `Spoken reply, ${mediaFormatLabel(mediaType)}`,
+    });
+  }
+}
+
+export default OpenAiChatCompletionInteraction;
+
+/** The transcript of a spoken reply, when the message carries one. */
+function audioTranscriptOf(message: unknown): string | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const audio = (message as { audio?: unknown }).audio;
+  if (typeof audio !== "object" || audio === null) return undefined;
+  const transcript = (audio as { transcript?: unknown }).transcript;
+  return typeof transcript === "string" && transcript ? transcript : undefined;
+}

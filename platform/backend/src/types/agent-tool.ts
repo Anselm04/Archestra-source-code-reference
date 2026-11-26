@@ -1,0 +1,127 @@
+import { TOOL_SEARCH_MAX_LENGTH } from "@archestra/shared";
+import {
+  createInsertSchema,
+  createSelectSchema,
+  createUpdateSchema,
+} from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database/schema";
+import { CredentialResolutionModeSchema } from "@/types/enterprise-managed-credentials";
+import { UuidIdSchema } from "./api";
+import { ToolParametersContentSchema } from "./tool";
+
+export const SelectAgentToolSchema = createSelectSchema(
+  schema.agentToolsTable,
+  {
+    credentialResolutionMode: CredentialResolutionModeSchema,
+  },
+)
+  .omit({
+    agentId: true,
+    toolId: true,
+  })
+  .extend({
+    agent: z.object({
+      id: z.string(),
+      name: z.string(),
+    }),
+    tool: z.object({
+      id: z.string(),
+      name: z.string(),
+      description: z.string().nullable(),
+      parameters: ToolParametersContentSchema,
+      createdAt: z.date(),
+      updatedAt: z.date(),
+      catalogId: z.string().nullable(),
+    }),
+  });
+
+export const InsertAgentToolSchema = createInsertSchema(
+  schema.agentToolsTable,
+  {
+    credentialResolutionMode: CredentialResolutionModeSchema,
+  },
+);
+export const UpdateAgentToolSchema = createUpdateSchema(
+  schema.agentToolsTable,
+  {
+    credentialResolutionMode: CredentialResolutionModeSchema,
+  },
+);
+export const AgentToolAssignmentInputSchema = z.object({
+  toolId: UuidIdSchema,
+  resolveAtCallTime: z.boolean().optional(),
+  credentialResolutionMode: CredentialResolutionModeSchema.optional(),
+  mcpServerId: UuidIdSchema.nullable().optional(),
+});
+
+export const AgentToolAssignmentBodySchema =
+  AgentToolAssignmentInputSchema.omit({
+    toolId: true,
+  }).nullish();
+
+export const BulkAgentToolAssignmentSchema =
+  AgentToolAssignmentInputSchema.extend({
+    agentId: UuidIdSchema,
+  });
+
+export const BulkAgentToolRemovalSchema = z.object({
+  agentId: UuidIdSchema,
+  toolId: UuidIdSchema,
+});
+
+/**
+ * Ceiling on entries in one bulk agent-tool request body.
+ *
+ * A fence, not a tuning knob: the widest realistic save is a single MCP server's
+ * catalog across a handful of agents, which is two orders of magnitude below
+ * this. It bounds the work one request can hold open a write transaction for.
+ * The statement-level parameter limit is a separate concern, handled by
+ * chunking the pair lookup rather than by this cap.
+ */
+export const MAX_BULK_AGENT_TOOL_ENTRIES = 5000;
+
+export const AgentToolFilterSchema = z.object({
+  search: z.string().max(TOOL_SEARCH_MAX_LENGTH).optional(),
+  agentId: UuidIdSchema.optional(),
+  origin: z.string().optional().describe("A catalogId to filter by"),
+  mcpServerOwnerId: z
+    .string()
+    .optional()
+    .describe("Filter by MCP server owner user ID"),
+  excludeArchestraTools: z.coerce
+    .boolean()
+    .optional()
+    .describe("For test isolation"),
+});
+
+export const AgentToolSortBy = [
+  "name",
+  "agent",
+  "origin",
+  "createdAt",
+] as const;
+export type AgentToolSortBy = (typeof AgentToolSortBy)[number];
+
+export type AgentTool = z.infer<typeof SelectAgentToolSchema>;
+export type InsertAgentTool = z.infer<typeof InsertAgentToolSchema>;
+export type UpdateAgentTool = z.infer<typeof UpdateAgentToolSchema>;
+
+export type AgentToolFilters = z.infer<typeof AgentToolFilterSchema>;
+
+export type McpToolAssignment = {
+  toolName: string;
+  /**
+   * Raw upstream tool name (tools.raw_name). Preferred over splitting `toolName`
+   * when dispatching to the upstream server. Null for legacy rows not yet
+   * re-synced; callers fall back to splitting `toolName`.
+   */
+  rawName: string | null;
+  mcpServerId: string | null;
+  credentialResolutionMode: z.infer<typeof CredentialResolutionModeSchema>;
+  catalogId: string | null;
+  catalogName: string | null;
+  meta: Record<string, unknown> | null;
+  /** Tool input schema, for x-mcp-header extraction on the call path. */
+  parameters?: Record<string, unknown> | null;
+};

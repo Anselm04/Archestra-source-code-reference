@@ -1,0 +1,208 @@
+import { randomBytes } from "node:crypto";
+import { describe, expect, test } from "vitest";
+import config from "@/config";
+import {
+  _resetCachedKey,
+  decryptBytesWithKey,
+  decryptSecretValue,
+  encryptBytesWithKey,
+  encryptSecretValue,
+  isEncryptedSecret,
+} from "./crypto";
+
+describe("encryptSecretValue / decryptSecretValue", () => {
+  test("round-trips a simple object", () => {
+    const plaintext = { apiKey: "sk-test-123" };
+    const encrypted = encryptSecretValue(plaintext);
+    const decrypted = decryptSecretValue(encrypted);
+    expect(decrypted).toEqual(plaintext);
+  });
+
+  test("round-trips an empty object", () => {
+    const plaintext = {};
+    const encrypted = encryptSecretValue(plaintext);
+    const decrypted = decryptSecretValue(encrypted);
+    expect(decrypted).toEqual(plaintext);
+  });
+
+  test("round-trips nested objects", () => {
+    const plaintext = {
+      oauth: { access_token: "abc", refresh_token: "def" },
+      nested: { deep: { value: 42 } },
+    };
+    const encrypted = encryptSecretValue(plaintext);
+    const decrypted = decryptSecretValue(encrypted);
+    expect(decrypted).toEqual(plaintext);
+  });
+
+  test("produces different ciphertexts for the same plaintext (random IV)", () => {
+    const plaintext = { key: "value" };
+    const a = encryptSecretValue(plaintext);
+    const b = encryptSecretValue(plaintext);
+    expect(a.__encrypted).not.toBe(b.__encrypted);
+  });
+
+  test("encrypted value has correct format", () => {
+    const encrypted = encryptSecretValue({ test: true });
+    expect(encrypted).toHaveProperty("__encrypted");
+    expect(encrypted.__encrypted).toMatch(
+      /^v1:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$/,
+    );
+  });
+
+  test("throws on tampered ciphertext", () => {
+    const encrypted = encryptSecretValue({ key: "value" });
+    const parts = encrypted.__encrypted.split(":");
+    // Tamper with the ciphertext portion
+    parts[3] = `${parts[3]}AAAA`;
+    encrypted.__encrypted = parts.join(":");
+    expect(() => decryptSecretValue(encrypted)).toThrow();
+  });
+
+  test("throws on tampered auth tag", () => {
+    const encrypted = encryptSecretValue({ key: "value" });
+    const parts = encrypted.__encrypted.split(":");
+    // Replace auth tag with garbage
+    parts[2] = "AAAAAAAAAAAAAAAAAAAAAA";
+    encrypted.__encrypted = parts.join(":");
+    expect(() => decryptSecretValue(encrypted)).toThrow();
+  });
+
+  test("throws on invalid format (missing parts)", () => {
+    expect(() => decryptSecretValue({ __encrypted: "v1:abc" })).toThrow(
+      "Invalid encrypted secret format",
+    );
+  });
+
+  test("throws on invalid version prefix", () => {
+    expect(() => decryptSecretValue({ __encrypted: "v2:a:b:c" })).toThrow(
+      "Invalid encrypted secret format",
+    );
+  });
+});
+
+describe("isEncryptedSecret", () => {
+  test("returns true for encrypted values", () => {
+    const encrypted = encryptSecretValue({ key: "value" });
+    expect(isEncryptedSecret(encrypted)).toBe(true);
+  });
+
+  test("returns false for plain objects", () => {
+    expect(isEncryptedSecret({ apiKey: "sk-123" })).toBe(false);
+  });
+
+  test("returns false for null", () => {
+    expect(isEncryptedSecret(null)).toBe(false);
+  });
+
+  test("returns false for non-objects", () => {
+    expect(isEncryptedSecret("string")).toBe(false);
+    expect(isEncryptedSecret(42)).toBe(false);
+  });
+
+  test("returns false for wrong version prefix", () => {
+    expect(isEncryptedSecret({ __encrypted: "v2:a:b:c" })).toBe(false);
+  });
+
+  test("returns false for non-string __encrypted", () => {
+    expect(isEncryptedSecret({ __encrypted: 123 })).toBe(false);
+  });
+});
+
+describe("key management", () => {
+  test("throws when the encryption secret is not set", () => {
+    _resetCachedKey();
+
+    const original = config.secretsManager.encryptionSecret;
+    config.secretsManager.encryptionSecret = undefined;
+
+    try {
+      expect(() => encryptSecretValue({ key: "value" })).toThrow(
+        "ARCHESTRA_SECRETS_ENCRYPTION_SECRET",
+      );
+    } finally {
+      config.secretsManager.encryptionSecret = original;
+      _resetCachedKey();
+    }
+  });
+
+  test("decryption fails with a different key", () => {
+    const encrypted = encryptSecretValue({ key: "value" });
+
+    // Change the secret to simulate key rotation without re-encryption
+    _resetCachedKey();
+    const original = config.secretsManager.encryptionSecret;
+    config.secretsManager.encryptionSecret =
+      "a-completely-different-secret-key-value-here";
+
+    try {
+      // The raw Node crypto error is opaque; the wrapper must point at the
+      // encryption-secret mismatch so operators can diagnose it.
+      expect(() => decryptSecretValue(encrypted)).toThrow(
+        "different key than the one derived from the current ARCHESTRA_SECRETS_ENCRYPTION_SECRET",
+      );
+    } finally {
+      config.secretsManager.encryptionSecret = original;
+      _resetCachedKey();
+    }
+  });
+});
+
+describe("encryptBytesWithKey / decryptBytesWithKey", () => {
+  const key = randomBytes(32);
+  const aad = "conversation_attachments.file_data|incognito:conv-1";
+
+  test("round-trips arbitrary binary content", () => {
+    // Deliberately not text: the whole point of this pair is carrying file
+    // bytes, including NULs and every high byte, without a text encoding.
+    const plaintext = Buffer.concat([
+      Buffer.from([0x00, 0xff, 0x01, 0x00]),
+      randomBytes(4096),
+    ]);
+    const envelope = encryptBytesWithKey(plaintext, key, aad);
+
+    expect(envelope.equals(plaintext)).toBe(false);
+    expect(decryptBytesWithKey(envelope, key, aad).equals(plaintext)).toBe(
+      true,
+    );
+  });
+
+  test("round-trips an empty payload", () => {
+    const envelope = encryptBytesWithKey(Buffer.alloc(0), key, aad);
+    expect(decryptBytesWithKey(envelope, key, aad).byteLength).toBe(0);
+  });
+
+  test("refuses a different key, a different AAD, or tampered bytes", () => {
+    const plaintext = randomBytes(64);
+    const envelope = encryptBytesWithKey(plaintext, key, aad);
+
+    expect(() => decryptBytesWithKey(envelope, randomBytes(32), aad)).toThrow();
+    // The AAD binds ciphertext to one column of one conversation, so a blob
+    // moved between either must not open — this is what stops a database-level
+    // writer transplanting one attachment's bytes onto another row.
+    expect(() =>
+      decryptBytesWithKey(
+        envelope,
+        key,
+        "conversation_attachments.file_data|incognito:conv-2",
+      ),
+    ).toThrow();
+    expect(() =>
+      decryptBytesWithKey(
+        envelope,
+        key,
+        "conversation_attachments.text_preview|incognito:conv-1",
+      ),
+    ).toThrow();
+
+    const tampered = Buffer.from(envelope);
+    tampered[tampered.length - 1] ^= 0xff;
+    expect(() => decryptBytesWithKey(tampered, key, aad)).toThrow();
+  });
+
+  test("rejects a buffer too short to be an envelope", () => {
+    expect(() => decryptBytesWithKey(Buffer.alloc(8), key, aad)).toThrow(
+      /Invalid encrypted bytes format/,
+    );
+  });
+});

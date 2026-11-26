@@ -1,0 +1,323 @@
+import {
+  API_KEY_MAX_EXPIRATION_DAYS,
+  API_KEY_MAX_NAME_LENGTH,
+  API_KEY_MIN_EXPIRATION_DAYS,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { auth as betterAuth } from "@/auth/better-auth";
+import ApiKeyModel from "@/models/api-key";
+import {
+  ApiError,
+  ApiKeyIdParamsSchema,
+  ApiKeyResponseSchema,
+  ApiKeyWithValueResponseSchema,
+  CreateApiKeyBodySchema,
+  constructResponseSchema,
+  DeleteApiKeyResponseSchema,
+} from "@/types";
+import { BulkDeleteBodySchema, BulkOutcomeSchema, runBulk } from "./bulk-route";
+
+const apiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.get(
+    "/api/api-keys",
+    {
+      schema: {
+        operationId: RouteId.GetApiKeys,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+        description: "List the authenticated user's Archestra API keys",
+        tags: ["API Keys"],
+        response: constructResponseSchema(ApiKeyResponseSchema.array()),
+      },
+    },
+    async ({ user }, reply) => {
+      const apiKeys = await ApiKeyModel.listByUserId(user.id);
+      return reply.send(apiKeys);
+    },
+  );
+
+  fastify.get(
+    "/api/api-keys/:id",
+    {
+      schema: {
+        operationId: RouteId.GetApiKey,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+        description: "Get one authenticated user's Archestra API key",
+        tags: ["API Keys"],
+        params: ApiKeyIdParamsSchema,
+        response: constructResponseSchema(ApiKeyResponseSchema),
+      },
+    },
+    async ({ user, params }, reply) => {
+      const apiKey = await ApiKeyModel.findByIdForUser(params.id, user.id);
+      if (!apiKey) {
+        throw new ApiError(404, "API key not found");
+      }
+
+      return reply.send(apiKey);
+    },
+  );
+
+  fastify.post(
+    "/api/api-keys",
+    {
+      schema: {
+        operationId: RouteId.CreateApiKey,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+        description: "Create an Archestra API key for the authenticated user",
+        tags: ["API Keys"],
+        body: CreateApiKeyBodySchema,
+        response: constructResponseSchema(ApiKeyWithValueResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      try {
+        const apiKey = await betterAuth.api.createApiKey({
+          headers: new Headers(request.headers as HeadersInit),
+          body: normalizeCreateApiKeyBody(request.body),
+        });
+
+        return reply.send(normalizeCreatedApiKeyResponse(apiKey));
+      } catch (error) {
+        throw toApiError(error, {
+          fallbackStatusCode: 400,
+          fallbackMessage: "Failed to create API key",
+        });
+      }
+    },
+  );
+
+  fastify.delete(
+    "/api/api-keys/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteApiKeys,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+        description:
+          "Delete several of the authenticated user's Archestra API keys in " +
+          "one request. Keys are personal, so an id belonging to anyone else " +
+          "is reported in `failed` as not found and the rest of the batch " +
+          "still applies.",
+        tags: ["API Keys"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const userId = request.user.id;
+      const snapshot = async (ids: string[]) => {
+        const wanted = new Set(ids);
+        const keys = await ApiKeyModel.listByUserId(userId);
+        return {
+          apiKeys: keys
+            .filter((key) => wanted.has(key.id))
+            .map(({ id, name }) => ({ id, name }))
+            .sort((a, b) => a.id.localeCompare(b.id)),
+        };
+      };
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "api keys bulk delete",
+        notFoundMessage: "API key not found",
+        unexpectedMessage: "Could not delete this API key",
+        // Keys are addressed by their owner, not by organization, so listing
+        // the caller's own is the fence: another user's id simply is not here.
+        load: async (ids) => {
+          const wanted = new Set(ids);
+          const keys = await ApiKeyModel.listByUserId(userId);
+          return new Map(
+            keys
+              .filter((key) => wanted.has(key.id))
+              .map((key) => [key.id, key] as const),
+          );
+        },
+        describe: (key) => key.name ?? "Unnamed key",
+        applyEach: async (key) => {
+          await betterAuth.api.deleteApiKey({
+            headers: new Headers(request.headers as HeadersInit),
+            body: { keyId: key.id },
+          });
+        },
+        audit: { target: request, snapshot },
+      });
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.delete(
+    "/api/api-keys/:id",
+    {
+      schema: {
+        operationId: RouteId.DeleteApiKey,
+        // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+        description: "Delete an Archestra API key for the authenticated user",
+        tags: ["API Keys"],
+        params: ApiKeyIdParamsSchema,
+        response: constructResponseSchema(DeleteApiKeyResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const existingApiKey = await ApiKeyModel.findByIdForUser(
+        request.params.id,
+        request.user.id,
+      );
+      if (!existingApiKey) {
+        throw new ApiError(404, "API key not found");
+      }
+
+      try {
+        const result = await betterAuth.api.deleteApiKey({
+          headers: new Headers(request.headers as HeadersInit),
+          body: { keyId: request.params.id },
+        });
+
+        return reply.send(result);
+      } catch (error) {
+        throw toApiError(error, {
+          fallbackStatusCode: 500,
+          fallbackMessage: "Failed to delete API key",
+        });
+      }
+    },
+  );
+};
+
+export default apiKeyRoutes;
+
+// === Internal helpers
+
+/**
+ * Better Auth api-key validation error codes mapped to user-facing messages.
+ * Codes not listed here keep the generic fallback so arbitrary upstream
+ * internals are never exposed.
+ */
+const KNOWN_VALIDATION_ERROR_MESSAGES: Record<string, string> = {
+  EXPIRES_IN_IS_TOO_SMALL: `Expiration must be at least ${API_KEY_MIN_EXPIRATION_DAYS} day from now`,
+  EXPIRES_IN_IS_TOO_LARGE: `Expiration cannot be more than ${API_KEY_MAX_EXPIRATION_DAYS} days from now`,
+  INVALID_NAME_LENGTH: `Name must be at most ${API_KEY_MAX_NAME_LENGTH} characters`,
+  NAME_REQUIRED: "API key name is required",
+};
+
+function toApiError(
+  error: unknown,
+  params: { fallbackStatusCode: number; fallbackMessage: string },
+): ApiError {
+  if (error instanceof ApiError) {
+    return error;
+  }
+
+  const statusCode = getStatusCode(error, params.fallbackStatusCode);
+  const message =
+    getKnownValidationErrorMessage(error) ??
+    getApiKeyErrorMessage(statusCode, params.fallbackMessage);
+
+  return new ApiError(statusCode, message);
+}
+
+function getKnownValidationErrorMessage(error: unknown): string | null {
+  const body = (error as { body?: { code?: unknown } }).body;
+  const code = body?.code;
+  if (typeof code !== "string") {
+    return null;
+  }
+
+  return KNOWN_VALIDATION_ERROR_MESSAGES[code] ?? null;
+}
+
+function getStatusCode(error: unknown, fallbackStatusCode: number): number {
+  const maybeStatusCode = (
+    error as Error & { statusCode?: unknown; status?: unknown }
+  ).statusCode;
+  if (typeof maybeStatusCode === "number") {
+    return maybeStatusCode;
+  }
+
+  const maybeStatus = (error as Error & { status?: unknown }).status;
+  if (typeof maybeStatus === "number") {
+    return maybeStatus;
+  }
+
+  return fallbackStatusCode;
+}
+
+function getApiKeyErrorMessage(
+  statusCode: number,
+  fallbackMessage: string,
+): string {
+  switch (statusCode) {
+    case 400:
+      return fallbackMessage;
+    case 401:
+      return "Authentication required";
+    case 403:
+      return "Forbidden";
+    case 404:
+      return "API key not found";
+    default:
+      return fallbackMessage;
+  }
+}
+
+function normalizeCreatedApiKeyResponse(apiKey: {
+  id: string;
+  configId: string;
+  name: string | null;
+  start: string | null;
+  prefix: string | null;
+  referenceId: string;
+  enabled: boolean;
+  lastRequest: string | Date | null;
+  expiresAt: string | Date | null;
+  createdAt: string | Date;
+  updatedAt: string | Date;
+  refillInterval: number | null;
+  refillAmount: number | null;
+  lastRefillAt: string | Date | null;
+  rateLimitEnabled: boolean;
+  rateLimitTimeWindow: number | null;
+  rateLimitMax: number | null;
+  requestCount: number;
+  remaining: number | null;
+  metadata?: Record<string, unknown> | null;
+  permissions?: Record<string, string[]> | null;
+  key: string;
+}) {
+  return {
+    id: apiKey.id,
+    name: apiKey.name,
+    start: apiKey.start,
+    prefix: apiKey.prefix,
+    userId: apiKey.referenceId,
+    enabled: apiKey.enabled,
+    lastRequest: toDateOrNull(apiKey.lastRequest),
+    expiresAt: toDateOrNull(apiKey.expiresAt),
+    createdAt: toDate(apiKey.createdAt),
+    updatedAt: toDate(apiKey.updatedAt),
+    metadata: apiKey.metadata ?? null,
+    permissions: apiKey.permissions ?? null,
+    key: apiKey.key,
+  };
+}
+
+function normalizeCreateApiKeyBody(body: {
+  expiresIn?: number | null;
+  name?: string | null;
+}) {
+  const { name, ...rest } = body;
+
+  return {
+    ...rest,
+    ...(name === null ? {} : { name }),
+  };
+}
+
+function toDate(value: string | Date): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function toDateOrNull(value: string | Date | null): Date | null {
+  if (!value) return null;
+  return toDate(value);
+}

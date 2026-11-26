@@ -1,0 +1,133 @@
+// @vitest-environment node
+import { describe, expect, it } from "vitest";
+import {
+  getReviewCardView,
+  getReviewDecisionContent,
+  parseJsonArguments,
+  reviveJsonStrings,
+} from "./openappa-review-presentation";
+
+describe("reviveJsonStrings", () => {
+  it("parses a JSON array that arrived as an escaped string", () => {
+    expect(
+      reviveJsonStrings({
+        todos: '[{"id": 1, "content": "qa-hitl", "status": "pending"}]',
+      }),
+    ).toEqual({
+      todos: [{ id: 1, content: "qa-hitl", status: "pending" }],
+    });
+  });
+
+  it("leaves ordinary strings alone", () => {
+    expect(reviveJsonStrings({ path: "/tmp/notes.md" })).toEqual({
+      path: "/tmp/notes.md",
+    });
+  });
+});
+
+describe("parseJsonArguments", () => {
+  it("returns the raw text when the payload is not JSON", () => {
+    expect(parseJsonArguments("not json")).toBe("not json");
+  });
+});
+
+describe("getReviewCardView", () => {
+  it("shows the tool card with parsed arguments", () => {
+    expect(
+      getReviewCardView({
+        message: "Approve this call?",
+        reviewedTool: "archestra__todo_write",
+        reviewedArguments: JSON.stringify({
+          todos: '[{"id": 1, "content": "qa-hitl", "status": "pending"}]',
+        }),
+        reviewedCoverage: [],
+      }),
+    ).toEqual({
+      toolCard: {
+        title: "archestra__todo_write",
+        input: { todos: [{ id: 1, content: "qa-hitl", status: "pending" }] },
+      },
+    });
+  });
+
+  it("lists what approving also accepts", () => {
+    expect(
+      getReviewCardView({
+        message: "Approve Bash?",
+        reviewedTool: "Bash",
+        reviewedCoverage: ["first", "second"],
+      }),
+    ).toEqual({
+      toolCard: { title: "Bash" },
+      coverage: ["first", "second"],
+    });
+  });
+
+  it("shows the review text when what approving accepts is unknown", () => {
+    expect(
+      getReviewCardView({
+        message: "Approve Bash?",
+        reviewedTool: "Bash",
+        reviewedText: "  The whole review.  ",
+      }),
+    ).toEqual({
+      toolCard: { title: "Bash" },
+      details: "The whole review.",
+    });
+  });
+
+  it("shows the message of a request that carries neither coverage nor text", () => {
+    expect(
+      getReviewCardView({ message: "Old review.", reviewedTool: "Bash" }),
+    ).toEqual({
+      toolCard: { title: "Bash" },
+      details: "Old review.",
+    });
+  });
+
+  it("falls back to the message when the review names no tool", () => {
+    expect(
+      getReviewCardView({ message: "  Allow the agent to continue?  " }),
+    ).toEqual({ details: "Allow the agent to continue?" });
+    expect(getReviewCardView({ message: "" })).toEqual({});
+  });
+});
+
+describe("getReviewDecisionContent", () => {
+  const requestedSchema = {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["approve", "deny"] },
+    },
+    required: ["action"],
+  };
+
+  it("answers the schema's action field with the decision", () => {
+    expect(
+      getReviewDecisionContent({ requestedSchema, decision: "approve" }),
+    ).toEqual({ action: "approve" });
+    expect(
+      getReviewDecisionContent({ requestedSchema, decision: "deny" }),
+    ).toEqual({ action: "deny" });
+  });
+
+  it("uses the field whose enum offers the decision", () => {
+    expect(
+      getReviewDecisionContent({
+        requestedSchema: {
+          properties: { ruling: { enum: ["approve", "deny"] } },
+        },
+        decision: "deny",
+      }),
+    ).toEqual({ ruling: "deny" });
+  });
+
+  it("defaults to the action field when the schema is missing", () => {
+    expect(
+      getReviewDecisionContent({
+        requestedSchema: undefined,
+        decision: "deny",
+      }),
+    ).toEqual({ action: "deny" });
+  });
+});

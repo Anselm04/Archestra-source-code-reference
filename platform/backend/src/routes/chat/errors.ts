@@ -1,0 +1,2291 @@
+import {
+  AnthropicErrorTypes,
+  ArchestraInternalErrorCode,
+  BedrockErrorTypes,
+  ChatErrorCode,
+  ChatErrorMessages,
+  type ChatErrorResponse,
+  GeminiErrorCodes,
+  GeminiErrorReasons,
+  OllamaErrorTypes,
+  OpenAIErrorTypes,
+  OUTPUT_LIMIT_REACHED_MESSAGE,
+  providerDisplayNames,
+  RetryableErrorCodes,
+  SUBSCRIPTION_CREDENTIALS,
+  type SupportedProvider,
+  subscriptionKindForProvider,
+  TOOL_RUN_TOOL_SHORT_NAME,
+  TOOL_SEARCH_TOOLS_SHORT_NAME,
+  VllmErrorTypes,
+  ZhipuaiErrorTypes,
+} from "@archestra/shared";
+import {
+  isSpanContextValid,
+  context as otelContext,
+  trace,
+} from "@opentelemetry/api";
+import {
+  APICallError,
+  NoOutputGeneratedError,
+  NoSuchToolError,
+  RetryError,
+  UnsupportedFunctionalityError,
+} from "ai";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+import { unavailableToolDispatchModeMessage } from "@/archestra-mcp-server/tool-recovery-messages";
+import logger from "@/logging";
+import { getActiveSessionId } from "@/observability/request-context";
+import { captureRawProviderErrorInSentry } from "@/observability/sentry";
+import { MICROSOFT_365_COPILOT_TOOLS_UNSUPPORTED_MESSAGE } from "@/routes/proxy/adapters/microsoft-365-copilot-graph-translator";
+import {
+  GithubCopilot,
+  SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE,
+} from "@/types";
+import { LlmProviderAuthRequiredError } from "@/utils/llm-provider-auth-error";
+import { BedrockThinkingConfigurationError } from "./bedrock-provider-options";
+import { ContextWindowExceededError } from "./normalization/enforce-context-window-limit";
+import { RequestTooLargeError } from "./normalization/enforce-request-size-limit";
+
+// =============================================================================
+// ProviderError — carries a fully-mapped ChatErrorResponse with correct provider
+// =============================================================================
+
+export class ProviderError extends Error {
+  public readonly chatErrorResponse: ChatErrorResponse;
+  /** The model whose call failed, when the thrower knows it. */
+  public readonly model?: string;
+
+  constructor(
+    chatErrorResponse: ChatErrorResponse,
+    options?: { model?: string },
+  ) {
+    super(
+      chatErrorResponse.originalError?.message || chatErrorResponse.message,
+    );
+    this.name = "ProviderError";
+    this.chatErrorResponse = chatErrorResponse;
+    this.model = options?.model;
+  }
+}
+
+/**
+ * A provider failure raised while a parent agent was waiting on a delegated
+ * agent. Keeping this as a ProviderError preserves the parent run's existing
+ * retry and provider-error handling while retaining where the failure began.
+ * The chat error response names the subagent and its model, so the error card
+ * does not attribute the failure to the conversation's own model.
+ */
+export class SubagentProviderError extends ProviderError {
+  public readonly subagentId: string;
+  public readonly subagentName: string;
+
+  constructor(params: {
+    providerError: ProviderError;
+    subagentId: string;
+    subagentName: string;
+  }) {
+    const { providerError } = params;
+    super(
+      {
+        ...providerError.chatErrorResponse,
+        subagent: {
+          name: params.subagentName,
+          ...(providerError.model ? { model: providerError.model } : {}),
+        },
+      },
+      { model: providerError.model },
+    );
+    this.name = "SubagentProviderError";
+    this.subagentId = params.subagentId;
+    this.subagentName = params.subagentName;
+  }
+}
+
+/**
+ * Thrown when the provider finishes a turn cleanly (finishReason stop/length)
+ * but produces no renderable content, after the empty-response auto-retries are
+ * exhausted (or immediately for a non-retryable finishReason). Carries the last
+ * finishReason for diagnostics. mapProviderError turns it into a structured
+ * error card: length and content-filter finishes become non-retryable
+ * IncompleteResponse and ContentFiltered cards; other finishes remain retryable.
+ */
+export class EmptyModelResponseError extends Error {
+  public readonly finishReason: string;
+  public readonly rawFinishReason?: string;
+  public readonly attempts: number;
+
+  constructor(params: {
+    finishReason: string;
+    rawFinishReason?: string;
+    attempts: number;
+  }) {
+    super(`Model returned an empty response after ${params.attempts} attempts`);
+    this.name = "EmptyModelResponseError";
+    this.finishReason = params.finishReason;
+    this.rawFinishReason = params.rawFinishReason;
+    this.attempts = params.attempts;
+  }
+}
+
+/**
+ * The model stream produced no parsed chunk within the idle deadline (SSE
+ * comments and proxy keep-alives never reach the parser output, so they do not
+ * count as progress). Emitted as a stream error part by the idle-timeout
+ * middleware; mapProviderError turns it into the retryable UpstreamStalled card.
+ */
+export class ModelStreamStalledError extends Error {
+  public readonly idleTimeoutMs: number;
+
+  constructor(idleTimeoutMs: number) {
+    super(`Model stream sent no data for ${idleTimeoutMs} ms`);
+    this.name = "ModelStreamStalledError";
+    this.idleTimeoutMs = idleTimeoutMs;
+  }
+}
+
+// =============================================================================
+// Unavailable tool errors — model called a tool that doesn't exist
+// =============================================================================
+
+// Applies only when the live tool list has no search/run dispatch pair (full
+// exposure): every callable tool really is in the list, so "copy an exact name"
+// is the correct steer. Dispatch-mode surfaces get
+// `unavailableToolDispatchModeMessage` instead — see unavailableToolMessage.
+const UNAVAILABLE_TOOL_ERROR_MESSAGE =
+  "The requested tool is not available in this chat. Available tools are listed in the details below. Tool names carry their server as a prefix in the form `server__tool`; the bare short name without that prefix will not match. Copy an exact name from the list for the next tool call.";
+
+/**
+ * Pick the recovery steer for a nonexistent-tool call. When the request's tool
+ * list contains the search/run dispatch pair (search_and_run_only exposure),
+ * "copy a name from the list" is wrong — third-party tools are never in that
+ * list — so steer the model through search_tools → run_tool instead. The
+ * dispatch tools are located by short name so a custom-branded prefix (e.g.
+ * `acme__run_tool`) is recognized and echoed exactly as the model sees it.
+ */
+function unavailableToolMessage(availableToolNames: string[]): string {
+  const searchToolsName = availableToolNames.find(
+    (name) =>
+      archestraMcpBranding.getToolShortName(name) ===
+      TOOL_SEARCH_TOOLS_SHORT_NAME,
+  );
+  const runToolName = availableToolNames.find(
+    (name) =>
+      archestraMcpBranding.getToolShortName(name) === TOOL_RUN_TOOL_SHORT_NAME,
+  );
+  if (searchToolsName && runToolName) {
+    return unavailableToolDispatchModeMessage({ searchToolsName, runToolName });
+  }
+  return UNAVAILABLE_TOOL_ERROR_MESSAGE;
+}
+
+type UnavailableToolErrorDetails = {
+  type: "unavailable_tool";
+  message: string;
+  requestedToolName: string;
+  availableToolNames: string[];
+  originalErrorMessage: string;
+};
+
+/**
+ * Recognize the AI SDK's "model called a nonexistent tool" failure in both
+ * shapes it reaches stream onError handlers: the genuine NoSuchToolError
+ * instance (from the invalid tool-call part), and the duplicate tool-error
+ * part for the same call, whose error the SDK stringifies in
+ * runToolsTransformation before it gets here — so an isInstance check alone
+ * misses it and the recoverable failure escalates into a failed run.
+ */
+export function getUnavailableToolErrorDetails(
+  error: unknown,
+): UnavailableToolErrorDetails | null {
+  if (NoSuchToolError.isInstance(error)) {
+    const availableToolNames = error.availableTools ?? [];
+    return {
+      type: "unavailable_tool",
+      message: unavailableToolMessage(availableToolNames),
+      requestedToolName: error.toolName,
+      availableToolNames,
+      originalErrorMessage: error.message,
+    };
+  }
+
+  const parsed = parseUnavailableToolErrorMessage(error);
+  if (!parsed) {
+    return null;
+  }
+
+  return {
+    type: "unavailable_tool",
+    message: unavailableToolMessage(parsed.availableToolNames),
+    ...parsed,
+  };
+}
+
+export function formatUnavailableToolErrorDetails(
+  details: UnavailableToolErrorDetails,
+): string {
+  return `${details.message}\n\nDetails:\n${JSON.stringify(
+    {
+      type: details.type,
+      requestedToolName: details.requestedToolName,
+      availableToolNames: details.availableToolNames,
+      originalErrorMessage: details.originalErrorMessage,
+    },
+    null,
+    2,
+  )}`;
+}
+
+// matches NoSuchToolError's message verbatim (parse-tool-call.ts in the ai
+// package), covering both the "Available tools: ..." and "No tools are
+// available." variants
+function parseUnavailableToolErrorMessage(error: unknown): {
+  requestedToolName: string;
+  availableToolNames: string[];
+  originalErrorMessage: string;
+} | null {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : null;
+  if (message === null) {
+    return null;
+  }
+
+  const match = message.match(
+    /^Model tried to call unavailable tool '([^']+)'\. (?:No tools are available\.|Available tools: (.*)\.)$/s,
+  );
+  if (!match) {
+    return null;
+  }
+
+  return {
+    requestedToolName: match[1],
+    availableToolNames: (match[2] ?? "")
+      .split(",")
+      .map((toolName) => toolName.trim())
+      .filter(Boolean),
+    originalErrorMessage: message,
+  };
+}
+
+// =============================================================================
+// Safe Serialization
+// =============================================================================
+
+/**
+ * Safely stringify an object, handling circular references.
+ * Returns a plain object that can be safely JSON.stringify'd later.
+ */
+function safeSerialize(obj: unknown): unknown {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+
+  // For primitive types, return as-is
+  if (typeof obj !== "object") {
+    return obj;
+  }
+
+  // Try to create a safe copy by stringifying with a circular reference handler
+  try {
+    const seen = new WeakSet();
+    const safeStringified = JSON.stringify(obj, (_key, value) => {
+      if (typeof value === "object" && value !== null) {
+        if (seen.has(value)) {
+          return "[Circular]";
+        }
+        seen.add(value);
+      }
+      // Convert Error objects to plain objects
+      if (value instanceof Error) {
+        return {
+          name: value.name,
+          message: value.message,
+          stack: value.stack,
+        };
+      }
+      return value;
+    });
+    return JSON.parse(safeStringified);
+  } catch {
+    // If even safe stringify fails, return a string representation
+    if (obj instanceof Error) {
+      return {
+        name: obj.name,
+        message: obj.message,
+        stack: obj.stack,
+      };
+    }
+    return String(obj);
+  }
+}
+
+function stringifyRawError(error: unknown): string {
+  try {
+    return JSON.stringify(error, Object.getOwnPropertyNames(error));
+  } catch {
+    try {
+      return JSON.stringify(safeSerialize(error));
+    } catch {
+      return String(error);
+    }
+  }
+}
+
+// =============================================================================
+// Parsed Error Types
+// =============================================================================
+
+interface ParsedOpenAIError {
+  type?: string;
+  code?: string;
+  message?: string;
+  param?: string;
+}
+
+interface ParsedAnthropicError {
+  type?: string;
+  message?: string;
+}
+
+interface ParsedZhipuaiError {
+  code?: string;
+  message?: string;
+}
+
+interface ParsedMinimaxError {
+  type?: string;
+  message?: string;
+  http_code?: string;
+}
+
+interface ParsedBedrockError {
+  type?: string;
+  message?: string;
+}
+
+/**
+ * Parsed ErrorInfo from google.rpc.ErrorInfo in the details array.
+ * @see https://cloud.google.com/apis/design/errors#error_info
+ * @see https://googleapis.dev/nodejs/spanner/latest/google.rpc.ErrorInfo.html
+ */
+interface GeminiErrorInfo {
+  /** The reason for the error (e.g., "API_KEY_INVALID", "RESOURCE_EXHAUSTED") */
+  reason?: string;
+  /** The domain of the error (e.g., "googleapis.com") */
+  domain?: string;
+  /** Additional metadata about the error */
+  metadata?: Record<string, string>;
+}
+
+interface ParsedGeminiError {
+  code?: number;
+  status?: string;
+  message?: string;
+  details?: unknown[];
+  /** Extracted ErrorInfo from details array, if present */
+  errorInfo?: GeminiErrorInfo;
+}
+
+// =============================================================================
+// Archestra Envelope Reader
+// =============================================================================
+
+/**
+ * Read the Archestra-normalized `internal_code` field from the LLM-proxy
+ * error envelope. The envelope has shape `{ error: { message, type,
+ * internal_code } }` and is produced by the Fastify error handler from
+ * `ApiError.internalCode`, which in turn is populated by the adapter's
+ * `extractInternalCode` classifier. Provider-agnostic — any provider whose
+ * adapter emits a code can be short-circuited here.
+ */
+function extractArchestraInternalCode(
+  responseBody: string | undefined,
+): ArchestraInternalErrorCode | undefined {
+  if (!responseBody) return undefined;
+  try {
+    const parsed = JSON.parse(responseBody);
+    const code = parsed?.error?.internal_code;
+    if (
+      code === ArchestraInternalErrorCode.ContextLengthExceeded ||
+      code === ArchestraInternalErrorCode.ProviderInsufficientBalance ||
+      code === ArchestraInternalErrorCode.UpstreamEmptyResponse ||
+      code === ArchestraInternalErrorCode.UpstreamTimeout ||
+      code === ArchestraInternalErrorCode.ProviderOverloaded ||
+      code === ArchestraInternalErrorCode.RequestExceedsRateLimit ||
+      code === ArchestraInternalErrorCode.ProviderAuthRequired
+    ) {
+      return code;
+    }
+  } catch {
+    // Not JSON — fall through.
+  }
+  return undefined;
+}
+
+function extractUsageLimitError(
+  responseBody: string | undefined,
+): { entityType?: string } | null {
+  if (!responseBody) return null;
+  try {
+    const parsed = JSON.parse(responseBody);
+    if (parsed?.error?.code !== "token_cost_limit_exceeded") {
+      return null;
+    }
+    return {
+      entityType:
+        typeof parsed.error.usage_limit?.entity_type === "string"
+          ? parsed.error.usage_limit.entity_type
+          : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// =============================================================================
+// Provider-Specific Error Parsers
+// =============================================================================
+
+/**
+ * Parse OpenAI error response body.
+ * OpenAI errors have structure: { error: { type, code, message, param } }
+ *
+ * @see https://platform.openai.com/docs/guides/error-codes - Error codes guide
+ * @see https://platform.openai.com/docs/api-reference/errors - API error reference
+ */
+function parseOpenAIError(responseBody: string): ParsedOpenAIError | null {
+  try {
+    const parsed = JSON.parse(responseBody);
+    if (parsed?.error) {
+      return {
+        type: parsed.error.type,
+        code: parsed.error.code,
+        message: parsed.error.message,
+        param: parsed.error.param,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse Anthropic error response body.
+ * Anthropic errors have structure: { error: { type, message } } or { type, message }
+ *
+ * @see https://docs.anthropic.com/en/api/errors - Anthropic API errors documentation
+ */
+function parseAnthropicError(
+  responseBody: string,
+): ParsedAnthropicError | null {
+  try {
+    const parsed = JSON.parse(responseBody);
+    // Handle nested error object
+    if (parsed?.error) {
+      return {
+        type: parsed.error.type,
+        message: parsed.error.message,
+      };
+    }
+    // Handle flat structure
+    if (parsed?.type) {
+      return {
+        type: parsed.type,
+        message: parsed.message,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse Zhipuai error response body.
+ * Zhipuai errors have structure: { error: { code, message } }
+ * Zhipuai uses numeric string codes (e.g., "1211", "1305")
+ * Since Zhipuai is OpenAI-compatible, the error format follows OpenAI structure
+ *
+ * @see https://docs.z.ai/api-reference/api-code#errors
+ */
+function parseZhipuaiError(responseBody: string): ParsedZhipuaiError | null {
+  try {
+    const parsed = JSON.parse(responseBody);
+    if (parsed?.error) {
+      return {
+        code: parsed.error.code,
+        message: parsed.error.message,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse MiniMax error response body.
+ * MiniMax has a unique error structure: { type: "error", error: { type, message, http_code } }
+ * Note: Different from OpenAI despite being "OpenAI-compatible" for chat completions
+ *
+ * @see https://platform.minimax.io/docs/api-reference/text-openai-api
+ */
+function parseMinimaxError(responseBody: string): ParsedMinimaxError | null {
+  try {
+    const parsed = JSON.parse(responseBody);
+    // MiniMax wraps errors with type: "error"
+    if (parsed?.type === "error" && parsed?.error) {
+      return {
+        type: parsed.error.type,
+        message: parsed.error.message,
+        http_code: parsed.error.http_code,
+      };
+    }
+    // Fallback to standard OpenAI format if MiniMax changes their API
+    if (parsed?.error) {
+      return {
+        type: parsed.error.type,
+        message: parsed.error.message,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Recursively parse nested JSON strings to find the innermost error.
+ * Gemini errors can be deeply nested with JSON-encoded strings.
+ * Arrays are preserved during parsing to maintain the details array structure.
+ */
+function parseNestedJson(obj: unknown, depth = 0): unknown {
+  if (depth > 10) return obj; // Prevent infinite recursion
+
+  if (typeof obj === "string") {
+    try {
+      const parsed = JSON.parse(obj);
+      return parseNestedJson(parsed, depth + 1);
+    } catch {
+      return obj;
+    }
+  }
+
+  // Preserve arrays (important for details array)
+  if (Array.isArray(obj)) {
+    return obj.map((item) => parseNestedJson(item, depth + 1));
+  }
+
+  if (typeof obj === "object" && obj !== null) {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      result[key] = parseNestedJson(value, depth + 1);
+    }
+    return result;
+  }
+
+  return obj;
+}
+
+/**
+ * Extract ErrorInfo from the details array (or object-like array from nested JSON parsing).
+ * ErrorInfo provides specific error reasons like "API_KEY_INVALID".
+ *
+ * @see https://cloud.google.com/apis/design/errors#error_info
+ * @see https://googleapis.dev/nodejs/spanner/latest/google.rpc.ErrorInfo.html
+ */
+function extractErrorInfo(
+  details: unknown[] | Record<string, unknown>,
+): GeminiErrorInfo | undefined {
+  // Handle both arrays and object-like arrays (from nested JSON parsing)
+  const items = Array.isArray(details) ? details : Object.values(details);
+
+  for (const detail of items) {
+    if (typeof detail !== "object" || detail === null) continue;
+
+    const detailObj = detail as Record<string, unknown>;
+
+    // Check for ErrorInfo type (can be @type or type field)
+    const typeField = detailObj["@type"] || detailObj.type;
+    if (
+      typeof typeField === "string" &&
+      typeField.includes("google.rpc.ErrorInfo")
+    ) {
+      return {
+        reason:
+          typeof detailObj.reason === "string" ? detailObj.reason : undefined,
+        domain:
+          typeof detailObj.domain === "string" ? detailObj.domain : undefined,
+        metadata:
+          typeof detailObj.metadata === "object" && detailObj.metadata !== null
+            ? (detailObj.metadata as Record<string, string>)
+            : undefined,
+      };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Recursively find the innermost error object that has actual error fields.
+ * After parseNestedJson, the error structure can have error objects nested inside
+ * message fields (which were previously JSON strings).
+ */
+function findInnermostError(
+  obj: Record<string, unknown>,
+  depth = 0,
+): Record<string, unknown> {
+  if (depth > 10) return obj;
+
+  // Check if this object has the typical error fields (status, code, details)
+  const hasErrorFields =
+    typeof obj.status === "string" ||
+    typeof obj.code === "number" ||
+    Array.isArray(obj.details) ||
+    (typeof obj.details === "object" && obj.details !== null);
+
+  // If we have error fields and also have a nested error, prefer the deeper one
+  if (typeof obj.error === "object" && obj.error !== null) {
+    const nestedError = findInnermostError(
+      obj.error as Record<string, unknown>,
+      depth + 1,
+    );
+    // If the nested error has more specific fields, use it
+    if (
+      typeof nestedError.status === "string" ||
+      typeof nestedError.details === "object"
+    ) {
+      return nestedError;
+    }
+  }
+
+  // If message is an object (parsed from nested JSON), check for error inside it
+  if (typeof obj.message === "object" && obj.message !== null) {
+    const nestedMessage = obj.message as Record<string, unknown>;
+    if (
+      typeof nestedMessage.error === "object" &&
+      nestedMessage.error !== null
+    ) {
+      const nestedError = findInnermostError(
+        nestedMessage.error as Record<string, unknown>,
+        depth + 1,
+      );
+      if (
+        typeof nestedError.status === "string" ||
+        typeof nestedError.details === "object"
+      ) {
+        return nestedError;
+      }
+    }
+  }
+
+  // If current object has error fields, return it
+  if (hasErrorFields) {
+    return obj;
+  }
+
+  return obj;
+}
+
+/**
+ * Parse Gemini/Vertex AI error response body.
+ * Gemini errors have structure: { error: { code, status, message, details } }
+ * Note: Errors can be deeply nested with JSON-encoded strings when proxied.
+ *
+ * The `details` array may contain google.rpc.ErrorInfo objects with specific
+ * error reasons (e.g., "API_KEY_INVALID") that provide more precise error
+ * classification than the status code alone.
+ *
+ * @see https://ai.google.dev/gemini-api/docs/troubleshooting - Google AI Studio troubleshooting
+ * @see https://cloud.google.com/vertex-ai/generative-ai/docs/error-codes - Vertex AI error codes
+ * @see https://cloud.google.com/apis/design/errors - Google Cloud API error design (gRPC codes)
+ * @see https://googleapis.dev/nodejs/spanner/latest/google.rpc.ErrorInfo.html - ErrorInfo structure
+ */
+function parseGeminiError(responseBody: string): ParsedGeminiError | null {
+  try {
+    // First, recursively parse any nested JSON strings
+    const parsed = parseNestedJson(responseBody) as Record<string, unknown>;
+
+    // Find the innermost error object that has the actual error fields
+    let errorObj = parsed;
+    if (typeof parsed.error === "object" && parsed.error !== null) {
+      errorObj = findInnermostError(parsed.error as Record<string, unknown>);
+    }
+
+    // Extract the innermost error details
+    if (errorObj) {
+      // Details can be an array or object-like array from nested JSON parsing
+      const details =
+        Array.isArray(errorObj.details) ||
+        (typeof errorObj.details === "object" && errorObj.details !== null)
+          ? (errorObj.details as unknown[] | Record<string, unknown>)
+          : undefined;
+
+      return {
+        code:
+          typeof errorObj.code === "number"
+            ? errorObj.code
+            : typeof parsed?.error === "object"
+              ? ((parsed.error as Record<string, unknown>).code as
+                  | number
+                  | undefined)
+              : undefined,
+        status:
+          typeof errorObj.status === "string"
+            ? errorObj.status
+            : typeof parsed?.error === "object"
+              ? ((parsed.error as Record<string, unknown>).status as
+                  | string
+                  | undefined)
+              : undefined,
+        message:
+          typeof errorObj.message === "string"
+            ? errorObj.message
+            : typeof parsed?.error === "object" &&
+                parsed.error !== null &&
+                typeof (parsed.error as Record<string, unknown>).message ===
+                  "string"
+              ? ((parsed.error as Record<string, unknown>).message as string)
+              : undefined,
+        details: Array.isArray(details) ? details : undefined,
+        // Extract ErrorInfo for specific error reason mapping
+        errorInfo: details ? extractErrorInfo(details) : undefined,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Cohere Error Types and Parser
+
+interface ParsedCohereError {
+  message?: string;
+}
+
+/**
+ *
+ *  Errors in Cohere have this structure: { message: string }
+ * @see https://docs.cohere.com/reference/errors
+ */
+function parseCohereError(responseBody: string): ParsedCohereError | null {
+  try {
+    const parsed = JSON.parse(responseBody);
+    if (parsed?.message) {
+      return {
+        message: parsed.message,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function mapCohereErrorToCode(
+  statusCode: number | undefined,
+  _parsedError: ParsedCohereError | null,
+): ChatErrorCode {
+  // Cohere uses standard HTTP status codes
+  return mapStatusCodeToErrorCode(statusCode);
+}
+
+// Bedrock Error Parser and Mapper
+
+/**
+ * Parse AWS Bedrock Converse API error response body.
+ * Bedrock errors have structure: { message: "...", __type: "ThrottlingException" }
+ * Also handles proxy format: { error: { message, type } } with embedded AWS error info.
+ *
+ * @see https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
+ */
+function parseBedrockError(responseBody: string): ParsedBedrockError | null {
+  try {
+    const parsed = JSON.parse(responseBody);
+
+    // AWS native format: { message, __type }
+    if (parsed?.__type) {
+      return {
+        type: parsed.__type,
+        message: parsed.message,
+      };
+    }
+
+    // Proxy format: { error: { message, type } }
+    if (parsed?.error) {
+      const errorMessage = parsed.error.message ?? parsed.error.type;
+
+      // Try to extract __type from embedded JSON in the message
+      if (typeof errorMessage === "string") {
+        try {
+          const embedded = JSON.parse(errorMessage);
+          if (embedded?.__type) {
+            return {
+              type: embedded.__type,
+              message: embedded.message ?? errorMessage,
+            };
+          }
+        } catch {
+          // Not JSON, use as-is
+        }
+      }
+
+      return {
+        type: parsed.error.type,
+        message: errorMessage,
+      };
+    }
+
+    // Flat message-only format
+    if (parsed?.message) {
+      return {
+        message: parsed.message,
+      };
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map AWS Bedrock Converse API error to ChatErrorCode.
+ * Uses __type exception name from the API response.
+ *
+ * Exception types documented at:
+ * @see https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
+ *
+ * HTTP Status -> Exception Type mapping:
+ * - 400 -> ValidationException (invalid request)
+ * - 403 -> AccessDeniedException (no access)
+ * - 404 -> ResourceNotFoundException (model not found)
+ * - 408 -> ModelTimeoutException (model timeout)
+ * - 424 -> ModelErrorException (model error)
+ * - 429 -> ThrottlingException / ModelNotReadyException (rate limited)
+ * - 500 -> InternalServerException (internal error)
+ * - 503 -> ServiceUnavailableException (service unavailable)
+ */
+function mapBedrockErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedBedrockError | null,
+): ChatErrorCode {
+  const errorType = parsedError?.type;
+
+  if (errorType) {
+    switch (errorType) {
+      case BedrockErrorTypes.ACCESS_DENIED:
+        return ChatErrorCode.PermissionDenied;
+      case BedrockErrorTypes.INTERNAL_SERVER:
+        return ChatErrorCode.ServerError;
+      case BedrockErrorTypes.MODEL_ERROR:
+        return ChatErrorCode.ServerError;
+      case BedrockErrorTypes.MODEL_NOT_READY:
+        return ChatErrorCode.RateLimit;
+      case BedrockErrorTypes.MODEL_TIMEOUT:
+        return ChatErrorCode.ServerError;
+      case BedrockErrorTypes.RESOURCE_NOT_FOUND:
+        return ChatErrorCode.NotFound;
+      case BedrockErrorTypes.SERVICE_UNAVAILABLE:
+        return ChatErrorCode.ServerError;
+      case BedrockErrorTypes.THROTTLING:
+        return ChatErrorCode.RateLimit;
+      case BedrockErrorTypes.VALIDATION:
+        return ChatErrorCode.InvalidRequest;
+    }
+  }
+
+  // Fall back to HTTP status code
+  return mapStatusCodeToErrorCode(statusCode);
+}
+
+// =============================================================================
+// Provider-Specific Error Mappers
+// =============================================================================
+
+/**
+ * Map OpenAI error to ChatErrorCode.
+ * Uses error.type and error.code fields from the API response.
+ *
+ * Error types documented at:
+ * @see https://platform.openai.com/docs/guides/error-codes/api-errors
+ *
+ * HTTP Status -> Error Type mapping:
+ * - 400 -> invalid_request_error (malformed request)
+ * - 401 -> authentication_error (invalid API key)
+ * - 403 -> permission_denied_error (no access to resource)
+ * - 404 -> not_found_error (resource doesn't exist)
+ * - 422 -> unprocessable_entity_error (valid request, can't process)
+ * - 429 -> rate_limit_exceeded (quota exceeded)
+ * - 500 -> server_error (internal error)
+ * - 503 -> service_unavailable (temporarily down)
+ */
+function mapOpenAIErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedOpenAIError | null,
+): ChatErrorCode {
+  const errorType = parsedError?.type;
+  const errorCode = parsedError?.code;
+
+  // First check error.code for specific error codes
+  if (errorCode) {
+    if (
+      errorCode === OpenAIErrorTypes.INVALID_API_KEY_CODE ||
+      errorCode === OpenAIErrorTypes.INVALID_API_KEY
+    ) {
+      return ChatErrorCode.Authentication;
+    }
+    if (errorCode === OpenAIErrorTypes.CONTEXT_LENGTH_EXCEEDED) {
+      return ChatErrorCode.ContextTooLong;
+    }
+    if (errorCode === OpenAIErrorTypes.MODEL_NOT_FOUND) {
+      return ChatErrorCode.NotFound;
+    }
+  }
+
+  // Then check error.type
+  if (errorType) {
+    switch (errorType) {
+      case OpenAIErrorTypes.AUTHENTICATION:
+      case OpenAIErrorTypes.INVALID_API_KEY:
+        return ChatErrorCode.Authentication;
+      case OpenAIErrorTypes.RATE_LIMIT:
+        return ChatErrorCode.RateLimit;
+      case OpenAIErrorTypes.PERMISSION_DENIED:
+        return ChatErrorCode.PermissionDenied;
+      case OpenAIErrorTypes.NOT_FOUND:
+        return ChatErrorCode.NotFound;
+      case OpenAIErrorTypes.SERVER_ERROR:
+      case OpenAIErrorTypes.SERVICE_UNAVAILABLE:
+        return ChatErrorCode.ServerError;
+      case OpenAIErrorTypes.INVALID_REQUEST:
+      case OpenAIErrorTypes.UNPROCESSABLE_ENTITY:
+      case OpenAIErrorTypes.CONFLICT:
+        return ChatErrorCode.InvalidRequest;
+    }
+  }
+
+  // Fall back to status code
+  return mapStatusCodeToErrorCode(statusCode);
+}
+
+/**
+ * Map Anthropic error to ChatErrorCode.
+ * Uses error.type field from the API response.
+ *
+ * Error types documented at:
+ * @see https://docs.anthropic.com/en/api/errors
+ *
+ * HTTP Status -> Error Type mapping:
+ * - 400 -> invalid_request_error (invalid request body)
+ * - 401 -> authentication_error (invalid API key)
+ * - 403 -> permission_error (no access to resource)
+ * - 404 -> not_found_error (resource doesn't exist)
+ * - 413 -> request_too_large (request exceeds max size)
+ * - 429 -> rate_limit_error (quota exceeded)
+ * - 500 -> api_error (internal error)
+ * - 529 -> overloaded_error (API temporarily overloaded)
+ */
+function mapAnthropicErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedAnthropicError | null,
+): ChatErrorCode {
+  const errorType = parsedError?.type;
+
+  if (errorType) {
+    switch (errorType) {
+      case AnthropicErrorTypes.AUTHENTICATION:
+        return ChatErrorCode.Authentication;
+      case AnthropicErrorTypes.RATE_LIMIT:
+        return ChatErrorCode.RateLimit;
+      case AnthropicErrorTypes.PERMISSION:
+        return ChatErrorCode.PermissionDenied;
+      case AnthropicErrorTypes.NOT_FOUND:
+        return ChatErrorCode.NotFound;
+      case AnthropicErrorTypes.REQUEST_TOO_LARGE:
+        // Anthropic's 413 is a byte-size cap on the request body, not a context
+        // overflow — attachments are the usual cause.
+        return ChatErrorCode.RequestTooLarge;
+      case AnthropicErrorTypes.API_ERROR:
+      case AnthropicErrorTypes.OVERLOADED:
+        return ChatErrorCode.ServerError;
+      case AnthropicErrorTypes.INVALID_REQUEST:
+        return ChatErrorCode.InvalidRequest;
+    }
+  }
+
+  // Fall back to status code (including 529 for overloaded)
+  if (statusCode === 529) {
+    return ChatErrorCode.ServerError;
+  }
+
+  return mapStatusCodeToErrorCode(statusCode);
+}
+
+/**
+ * Map Zhipuai error to ChatErrorCode.
+ * Uses error.code field from the API response.
+ * Zhipuai uses numeric string codes for different error types.
+ *
+ * Error codes documented at:
+ * @see https://docs.z.ai/api-reference/api-code#errors
+ *
+ * Error categories:
+ * - 500: Internal server error
+ * - 1000-1004: Authentication errors
+ * - 1110-1121: Account errors (inactive, locked, balance)
+ * - 1200-1234: API call errors (parameters, models, network)
+ * - 1300-1309: Policy blocks (content filter, rate limits)
+ */
+function mapZhipuaiErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedZhipuaiError | null,
+): ChatErrorCode {
+  const errorCode = parsedError?.code;
+
+  if (errorCode) {
+    switch (errorCode) {
+      // Authentication errors (1000-1004)
+      case ZhipuaiErrorTypes.AUTHENTICATION_FAILED:
+      case ZhipuaiErrorTypes.INVALID_AUTH_TOKEN:
+      case ZhipuaiErrorTypes.AUTH_TOKEN_EXPIRED:
+        return ChatErrorCode.Authentication;
+
+      // Account/permission errors
+      case ZhipuaiErrorTypes.ACCOUNT_LOCKED:
+      case ZhipuaiErrorTypes.INSUFFICIENT_BALANCE:
+      case ZhipuaiErrorTypes.NO_PERMISSION:
+        return ChatErrorCode.PermissionDenied;
+
+      // Model/API not found
+      case ZhipuaiErrorTypes.MODEL_NOT_FOUND:
+        return ChatErrorCode.NotFound;
+
+      // Rate limiting (multiple variants)
+      case ZhipuaiErrorTypes.RATE_LIMIT:
+      case ZhipuaiErrorTypes.HIGH_CONCURRENCY:
+      case ZhipuaiErrorTypes.HIGH_FREQUENCY:
+        return ChatErrorCode.RateLimit;
+
+      // Content filtering
+      case ZhipuaiErrorTypes.CONTENT_FILTERED:
+        return ChatErrorCode.ContentFiltered;
+
+      // Invalid request parameters
+      case ZhipuaiErrorTypes.INVALID_API_PARAMETERS:
+      case ZhipuaiErrorTypes.INVALID_PARAMETER:
+        return ChatErrorCode.InvalidRequest;
+
+      // Server/network errors
+      case ZhipuaiErrorTypes.INTERNAL_ERROR:
+      case ZhipuaiErrorTypes.NETWORK_ERROR:
+      case ZhipuaiErrorTypes.API_OFFLINE:
+        return ChatErrorCode.ServerError;
+    }
+  }
+
+  // Fall back to HTTP status code
+  return mapStatusCodeToErrorCode(statusCode);
+}
+
+/**
+ * Map Gemini/Vertex AI error to ChatErrorCode.
+ * Uses error.status (gRPC status code) and error.details[].reason (ErrorInfo) from the API response.
+ *
+ * The ErrorInfo reason (from details array) provides more specific error classification
+ * than the gRPC status alone. For example, INVALID_ARGUMENT status with API_KEY_INVALID
+ * reason should map to Authentication, not InvalidRequest.
+ *
+ * gRPC status codes documented at:
+ * @see https://cloud.google.com/apis/design/errors#handling_errors
+ * @see https://grpc.io/docs/guides/status-codes/
+ *
+ * ErrorInfo reasons documented at:
+ * @see https://cloud.google.com/apis/design/errors#error_info
+ * @see https://googleapis.dev/nodejs/spanner/latest/google.rpc.ErrorInfo.html
+ *
+ * HTTP Status -> gRPC Status mapping (per Google's AIP-193):
+ * - 400 -> INVALID_ARGUMENT (client specified an invalid argument)
+ * - 401 -> UNAUTHENTICATED (missing/invalid authentication)
+ * - 403 -> PERMISSION_DENIED (insufficient permissions)
+ * - 404 -> NOT_FOUND (resource doesn't exist)
+ * - 429 -> RESOURCE_EXHAUSTED (quota exceeded)
+ * - 500 -> INTERNAL (internal server error)
+ * - 503 -> UNAVAILABLE (service temporarily unavailable)
+ * - 504 -> DEADLINE_EXCEEDED (request timeout)
+ */
+function mapGeminiErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedGeminiError | null,
+): ChatErrorCode {
+  const grpcStatus = parsedError?.status;
+  const errorReason = parsedError?.errorInfo?.reason;
+
+  // First, check ErrorInfo reason for more specific error classification
+  // This takes precedence because it provides more detail than status alone
+  if (errorReason) {
+    switch (errorReason) {
+      // Authentication errors
+      case GeminiErrorReasons.API_KEY_INVALID:
+      case GeminiErrorReasons.API_KEY_NOT_FOUND:
+      case GeminiErrorReasons.API_KEY_EXPIRED:
+      case GeminiErrorReasons.ACCESS_TOKEN_EXPIRED:
+      case GeminiErrorReasons.ACCESS_TOKEN_INVALID:
+      case GeminiErrorReasons.SERVICE_ACCOUNT_INVALID:
+        return ChatErrorCode.Authentication;
+
+      // Rate limit / quota errors
+      case GeminiErrorReasons.RATE_LIMIT_EXCEEDED:
+      case GeminiErrorReasons.RESOURCE_EXHAUSTED:
+      case GeminiErrorReasons.QUOTA_EXCEEDED:
+        return ChatErrorCode.RateLimit;
+
+      // Not found errors
+      case GeminiErrorReasons.MODEL_NOT_FOUND:
+      case GeminiErrorReasons.RESOURCE_NOT_FOUND:
+        return ChatErrorCode.NotFound;
+
+      // Content filtering errors
+      case GeminiErrorReasons.SAFETY_BLOCKED:
+      case GeminiErrorReasons.RECITATION_BLOCKED:
+      case GeminiErrorReasons.CONTENT_FILTERED:
+        return ChatErrorCode.ContentFiltered;
+
+      // Context length errors
+      case GeminiErrorReasons.CONTEXT_LENGTH_EXCEEDED:
+        return ChatErrorCode.ContextTooLong;
+    }
+  }
+
+  // Fall back to gRPC status code
+  if (grpcStatus) {
+    switch (grpcStatus) {
+      case GeminiErrorCodes.UNAUTHENTICATED:
+        return ChatErrorCode.Authentication;
+      case GeminiErrorCodes.PERMISSION_DENIED:
+        return ChatErrorCode.PermissionDenied;
+      case GeminiErrorCodes.RESOURCE_EXHAUSTED:
+        return ChatErrorCode.RateLimit;
+      case GeminiErrorCodes.NOT_FOUND:
+        return ChatErrorCode.NotFound;
+      case GeminiErrorCodes.INVALID_ARGUMENT:
+      case GeminiErrorCodes.FAILED_PRECONDITION:
+      case GeminiErrorCodes.OUT_OF_RANGE:
+        return ChatErrorCode.InvalidRequest;
+      case GeminiErrorCodes.INTERNAL:
+      case GeminiErrorCodes.UNAVAILABLE:
+      case GeminiErrorCodes.DEADLINE_EXCEEDED:
+        return ChatErrorCode.ServerError;
+    }
+  }
+
+  // Fall back to HTTP status code
+  return mapStatusCodeToErrorCode(statusCode);
+}
+
+/**
+ * Generic status code to error code mapping (fallback)
+ */
+function mapStatusCodeToErrorCode(
+  statusCode: number | undefined,
+): ChatErrorCode {
+  if (!statusCode) {
+    return ChatErrorCode.Unknown;
+  }
+
+  switch (statusCode) {
+    case 400:
+      return ChatErrorCode.InvalidRequest;
+    case 401:
+      return ChatErrorCode.Authentication;
+    case 403:
+      return ChatErrorCode.PermissionDenied;
+    case 404:
+      return ChatErrorCode.NotFound;
+    case 413:
+      // A 413 is about the size of *this request*, not the length of the
+      // conversation: providers return it for oversized payloads and for
+      // token-bucket rejections alike. Advising "start a new chat" is wrong for
+      // both — the request has to get smaller, not the history.
+      return ChatErrorCode.RequestTooLarge;
+    case 422:
+      return ChatErrorCode.InvalidRequest;
+    case 429:
+      return ChatErrorCode.RateLimit;
+    case 529: // Anthropic overloaded
+      return ChatErrorCode.ServerError;
+    default:
+      if (statusCode >= 500) {
+        return ChatErrorCode.ServerError;
+      }
+      return ChatErrorCode.Unknown;
+  }
+}
+
+// =============================================================================
+// Provider Parser/Mapper Registry
+// =============================================================================
+
+/** Union type of all parsed error types */
+type ParsedProviderError =
+  | ParsedOpenAIError
+  | ParsedAnthropicError
+  | ParsedGeminiError
+  | ParsedCohereError
+  | ParsedZhipuaiError
+  | ParsedMinimaxError
+  | ParsedBedrockError;
+
+/**
+ * A provider's matched error parse/map pair. The narrowing cast in the factory
+ * below is sound only because each registry entry pairs a mapper with the
+ * parser that produces its expected type — the mapper never sees anything else.
+ */
+interface ProviderErrorHandler {
+  parse: (responseBody: string) => ParsedProviderError | null;
+  map: (
+    statusCode: number | undefined,
+    parsedError: ParsedProviderError | null,
+  ) => ChatErrorCode;
+}
+
+function providerErrorHandler<T extends ParsedProviderError>(
+  parse: (responseBody: string) => T | null,
+  map: (statusCode: number | undefined, parsedError: T | null) => ChatErrorCode,
+): ProviderErrorHandler {
+  return {
+    parse,
+    map: (statusCode, parsedError) => map(statusCode, parsedError as T | null),
+  };
+}
+
+/**
+ * Map MiniMax error to ChatErrorCode.
+ * MiniMax has unique error types like "insufficient_balance_error"
+ *
+ * Error format: { type: "error", error: { type, message, http_code } }
+ * Common error types:
+ * - insufficient_balance_error (429) -> account has no balance
+ * - invalid_api_key (401) -> invalid authentication
+ * - rate_limit_exceeded (429) -> too many requests
+ */
+function mapMinimaxErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedMinimaxError | null,
+): ChatErrorCode {
+  const errorType = parsedError?.type;
+  const httpCode = parsedError?.http_code;
+
+  // MiniMax-specific error types
+  if (errorType) {
+    switch (errorType) {
+      case "insufficient_balance_error":
+        // Insufficient balance should map to PermissionDenied (account issue)
+        return ChatErrorCode.PermissionDenied;
+      case "invalid_api_key":
+      case "authentication_error":
+        return ChatErrorCode.Authentication;
+      case "rate_limit_exceeded":
+        return ChatErrorCode.RateLimit;
+      case "invalid_request_error":
+        return ChatErrorCode.InvalidRequest;
+      case "not_found_error":
+      case "model_not_found":
+        return ChatErrorCode.NotFound;
+      case "context_length_exceeded":
+        return ChatErrorCode.ContextTooLong;
+      case "server_error":
+      case "service_unavailable":
+        return ChatErrorCode.ServerError;
+    }
+  }
+
+  // Use http_code from MiniMax response if available
+  const effectiveStatus = httpCode ? Number.parseInt(httpCode, 10) : statusCode;
+  return mapStatusCodeToErrorCode(effectiveStatus);
+}
+
+/**
+ * Map vLLM error to ChatErrorCode.
+ * vLLM uses OpenAI-compatible error format with some additional codes.
+ *
+ * @see https://docs.vllm.ai/en/latest/features/openai_api.html
+ */
+function mapVllmErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedOpenAIError | null,
+): ChatErrorCode {
+  const errorType = parsedError?.type;
+  const errorCode = parsedError?.code;
+
+  // First check error.code for specific error codes
+  if (errorCode) {
+    if (
+      errorCode === VllmErrorTypes.INVALID_API_KEY ||
+      errorCode === OpenAIErrorTypes.INVALID_API_KEY_CODE
+    ) {
+      return ChatErrorCode.Authentication;
+    }
+    if (
+      errorCode === VllmErrorTypes.CONTEXT_LENGTH_EXCEEDED ||
+      errorCode === OpenAIErrorTypes.CONTEXT_LENGTH_EXCEEDED
+    ) {
+      return ChatErrorCode.ContextTooLong;
+    }
+    if (errorCode === VllmErrorTypes.MODEL_NOT_LOADED) {
+      return ChatErrorCode.NotFound;
+    }
+  }
+
+  // Then check error.type
+  if (errorType) {
+    switch (errorType) {
+      case VllmErrorTypes.AUTHENTICATION:
+      case VllmErrorTypes.INVALID_API_KEY:
+        return ChatErrorCode.Authentication;
+      case VllmErrorTypes.NOT_FOUND:
+        return ChatErrorCode.NotFound;
+      case VllmErrorTypes.SERVER_ERROR:
+      case VllmErrorTypes.SERVICE_UNAVAILABLE:
+        return ChatErrorCode.ServerError;
+      case VllmErrorTypes.INVALID_REQUEST:
+        return ChatErrorCode.InvalidRequest;
+    }
+  }
+
+  // Fall back to OpenAI error mapping (since vLLM is OpenAI-compatible)
+  return mapOpenAIErrorToCode(statusCode, parsedError);
+}
+
+/**
+ * Map Ollama error to ChatErrorCode.
+ * Ollama uses OpenAI-compatible error format with some additional codes.
+ *
+ * @see https://github.com/ollama/ollama/blob/main/docs/openai.md
+ */
+function mapOllamaErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedOpenAIError | null,
+): ChatErrorCode {
+  const errorType = parsedError?.type;
+  const errorCode = parsedError?.code;
+
+  // First check error.code for specific error codes
+  if (errorCode) {
+    if (
+      errorCode === OllamaErrorTypes.INVALID_API_KEY ||
+      errorCode === OpenAIErrorTypes.INVALID_API_KEY_CODE
+    ) {
+      return ChatErrorCode.Authentication;
+    }
+    if (
+      errorCode === OllamaErrorTypes.CONTEXT_LENGTH_EXCEEDED ||
+      errorCode === OpenAIErrorTypes.CONTEXT_LENGTH_EXCEEDED
+    ) {
+      return ChatErrorCode.ContextTooLong;
+    }
+    if (errorCode === OllamaErrorTypes.MODEL_NOT_FOUND) {
+      return ChatErrorCode.NotFound;
+    }
+  }
+
+  // Then check error.type
+  if (errorType) {
+    switch (errorType) {
+      case OllamaErrorTypes.AUTHENTICATION:
+      case OllamaErrorTypes.INVALID_API_KEY:
+        return ChatErrorCode.Authentication;
+      case OllamaErrorTypes.NOT_FOUND:
+        return ChatErrorCode.NotFound;
+      case OllamaErrorTypes.SERVER_ERROR:
+      case OllamaErrorTypes.SERVICE_UNAVAILABLE:
+        return ChatErrorCode.ServerError;
+      case OllamaErrorTypes.INVALID_REQUEST:
+        return ChatErrorCode.InvalidRequest;
+    }
+  }
+
+  // Fall back to OpenAI error mapping (since Ollama is OpenAI-compatible)
+  return mapOpenAIErrorToCode(statusCode, parsedError);
+}
+
+// vLLM and Ollama expose the same OpenAI-compatible error body but carry a few
+// provider-specific codes, hence their dedicated mappers over the shared parser.
+const openAiCompatibleErrorHandler = providerErrorHandler(
+  parseOpenAIError,
+  mapOpenAIErrorToCode,
+);
+
+/**
+ * Microsoft 365 Copilot shares the OpenAI-compatible error body; its one
+ * provider-specific case is the proxy adapter's tools rejection, which must
+ * surface as the actionable ToolsUnsupported headline instead of the generic
+ * invalid-request copy (whose details are visible to admins only).
+ */
+function mapMicrosoft365CopilotErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedOpenAIError | null,
+): ChatErrorCode {
+  if (
+    statusCode === 400 &&
+    parsedError?.message?.includes(
+      MICROSOFT_365_COPILOT_TOOLS_UNSUPPORTED_MESSAGE,
+    )
+  ) {
+    return ChatErrorCode.ToolsUnsupported;
+  }
+  return mapOpenAIErrorToCode(statusCode, parsedError);
+}
+
+/**
+ * GitHub Copilot shares the OpenAI-compatible error body, but the LLM proxy's
+ * error wrapping keeps only `message`/`type` — the upstream
+ * `model_not_supported` code is gone by the time the chat maps the error, so
+ * the one Copilot-specific case is keyed on the message. Copilot catalogues
+ * models its chat/completions endpoint rejects (the model fetcher verifies
+ * invocability, but a conversation can stay pinned to a model that has since
+ * been dropped), and that deterministic rejection must surface the actionable
+ * "choose a different model" copy, not the retry-suggesting invalid-request
+ * one.
+ */
+function mapGithubCopilotErrorToCode(
+  statusCode: number | undefined,
+  parsedError: ParsedOpenAIError | null,
+): ChatErrorCode {
+  if (
+    statusCode === 400 &&
+    parsedError?.message?.includes(
+      GithubCopilot.API.MODEL_NOT_SUPPORTED_MESSAGE,
+    )
+  ) {
+    return ChatErrorCode.NotFound;
+  }
+  return mapOpenAIErrorToCode(statusCode, parsedError);
+}
+
+/**
+ * Registry of provider-specific error parse/map pairs.
+ * Using Record<SupportedProvider, ...> ensures TypeScript will error
+ * if a new provider is added to SupportedProvider without updating this map.
+ */
+const providerErrorHandlers: Record<SupportedProvider, ProviderErrorHandler> = {
+  // Embeddings-only provider: it never reaches the chat error path. The
+  // OpenAI-compatible handler stands in so an unexpected caller still gets a
+  // classified error rather than a crash.
+  voyage: openAiCompatibleErrorHandler,
+  // Decisions-only provider: never on the chat path either.
+  jev: openAiCompatibleErrorHandler,
+  openai: openAiCompatibleErrorHandler,
+  archestra: openAiCompatibleErrorHandler,
+  anthropic: providerErrorHandler(parseAnthropicError, mapAnthropicErrorToCode),
+  gemini: providerErrorHandler(parseGeminiError, mapGeminiErrorToCode),
+  bedrock: providerErrorHandler(parseBedrockError, mapBedrockErrorToCode),
+  cerebras: openAiCompatibleErrorHandler,
+  cohere: providerErrorHandler(parseCohereError, mapCohereErrorToCode),
+  mistral: openAiCompatibleErrorHandler,
+  perplexity: openAiCompatibleErrorHandler,
+  groq: openAiCompatibleErrorHandler,
+  xai: openAiCompatibleErrorHandler,
+  openrouter: openAiCompatibleErrorHandler,
+  vllm: providerErrorHandler(parseOpenAIError, mapVllmErrorToCode),
+  ollama: providerErrorHandler(parseOpenAIError, mapOllamaErrorToCode),
+  "ollama-native": providerErrorHandler(parseOpenAIError, mapOllamaErrorToCode),
+  zhipuai: providerErrorHandler(parseZhipuaiError, mapZhipuaiErrorToCode),
+  deepseek: openAiCompatibleErrorHandler,
+  kimi: openAiCompatibleErrorHandler,
+  "kimi-code": openAiCompatibleErrorHandler,
+  "github-copilot": providerErrorHandler(
+    parseOpenAIError,
+    mapGithubCopilotErrorToCode,
+  ),
+  "microsoft-365-copilot": providerErrorHandler(
+    parseOpenAIError,
+    mapMicrosoft365CopilotErrorToCode,
+  ),
+  minimax: providerErrorHandler(parseMinimaxError, mapMinimaxErrorToCode),
+  azure: openAiCompatibleErrorHandler,
+};
+
+// =============================================================================
+// Message Extraction
+// =============================================================================
+
+/**
+ * Recursively find the deepest string message in a parsed object
+ * Handles both cases where message is a string or an already-parsed object
+ */
+function findDeepestMessage(obj: unknown, depth = 0): string | null {
+  if (depth > 10) return null;
+
+  if (typeof obj !== "object" || obj === null) {
+    return null;
+  }
+
+  const record = obj as Record<string, unknown>;
+
+  // If message is a string, check if it's a meaningful message
+  if (typeof record.message === "string" && record.message.length > 0) {
+    // If message doesn't look like JSON, return it
+    if (!record.message.startsWith("{") && !record.message.startsWith("[")) {
+      return record.message;
+    }
+  }
+
+  // If message is an object (already parsed from nested JSON), recurse into it
+  if (typeof record.message === "object" && record.message !== null) {
+    const deeper = findDeepestMessage(record.message, depth + 1);
+    if (deeper) return deeper;
+  }
+
+  if (
+    typeof record.error_description === "string" &&
+    record.error_description.length > 0
+  ) {
+    return record.error_description;
+  }
+
+  // Recurse into error object
+  if (typeof record.error === "object" && record.error !== null) {
+    const deeper = findDeepestMessage(record.error, depth + 1);
+    if (deeper) return deeper;
+  }
+
+  if (typeof record.error === "string" && record.error.length > 0) {
+    return record.error;
+  }
+
+  // If we have a message that looks like JSON, still return it as fallback
+  if (typeof record.message === "string" && record.message.length > 0) {
+    return record.message;
+  }
+
+  return null;
+}
+
+/**
+ * Extract the most meaningful error message from the parsed error or raw response
+ */
+function extractErrorMessage(
+  parsedError: ParsedProviderError | null,
+  responseBody: string | undefined,
+  error: unknown,
+): string {
+  // Try to extract from responseBody with deep parsing first (for nested Gemini errors)
+  if (responseBody) {
+    try {
+      const parsed = parseNestedJson(responseBody) as Record<string, unknown>;
+      const deepMessage = findDeepestMessage(parsed, 0);
+      if (deepMessage) {
+        return deepMessage;
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+  }
+
+  // Then try to get message from parsed error
+  if (typeof parsedError?.message === "string") {
+    return parsedError.message;
+  }
+
+  // Fall back to error object properties
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "object" && error !== null) {
+    const obj = error as Record<string, unknown>;
+    if (typeof obj.message === "string") {
+      return obj.message;
+    }
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  return "Unknown error";
+}
+
+// =============================================================================
+// Main Error Mapper
+// =============================================================================
+
+/**
+ * Create a ChatErrorResponse from the determined error code.
+ * The rawError is safely serialized to handle circular references.
+ */
+function createErrorResponse(
+  code: ChatErrorCode,
+  provider: SupportedProvider,
+  status: number | undefined,
+  originalMessage: string,
+  errorType: string | undefined,
+  rawError: unknown,
+  usageLimitError?: { entityType?: string } | null,
+): ChatErrorResponse {
+  const response: ChatErrorResponse = {
+    code,
+    message: usageLimitError
+      ? formatUsageLimitMessage(usageLimitError.entityType)
+      : archestraMcpBranding.brandBuiltInText(ChatErrorMessages[code]),
+    isRetryable: RetryableErrorCodes.has(code),
+    originalError: {
+      provider,
+      status,
+      message: originalMessage,
+      type: errorType,
+      raw: safeSerialize(rawError),
+    },
+  };
+  if (usageLimitError) {
+    response.usageLimitExceeded = true;
+    response.usageLimitEntityType = usageLimitError.entityType;
+  }
+  return response;
+}
+
+/**
+ * Build the error surfaced when a turn ends with a tool call the model started
+ * streaming but never completed — nothing executes and the turn produces no
+ * reply. A `length` finishReason means the model hit its output cap mid tool
+ * call (a deterministic, too-large payload): surface the non-retryable
+ * ToolCallOutputTruncated code so the card stops advertising a retry that would
+ * just re-truncate. Any other finishReason keeps the retryable IncompleteToolCall
+ * code (a transient mid-stream drop). Both distinguish it from a cleanly empty
+ * turn (EmptyResponse) for telemetry and the rendered card.
+ */
+export function buildAbortiveTurnError(
+  provider: SupportedProvider,
+  finishReason?: string | null,
+): ChatErrorResponse {
+  const code =
+    finishReason === "length"
+      ? ChatErrorCode.ToolCallOutputTruncated
+      : ChatErrorCode.IncompleteToolCall;
+  return createErrorResponse(
+    code,
+    provider,
+    undefined,
+    archestraMcpBranding.brandBuiltInText(ChatErrorMessages[code]),
+    "AbortiveTurn",
+    undefined,
+  );
+}
+
+/**
+ * Build the non-fatal notice attached to a reply the model finished for a
+ * reason other than a clean stop: `length` means the output cap cut it short,
+ * anything else (`other`, `error`, `unknown`, `content-filter`) that the model
+ * stopped early. Null for a clean finish, which needs no notice.
+ */
+export function buildIncompleteResponseNotice(
+  finishReason: string | undefined,
+): ChatErrorResponse | null {
+  switch (finishReason) {
+    case undefined:
+    case "stop":
+    case "tool-calls":
+      return null;
+    case "length":
+      return {
+        code: ChatErrorCode.IncompleteResponse,
+        message:
+          "The model reached its output limit, so this reply was cut short.",
+        isRetryable: false,
+      };
+    default:
+      return {
+        code: ChatErrorCode.IncompleteResponse,
+        message: ChatErrorMessages[ChatErrorCode.IncompleteResponse],
+        isRetryable: false,
+      };
+  }
+}
+
+/**
+ * Map a provider error to a normalized ChatErrorResponse.
+ * Uses provider-specific parsing and mapping for accurate error classification.
+ *
+ * @param error - The error to map (typically an APICallError from Vercel AI SDK)
+ * @param provider - The provider that generated the error
+ * @returns A normalized ChatErrorResponse with user-friendly message and technical details
+ */
+export function mapProviderError(
+  error: unknown,
+  provider: SupportedProvider,
+): ChatErrorResponse {
+  logger.debug({ provider }, "[ChatErrorMapper] Mapping provider error");
+
+  // A deliberate cancellation — the caller's own AbortSignal fired (a user
+  // stop, a muted chatops thread, or a superseding follow-up message) and the
+  // in-flight provider call threw an AbortError. Not a provider failure, so
+  // return the structured "cancelled" response without any error reporting.
+  if (isAbortError(error)) {
+    return {
+      code: ChatErrorCode.Aborted,
+      message: ChatErrorMessages[ChatErrorCode.Aborted],
+      isRetryable: false,
+    };
+  }
+
+  // Oversized request caught pre-flight (a large inline attachment) → an
+  // actionable size error instead of the provider's generic rejection. The
+  // error already carries the user-facing message with the size and limit.
+  if (error instanceof RequestTooLargeError) {
+    return {
+      code: ChatErrorCode.RequestTooLarge,
+      message: error.message,
+      isRetryable: false,
+    };
+  }
+
+  // These messages are authored locally, not arbitrary provider response text.
+  // Retrying unchanged cannot resolve a conflicting Nova reasoning setting.
+  if (error instanceof BedrockThinkingConfigurationError) {
+    return {
+      code: ChatErrorCode.InvalidRequest,
+      message: error.message,
+      isRetryable: false,
+    };
+  }
+
+  // Prompt assembled larger than the model's context window, caught pre-flight
+  // by the token-budget gate → an actionable "too long" message naming the
+  // estimate and the limit, instead of the provider's generic rejection.
+  if (error instanceof ContextWindowExceededError) {
+    return {
+      code: ChatErrorCode.ContextTooLong,
+      message: error.message,
+      isRetryable: false,
+    };
+  }
+
+  // Per-user provider with no linked account → an actionable "connect" prompt,
+  // not a generic key error. Carries authAction so the UI renders a link card.
+  if (error instanceof LlmProviderAuthRequiredError) {
+    return {
+      code: ChatErrorCode.ProviderAuthRequired,
+      message: `Connect your ${error.providerLabel} account to use this model.`,
+      isRetryable: false,
+      authAction: {
+        provider: error.provider,
+        providerLabel: error.providerLabel,
+      },
+    };
+  }
+
+  // Handle Vercel AI SDK RetryError - extract the lastError and map it
+  // RetryError wraps errors from retry attempts and contains the last underlying error
+  if (RetryError.isInstance(error)) {
+    const retryError = error as InstanceType<typeof RetryError>;
+    logger.debug(
+      {
+        provider,
+        reason: retryError.reason,
+        errorCount: retryError.errors?.length,
+        lastErrorType:
+          retryError.lastError instanceof Error
+            ? retryError.lastError.name
+            : typeof retryError.lastError,
+      },
+      "[ChatErrorMapper] Unwrapping RetryError to extract lastError",
+    );
+
+    // If we have a lastError, recursively map it to get the actual error details
+    if (retryError.lastError) {
+      const mappedLastError = mapProviderError(retryError.lastError, provider);
+      // Preserve the retry context in the message
+      const originalMessage =
+        mappedLastError.originalError?.message || "Unknown error";
+      return {
+        ...mappedLastError,
+        originalError: mappedLastError.originalError
+          ? {
+              ...mappedLastError.originalError,
+              message: `Failed after ${retryError.errors?.length || "multiple"} attempts. Last error: ${originalMessage}`,
+            }
+          : undefined,
+      };
+    }
+  }
+
+  // Empty turns can be transient, but exhausting the output budget or hitting a
+  // content filter needs a changed request rather than another unchanged retry.
+  if (error instanceof EmptyModelResponseError) {
+    let code = ChatErrorCode.EmptyResponse;
+    if (error.finishReason === "content-filter") {
+      code = ChatErrorCode.ContentFiltered;
+    } else if (error.finishReason === "length") {
+      code = ChatErrorCode.IncompleteResponse;
+    }
+    const message =
+      error.finishReason === "length"
+        ? OUTPUT_LIMIT_REACHED_MESSAGE
+        : ChatErrorMessages[code];
+    const brandedMessage = archestraMcpBranding.brandBuiltInText(message);
+    return {
+      ...createErrorResponse(
+        code,
+        provider,
+        undefined,
+        brandedMessage,
+        "EmptyModelResponseError",
+        {
+          finishReason: error.finishReason,
+          rawFinishReason: error.rawFinishReason,
+          attempts: error.attempts,
+        },
+      ),
+      message: brandedMessage,
+    };
+  }
+
+  if (error instanceof ModelStreamStalledError) {
+    return createErrorResponse(
+      ChatErrorCode.UpstreamStalled,
+      provider,
+      undefined,
+      error.message,
+      "ModelStreamStalledError",
+      { idleTimeoutMs: error.idleTimeoutMs },
+    );
+  }
+
+  // Handle NoOutputGeneratedError — the provider failed before producing any
+  // output. Map it to a structured server_error so the frontend shows the
+  // same styled error card instead of raw text.
+  if (NoOutputGeneratedError.isInstance(error)) {
+    return createErrorResponse(
+      ChatErrorCode.ServerError,
+      provider,
+      undefined,
+      ChatErrorMessages[ChatErrorCode.ServerError],
+      "NoOutputGeneratedError",
+      {},
+    );
+  }
+
+  // Handle UnsupportedFunctionalityError — a provider SDK rejected an input it
+  // can't represent (e.g. a text-document file part on an OpenAI-compatible
+  // provider). Surface the specific functionality so the user sees what was
+  // unsupported instead of the bare InvalidRequest message; sanitization strips
+  // originalError, so the detail must live in the user-facing message.
+  if (UnsupportedFunctionalityError.isInstance(error)) {
+    const code = ChatErrorCode.InvalidRequest;
+    const message = `This model does not support the attached content: ${error.functionality}`;
+    return {
+      code,
+      message,
+      isRetryable: RetryableErrorCodes.has(code),
+      originalError: {
+        provider,
+        status: undefined,
+        message,
+        type: "UnsupportedFunctionalityError",
+        raw: safeSerialize({ functionality: error.functionality }),
+      },
+    };
+  }
+
+  // Get provider-specific parser and mapper
+  const { parse: parseError, map: mapError } = providerErrorHandlers[provider];
+
+  let statusCode: number | undefined;
+  let responseBody: string | undefined;
+  let parsedError: ParsedProviderError | null = null;
+
+  // Handle Vercel AI SDK APICallError
+  if (APICallError.isInstance(error)) {
+    const apiError = error as InstanceType<typeof APICallError>;
+    statusCode = apiError.statusCode;
+    responseBody = apiError.responseBody;
+
+    // Parse the response body using provider-specific parser
+    if (responseBody) {
+      parsedError = parseError(responseBody);
+    }
+  } else if (typeof error === "object" && error !== null) {
+    // Handle generic error objects
+    const obj = error as Record<string, unknown>;
+    statusCode =
+      typeof obj.statusCode === "number"
+        ? obj.statusCode
+        : typeof obj.status === "number"
+          ? obj.status
+          : undefined;
+    responseBody =
+      typeof obj.responseBody === "string" ? obj.responseBody : undefined;
+
+    // A mid-stream SSE error part arrives as a bare `{ message, type,
+    // internal_code? }` object with no HTTP envelope. Re-wrap it as a response
+    // body so the provider parser, normalized internal-code extraction, and
+    // message extraction below all treat it uniformly with the pre-stream
+    // (status + body) delivery shape. Only the fields those consumers read are
+    // copied, so arbitrary (possibly circular) extra properties are ignored.
+    // Error instances are excluded: their fields are non-enumerable, so
+    // wrapping them would serialize to nothing. The AI SDK's Responses parser
+    // relays the whole `{ type: "error", error: {...} }` chunk instead, so the
+    // part's fields may sit one level down.
+    const nested = (obj.error ?? undefined) as
+      | Record<string, unknown>
+      | undefined;
+    const part =
+      error instanceof Error
+        ? undefined
+        : typeof obj.message === "string"
+          ? obj
+          : typeof nested === "object" && typeof nested.message === "string"
+            ? nested
+            : undefined;
+    if (!responseBody && part) {
+      // The Responses stream frame carries the normalized code in `code`,
+      // since that schema has no `internal_code` field.
+      const internalCode =
+        typeof part.internal_code === "string"
+          ? part.internal_code
+          : part === nested
+            ? part.code
+            : undefined;
+      responseBody = JSON.stringify({
+        error: {
+          message: part.message,
+          ...(typeof part.type === "string" ? { type: part.type } : {}),
+          ...(typeof part.code === "string" || typeof part.code === "number"
+            ? { code: part.code }
+            : {}),
+          ...(typeof internalCode === "string"
+            ? { internal_code: internalCode }
+            : {}),
+        },
+      });
+    }
+
+    if (responseBody) {
+      parsedError = parseError(responseBody);
+    }
+  }
+
+  // Map to error code using provider-specific mapper
+  let errorCode = mapError(statusCode, parsedError);
+  const errorMessage = extractErrorMessage(parsedError, responseBody, error);
+  // A proxy can serialize a native disconnect into an error frame, losing
+  // its Error prototype. Recognize that status-less fallback too, without
+  // overriding an explicit provider rejection or a more specific category.
+  const isTerminatedStream =
+    isStreamTerminatedError(error) ||
+    (statusCode === undefined &&
+      errorCode === ChatErrorCode.Unknown &&
+      errorMessage === "terminated");
+
+  if (isTerminatedStream) {
+    errorCode = ChatErrorCode.NetworkError;
+  }
+
+  // An Archestra-normalized `internal_code` emitted by the adapter's
+  // extractInternalCode takes precedence over the per-provider mapper. This
+  // is how cross-provider categories (context_length_exceeded, ...) are
+  // surfaced uniformly without each mapper re-implementing the detection.
+  const normalizedCode = extractArchestraInternalCode(responseBody);
+  if (normalizedCode === ArchestraInternalErrorCode.ContextLengthExceeded) {
+    errorCode = ChatErrorCode.ContextTooLong;
+  } else if (
+    normalizedCode === ArchestraInternalErrorCode.ProviderInsufficientBalance
+  ) {
+    // Balance too low arrives as a 400/402 the per-provider mapper would call
+    // InvalidRequest (generic "please try again"). Reclassify to the dedicated,
+    // non-retryable code so the card names the real cause.
+    errorCode = ChatErrorCode.ProviderInsufficientBalance;
+  } else if (
+    normalizedCode === ArchestraInternalErrorCode.UpstreamEmptyResponse
+  ) {
+    // The proxy detected the provider finished a turn with no content or tool
+    // calls and returned a 503 the per-provider mapper would call ServerError
+    // ("the provider is experiencing issues"). Reclassify to the retryable
+    // EmptyResponse code so the card names what actually happened.
+    errorCode = ChatErrorCode.EmptyResponse;
+  } else if (
+    normalizedCode === ArchestraInternalErrorCode.RequestExceedsRateLimit
+  ) {
+    // A token-bucket rejection arrives as a 413 the status mapper would call
+    // RequestTooLarge ("compress or split large attachments"), which points at
+    // the wrong thing entirely — the payload is usually tiny and the reserved
+    // output budget is what blew the per-minute allowance. Reclassify so the
+    // card names the real cause and stops advising a new chat.
+    errorCode = ChatErrorCode.RequestExceedsRateLimit;
+  } else if (normalizedCode === ArchestraInternalErrorCode.UpstreamTimeout) {
+    // Mid-stream HTTP status is already committed as 200, so the normalized
+    // code preserves the upstream 504 semantics and retryability.
+    errorCode = ChatErrorCode.NetworkError;
+  } else if (normalizedCode === ArchestraInternalErrorCode.ProviderOverloaded) {
+    // Mid-stream overloads have no usable HTTP status.
+    errorCode = ChatErrorCode.ServerError;
+  } else if (
+    normalizedCode === ArchestraInternalErrorCode.ProviderAuthRequired
+  ) {
+    // A per-user subscription credential is unusable (not linked, or the
+    // sign-in expired/was revoked upstream — e.g. a dead ChatGPT/Codex refresh
+    // token). The status mapper would call this Authentication ("Invalid API
+    // key — check your Chat Settings"), pointing at entirely the wrong remedy.
+    // Reclassify so the UI renders the connect/reconnect card.
+    errorCode = ChatErrorCode.ProviderAuthRequired;
+  }
+  const usageLimitError = extractUsageLimitError(responseBody);
+  // An Archestra usage-limit block arrives over the proxy envelope as an HTTP
+  // 429, which the per-provider mappers classify as a retryable RateLimit. That
+  // mislabels it as the provider throttling traffic ("not your usage limit" in
+  // some clients) and offers a pointless retry. Reclassify it to the dedicated,
+  // non-retryable UsageLimitExceeded code so the UI attributes it to Archestra
+  // and drops the retry affordance.
+  if (usageLimitError) {
+    errorCode = ChatErrorCode.UsageLimitExceeded;
+  }
+
+  // OpenRouter ends a streaming turn with "Upstream idle timeout exceeded" when
+  // the routed upstream stops emitting tokens mid-generation (e.g. a reasoning
+  // model that thinks for minutes before its first output token) — a transient
+  // infrastructure timeout, not a request fault. It arrives as a mid-stream SSE
+  // error after the HTTP response already opened 200, so it reaches here with no
+  // status code and no documented/stable error code to key on, and the
+  // per-provider mapper leaves it at the dead-end, non-retryable Unknown card.
+  // Match the message text and reclassify it as a retryable NetworkError. Scoped
+  // to the Unknown fallback so a more specific provider classification is never
+  // overwritten.
+  if (
+    errorCode === ChatErrorCode.Unknown &&
+    isUpstreamIdleTimeoutError(errorMessage)
+  ) {
+    errorCode = ChatErrorCode.NetworkError;
+  }
+
+  // OpenRouter reports a failure of the inference provider it routed to as
+  // "Upstream error from <provider>: ...". Like the idle timeout above, it can
+  // arrive as a mid-stream SSE error with no status code, leaving the
+  // per-provider mapper at the dead-end, non-retryable Unknown card even
+  // though the condition is a transient provider-side failure. Reclassify it
+  // as a retryable ServerError, again scoped to the Unknown fallback so a more
+  // specific classification is never overwritten.
+  if (
+    errorCode === ChatErrorCode.Unknown &&
+    isUpstreamProviderError(errorMessage)
+  ) {
+    errorCode = ChatErrorCode.ServerError;
+  }
+
+  // A secrets-backend outage surfaces through the provider call as our own
+  // secrets-unavailable message (relayed by the proxy), often with no status
+  // code, landing on the dead-end Unknown card. The underlying incident is
+  // already captured and grouped at its source — classify it as a retryable
+  // ServerError here so the user gets a retry and the relay isn't re-captured.
+  if (
+    errorCode === ChatErrorCode.Unknown &&
+    isSecretsUnavailableMessage(errorMessage)
+  ) {
+    errorCode = ChatErrorCode.ServerError;
+  }
+
+  // Bedrock's InternalServerException arrives mid-stream as the bare message
+  // "Bedrock is unable to process your request." with no status code or typed
+  // body, so the per-provider mapper can't classify it. It's a transient
+  // provider-side failure — retryable ServerError, like any provider 5xx.
+  if (
+    errorCode === ChatErrorCode.Unknown &&
+    isProviderInternalFailureMessage(errorMessage)
+  ) {
+    errorCode = ChatErrorCode.ServerError;
+  }
+
+  // Determine error type from parsed error
+  const errorType =
+    (parsedError as ParsedOpenAIError)?.type ||
+    (parsedError as ParsedAnthropicError)?.type ||
+    (parsedError as ParsedGeminiError)?.status ||
+    (error instanceof Error ? error.name : undefined);
+  const rawErrorJson = stringifyRawError(error);
+
+  // Report only provider errors that suggest a gap on our side (an
+  // unrecognized shape, or an unexpected classification). Client-class 4xx
+  // rejections and transient retryable provider-side conditions (server
+  // errors, rate limits, empty turns, network blips) are expected operational
+  // noise: they're already surfaced to the user, logged below, and don't
+  // indicate a bug.
+  const isExpectedProviderError =
+    (statusCode !== undefined && statusCode >= 400 && statusCode < 500) ||
+    RetryableErrorCodes.has(errorCode);
+
+  if (!isTerminatedStream && !isExpectedProviderError) {
+    captureRawProviderErrorInSentry({
+      provider,
+      statusCode,
+      parsedError,
+      errorCode,
+      errorMessage,
+      errorType,
+      rawErrorJson,
+    });
+  }
+
+  logger.info(
+    {
+      provider,
+      statusCode,
+      parsedError,
+      mappedCode: errorCode,
+      errorMessage,
+      rawErrorJson,
+    },
+    "[ChatErrorMapper] Mapped provider error",
+  );
+
+  const response = createErrorResponse(
+    errorCode,
+    provider,
+    statusCode,
+    isTerminatedStream
+      ? "Upstream provider closed the connection unexpectedly"
+      : errorMessage,
+    errorType,
+    {
+      url: APICallError.isInstance(error)
+        ? (error as InstanceType<typeof APICallError>).url
+        : undefined,
+      statusCode,
+      responseBody,
+      isRetryable: APICallError.isInstance(error)
+        ? (error as InstanceType<typeof APICallError>).isRetryable
+        : undefined,
+    },
+    usageLimitError,
+  );
+
+  if (errorCode === ChatErrorCode.ProviderAuthRequired) {
+    // The upstream message names the exact remedy ("Reconnect your ChatGPT
+    // account…"), so prefer it over the table's generic connect text, and
+    // attach authAction so the UI renders the inline connect/reconnect card.
+    // On credential-level subscription providers (openai, xai) this code is
+    // only ever emitted for the subscription credential mode — a plain API key
+    // never needs a per-user link — so the label must name the subscription
+    // ("ChatGPT Subscription", "SuperGrok"), not the provider.
+    if (errorMessage) {
+      response.message = errorMessage;
+    }
+    const subscriptionKind = subscriptionKindForProvider(provider);
+    response.authAction = {
+      provider,
+      providerLabel: subscriptionKind
+        ? SUBSCRIPTION_CREDENTIALS[subscriptionKind].label
+        : providerDisplayNames[provider],
+    };
+  }
+
+  return response;
+}
+
+// Matches by name rather than DOMException instanceof: the AbortError may be
+// the DOMException Node's AbortController produces, undici's flavor, or an AI
+// SDK re-throw, but all carry name "AbortError". Deliberately excludes
+// "TimeoutError" (AbortSignal.timeout) — a timeout is not a cancellation.
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isStreamTerminatedError(error: unknown): boolean {
+  // Node.js/undici stream termination can surface as a bare Error("terminated")
+  // when an upstream streamed response closes before the AI SDK finishes reading it.
+  return error instanceof Error && error.message === "terminated";
+}
+
+function isUpstreamIdleTimeoutError(message: string): boolean {
+  return /idle timeout/i.test(message);
+}
+
+function isUpstreamProviderError(message: string): boolean {
+  return /^upstream error from /i.test(message);
+}
+
+// `includes` rather than equality: the message may pick up envelope prefixes
+// on its way through the proxy, but the secrets-manager text and internal code
+// slug are stable constants.
+function isSecretsUnavailableMessage(message: string): boolean {
+  return (
+    message.includes("An error occurred while accessing secrets") ||
+    message.includes(SECRETS_MANAGER_UNAVAILABLE_INTERNAL_CODE)
+  );
+}
+
+function isProviderInternalFailureMessage(message: string): boolean {
+  return message.includes("unable to process your request");
+}
+
+/**
+ * Extract the active OpenTelemetry trace/span IDs from the current context.
+ * Returns an object with traceId and spanId if available.
+ */
+export function getActiveTraceContext(): {
+  sessionId?: string;
+  traceId?: string;
+  spanId?: string;
+} {
+  const span = trace.getSpan(otelContext.active());
+  const sessionId = getActiveSessionId();
+  if (!span) return sessionId ? { sessionId } : {};
+
+  const spanContext = span.spanContext();
+  if (!isSpanContextValid(spanContext)) {
+    return sessionId ? { sessionId } : {};
+  }
+
+  return {
+    sessionId,
+    traceId: spanContext.traceId,
+    spanId: spanContext.spanId,
+  };
+}
+
+/**
+ * Strip provider/internal error details from the frontend payload while
+ * preserving the user-safe message and correlation IDs for log lookup.
+ */
+export function sanitizeChatErrorForFrontend(
+  error: ChatErrorResponse,
+): ChatErrorResponse {
+  const sanitized: ChatErrorResponse = {
+    code: error.code,
+    message: error.message,
+    isRetryable: error.isRetryable,
+    sessionId: error.sessionId,
+    traceId: error.traceId,
+    spanId: error.spanId,
+  };
+  if (error.usageLimitExceeded) {
+    sanitized.usageLimitExceeded = true;
+    sanitized.usageLimitEntityType = error.usageLimitEntityType;
+  }
+  // Preserve the connect-account action so the inline "Connect <provider>" card
+  // still renders in slim chat error mode. It carries no secrets — only the
+  // provider name and label.
+  if (error.authAction) {
+    sanitized.authAction = error.authAction;
+  }
+  return sanitized;
+}
+
+function formatUsageLimitMessage(entityType: string | undefined): string {
+  // Named under the deployment's own brand: this reaches the end user, and the
+  // whole point of the sentence is attributing the block to the platform rather
+  // than the AI provider.
+  const appName = archestraMcpBranding.appName;
+  if (!entityType) {
+    return `${appName} blocked this request because a configured usage limit has been reached.`;
+  }
+  return `${appName} blocked this request because the ${entityType.replace(
+    /_/g,
+    " ",
+  )} usage limit has been reached.`;
+}

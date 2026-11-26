@@ -1,0 +1,42 @@
+/**
+ * DeepSeek LLM Proxy Adapter - OpenAI-compatible
+ *
+ * DeepSeek uses an OpenAI-compatible API (with optional extras like
+ * reasoning_content), so the whole adapter is OpenAI's, configured for
+ * DeepSeek via createOpenAiCompatibleAdapterFactory.
+ *
+ * @see https://api-docs.deepseek.com/api/create-chat-completion
+ */
+import OpenAIProvider from "openai";
+import config from "@/config";
+import { metrics } from "@/observability";
+import type { CreateClientOptions } from "@/types";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { createOpenAiCompatibleAdapterFactory } from "./openai-compatible-adapter";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+
+export const deepseekAdapterFactory = createOpenAiCompatibleAdapterFactory({
+  provider: "deepseek",
+  interactionType: "deepseek:chatCompletions",
+  getBaseUrl: () => config.llm.deepseek.baseUrl,
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): OpenAIProvider {
+    const customFetch = options.agent
+      ? metrics.llm.getObservableFetch(
+          "deepseek",
+          options.agent,
+          options.source,
+        )
+      : undefined;
+
+    return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      apiKey,
+      baseURL: options.baseUrl ?? config.llm.deepseek.baseUrl,
+      fetch: fetchWithAbortSignal(customFetch, options.abortSignal),
+      defaultHeaders: options.defaultHeaders,
+    });
+  },
+});

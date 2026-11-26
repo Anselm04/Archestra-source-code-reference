@@ -1,0 +1,81 @@
+import { cva, type VariantProps } from "class-variance-authority";
+import type * as React from "react";
+
+import { cn } from "@/lib/utils/tailwind";
+
+/**
+ * A page-level banner: its own row on the page, with a heading and a body that
+ * can run to several sentences or carry its own links and lists.
+ *
+ * For a notice *about the surface it sits on* — a form that could not reach a
+ * repository, a composer whose agent is missing a connection, a read-only
+ * panel — render `<InlineNotice>` instead. Inside a form or a dialog this
+ * component's padding dwarfs the controls it is talking about, which is how
+ * the app ended up with a dozen hand-rolled slim copies of it.
+ */
+const alertVariants = cva(
+  "relative w-full rounded-lg border px-4 py-3 text-sm grid has-[>svg]:grid-cols-[calc(var(--spacing)*4)_1fr] grid-cols-[0_1fr] has-[>svg]:gap-x-3 gap-y-0.5 items-start [&>svg]:size-4 [&>svg]:translate-y-0.5 [&>svg]:text-current",
+  {
+    variants: {
+      variant: {
+        default: "bg-card text-card-foreground",
+        destructive:
+          "text-destructive bg-card [&>svg]:text-current *:data-[slot=alert-description]:text-destructive/90",
+        error:
+          "border-red-500/50 bg-red-50 text-red-900 dark:border-red-500/40 dark:bg-red-950/50 dark:text-red-200 [&>svg]:text-red-600 dark:[&>svg]:text-red-400 *:data-[slot=alert-description]:text-red-800 dark:*:data-[slot=alert-description]:text-red-300",
+        warning:
+          "border-[#EBCB8B] bg-[#FFFAEE] text-[#6A3E0E] dark:border-amber-500/30 dark:bg-amber-950/50 dark:text-amber-200 [&>svg]:text-[#A25E07] dark:[&>svg]:text-amber-400 *:data-[slot=alert-description]:text-[#8A5A1C] dark:*:data-[slot=alert-description]:text-amber-300",
+        info: "border-blue-500/50 bg-blue-50 text-blue-900 dark:border-blue-500/30 dark:bg-blue-950/50 dark:text-blue-200 [&>svg]:text-blue-600 dark:[&>svg]:text-blue-400 *:data-[slot=alert-description]:text-blue-800 dark:*:data-[slot=alert-description]:text-blue-300",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  },
+);
+
+function Alert({
+  className,
+  variant,
+  ...props
+}: React.ComponentProps<"div"> & VariantProps<typeof alertVariants>) {
+  return (
+    <div
+      data-slot="alert"
+      role="alert"
+      className={cn(alertVariants({ variant }), className)}
+      {...props}
+    />
+  );
+}
+
+function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="alert-title"
+      className={cn(
+        "col-start-2 line-clamp-1 min-h-4 font-medium tracking-tight",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+function AlertDescription({
+  className,
+  ...props
+}: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="alert-description"
+      className={cn(
+        "text-muted-foreground col-start-2 grid justify-items-start gap-1 text-sm [&_p]:leading-relaxed",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+export { Alert, AlertTitle, AlertDescription };

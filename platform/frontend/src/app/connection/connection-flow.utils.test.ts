@@ -1,0 +1,194 @@
+// @vitest-environment node
+import {
+  EMBEDDING_ONLY_PROVIDERS,
+  providerSupportsChat,
+  SupportedProviders,
+} from "@archestra/shared";
+import { describe, expect, it } from "vitest";
+import {
+  getConnectableProviders,
+  resolveEffectiveId,
+  resolveInitialClientId,
+} from "./connection-flow.utils";
+
+const baseParams = {
+  selected: null,
+  fromUrl: null,
+  adminDefault: null,
+  systemDefault: null,
+  firstAvailable: null,
+  skipAdminDefault: false,
+};
+
+describe("resolveEffectiveId", () => {
+  it("returns the user's selection first, ignoring everything else", () => {
+    expect(
+      resolveEffectiveId({
+        ...baseParams,
+        selected: "user-pick",
+        fromUrl: "url-id",
+        adminDefault: "admin-id",
+        systemDefault: "system-id",
+        firstAvailable: "first-id",
+      }),
+    ).toBe("user-pick");
+  });
+
+  it("falls back to the URL param when nothing is selected", () => {
+    expect(
+      resolveEffectiveId({
+        ...baseParams,
+        fromUrl: "url-id",
+        adminDefault: "admin-id",
+      }),
+    ).toBe("url-id");
+  });
+
+  it("falls back to the admin default when selection and URL are empty", () => {
+    expect(
+      resolveEffectiveId({
+        ...baseParams,
+        adminDefault: "admin-id",
+        systemDefault: "system-id",
+      }),
+    ).toBe("admin-id");
+  });
+
+  it("skips the admin default when skipAdminDefault is true", () => {
+    expect(
+      resolveEffectiveId({
+        ...baseParams,
+        adminDefault: "admin-id",
+        systemDefault: "system-id",
+        skipAdminDefault: true,
+      }),
+    ).toBe("system-id");
+  });
+
+  it("does not skip the URL param even when skipAdminDefault is true", () => {
+    expect(
+      resolveEffectiveId({
+        ...baseParams,
+        fromUrl: "url-id",
+        adminDefault: "admin-id",
+        skipAdminDefault: true,
+      }),
+    ).toBe("url-id");
+  });
+
+  it("falls through to systemDefault when adminDefault is null", () => {
+    expect(
+      resolveEffectiveId({ ...baseParams, systemDefault: "system-id" }),
+    ).toBe("system-id");
+  });
+
+  it("falls through to firstAvailable when everything else is empty", () => {
+    expect(
+      resolveEffectiveId({ ...baseParams, firstAvailable: "first-id" }),
+    ).toBe("first-id");
+  });
+
+  it("returns null when nothing is available", () => {
+    expect(resolveEffectiveId(baseParams)).toBeNull();
+  });
+
+  it("treats undefined the same as null for optional slots", () => {
+    expect(
+      resolveEffectiveId({
+        ...baseParams,
+        adminDefault: undefined,
+        systemDefault: undefined,
+        firstAvailable: "first-id",
+      }),
+    ).toBe("first-id");
+  });
+});
+
+describe("resolveInitialClientId", () => {
+  const visibleClientIds = ["claude-code", "cursor", "generic"] as const;
+
+  it("falls back to the first visible client when nothing else is specified", () => {
+    expect(
+      resolveInitialClientId({
+        urlClientId: null,
+        adminDefaultClientId: null,
+        visibleClientIds,
+      }),
+    ).toBe("claude-code");
+  });
+
+  it("returns null when no clients are visible at all", () => {
+    expect(
+      resolveInitialClientId({
+        urlClientId: null,
+        adminDefaultClientId: null,
+        visibleClientIds: [],
+      }),
+    ).toBeNull();
+  });
+
+  it("picks the admin default when no URL param is set", () => {
+    expect(
+      resolveInitialClientId({
+        urlClientId: null,
+        adminDefaultClientId: "cursor",
+        visibleClientIds,
+      }),
+    ).toBe("cursor");
+  });
+
+  it("lets the URL param override the admin default", () => {
+    expect(
+      resolveInitialClientId({
+        urlClientId: "claude-code",
+        adminDefaultClientId: "cursor",
+        visibleClientIds,
+      }),
+    ).toBe("claude-code");
+  });
+
+  it("ignores a URL param that isn't a visible client", () => {
+    expect(
+      resolveInitialClientId({
+        urlClientId: "unknown-client",
+        adminDefaultClientId: "cursor",
+        visibleClientIds,
+      }),
+    ).toBe("cursor");
+  });
+
+  it("falls back to the first visible client when the admin default isn't visible", () => {
+    expect(
+      resolveInitialClientId({
+        urlClientId: null,
+        adminDefaultClientId: "hidden-client",
+        visibleClientIds,
+      }),
+    ).toBe("claude-code");
+  });
+});
+
+describe("getConnectableProviders", () => {
+  it("offers every chat provider when the deployment has switched none off", () => {
+    expect(getConnectableProviders({ modelProviderOverrides: null })).toEqual(
+      SupportedProviders.filter(providerSupportsChat),
+    );
+  });
+
+  it("never offers an embeddings-only provider, which has no chat endpoint", () => {
+    const providers = getConnectableProviders({ modelProviderOverrides: null });
+    for (const provider of EMBEDDING_ONLY_PROVIDERS) {
+      expect(providers).not.toContain(provider);
+    }
+    // Guards the assertion above against silently passing on an empty set.
+    expect(EMBEDDING_ONLY_PROVIDERS.size).toBeGreaterThan(0);
+  });
+
+  it("drops the providers the deployment switched off", () => {
+    const providers = getConnectableProviders({
+      modelProviderOverrides: { anthropic: { hidden: true } },
+    });
+    expect(providers).not.toContain("anthropic");
+    expect(providers).toContain("openai");
+  });
+});

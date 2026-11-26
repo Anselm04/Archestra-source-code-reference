@@ -1,0 +1,310 @@
+import { archestraApiClient, type archestraApiTypes } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
+import { setupServer } from "msw/node";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
+import { organizationKeys } from "@/lib/organization.query";
+import { ClaudeCodeAccount } from "./claude-code-account";
+
+const origin = "http://localhost:9000";
+const accountUrl = `${origin}/api/agents/agent-1/runtime/claude-code/account`;
+const server = setupServer();
+let queryClient: QueryClient;
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterAll(() => {
+  server.close();
+  archestraApiClient.setConfig({ baseUrl: "" });
+});
+afterEach(() => {
+  server.resetHandlers();
+  queryClient.clear();
+});
+beforeEach(() => {
+  queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  archestraApiClient.setConfig({ baseUrl: origin });
+});
+
+describe("ClaudeCodeAccount setup", () => {
+  it.each([
+    "row",
+    "compact",
+  ] as const)("takes an unconnected user from %s status straight to native sign-in", async (variant) => {
+    const user = userEvent.setup();
+    let started = false;
+    const status = () =>
+      started
+        ? {
+            state: "awaiting_code",
+            flowId: "flow-1",
+            authorizationUrl: "https://claude.ai/oauth/authorize",
+          }
+        : { state: "disconnected" };
+    server.use(
+      http.get(accountUrl, () => HttpResponse.json(status())),
+      http.post(accountUrl, () => {
+        started = true;
+        return HttpResponse.json(status());
+      }),
+    );
+    renderAccount(variant);
+
+    expect(await screen.findByText(SIGN_IN_STATUS[variant])).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(
+      screen.getByRole("dialog", { name: "Connect Claude Code" }),
+    ).toBeVisible();
+
+    // The click that opened the dialog already started the flow.
+    expect(
+      await screen.findByRole("link", { name: "Open Claude" }),
+    ).toHaveAttribute("href", "https://claude.ai/oauth/authorize");
+    expect(
+      screen.queryByRole("button", { name: "Sign in with Claude" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Authorization code")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Complete sign-in" }),
+    ).toBeDisabled();
+  });
+
+  it.each([
+    "row",
+    "compact",
+  ] as const)("lets an already-connected user manage their %s account without asking them to sign in again", async (variant) => {
+    const user = userEvent.setup();
+    server.use(
+      http.get(accountUrl, () => HttpResponse.json({ state: "connected" })),
+    );
+    renderAccount(variant);
+
+    expect(await screen.findByText("Signed in for you")).toBeVisible();
+    if (variant === "compact") {
+      expect(screen.getByRole("status")).toHaveTextContent("Signed in for you");
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText(SIGN_IN_STATUS[variant])).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Manage" }));
+    expect(
+      screen.getByRole("dialog", { name: "Claude Code account" }),
+    ).toBeVisible();
+    expect(screen.getByText("Connected for you")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Disconnect" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: "Sign in with Claude" }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+const SIGN_IN_STATUS = {
+  row: "Sign in once for all your Claude Code agents.",
+  compact: "Sign in to use this agent.",
+};
+
+function renderAccount(variant: "row" | "compact" = "row") {
+  render(
+    <QueryClientProvider client={queryClient}>
+      <ClaudeCodeAccount agentId="agent-1" variant={variant} />
+    </QueryClientProvider>,
+  );
+}
+
+it("starts a fresh sign-in after a failed one and exposes the authorization link", async () => {
+  const user = userEvent.setup();
+  let account: archestraApiTypes.GetClaudeCodeAccountResponses["200"] = {
+    state: "failed",
+  };
+  server.use(
+    http.get(accountUrl, () => HttpResponse.json(account)),
+    http.post(accountUrl, () => {
+      account = {
+        state: "awaiting_code",
+        flowId: "00000000-0000-4000-8000-000000000001",
+        authorizationUrl: "https://claude.ai/oauth/authorize?state=test",
+      };
+      return HttpResponse.json(account);
+    }),
+  );
+  renderAccount();
+  await user.click(await screen.findByRole("button", { name: "Sign in" }));
+  expect(
+    await screen.findByRole("link", { name: "Open Claude" }),
+  ).toHaveAttribute("href", account.authorizationUrl);
+  expect(screen.getByLabelText("Authorization code")).toBeVisible();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("updates every Agent after connecting and disconnecting the shared account", async () => {
+  const user = userEvent.setup();
+  let account: archestraApiTypes.GetClaudeCodeAccountResponses["200"] = {
+    state: "disconnected",
+  };
+  const url = `${origin}/api/agents/:id/runtime/claude-code/account`;
+  server.use(
+    http.get(url, () => HttpResponse.json(account)),
+    http.post(url, () => {
+      account = {
+        state: "awaiting_code",
+        flowId: "00000000-0000-4000-8000-000000000001",
+        authorizationUrl: "https://claude.ai/oauth/authorize",
+      };
+      return HttpResponse.json(account);
+    }),
+    http.delete(url, () => {
+      account = { state: "disconnected" };
+      return HttpResponse.json(account);
+    }),
+    http.post(`${url}/complete`, () => {
+      account = { state: "connected" };
+      return HttpResponse.json(account);
+    }),
+  );
+  render(
+    <QueryClientProvider client={queryClient}>
+      <ClaudeCodeAccount agentId="agent-1" variant="row" />
+      <ClaudeCodeAccount agentId="agent-2" variant="row" />
+    </QueryClientProvider>,
+  );
+  await user.click(
+    (await screen.findAllByRole("button", { name: "Sign in" }))[0],
+  );
+  await user.type(
+    await screen.findByLabelText("Authorization code"),
+    "example-code",
+  );
+  await user.click(screen.getByRole("button", { name: "Complete sign-in" }));
+  expect(await screen.findAllByText("Signed in for you")).toHaveLength(2);
+  expect(
+    screen.queryByText("Sign in once for all your Claude Code agents."),
+  ).not.toBeInTheDocument();
+  await user.click(screen.getAllByRole("button", { name: "Manage" })[1]);
+  await user.click(screen.getByRole("button", { name: "Disconnect" }));
+  expect(
+    await screen.findAllByText("Sign in once for all your Claude Code agents."),
+  ).toHaveLength(2);
+  expect(screen.queryByText("Signed in for you")).not.toBeInTheDocument();
+});
+
+it("signs in where it sits when inline, without opening a second dialog", async () => {
+  const user = userEvent.setup();
+  let account: archestraApiTypes.GetClaudeCodeAccountResponses["200"] = {
+    state: "disconnected",
+  };
+  server.use(
+    http.get(accountUrl, () => HttpResponse.json(account)),
+    http.post(accountUrl, () => {
+      account = {
+        state: "awaiting_code",
+        flowId: "00000000-0000-4000-8000-000000000001",
+        authorizationUrl: "https://claude.ai/oauth/authorize",
+      };
+      return HttpResponse.json(account);
+    }),
+    http.post(`${accountUrl}/complete`, () => {
+      account = { state: "connected" };
+      return HttpResponse.json(account);
+    }),
+  );
+  render(
+    <QueryClientProvider client={queryClient}>
+      <ClaudeCodeAccount agentId="agent-1" variant="inline" />
+    </QueryClientProvider>,
+  );
+
+  await user.click(
+    await screen.findByRole("button", { name: "Sign in with Claude" }),
+  );
+  expect(
+    await screen.findByRole("link", { name: "Open Claude" }),
+  ).toBeVisible();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  await user.type(screen.getByLabelText("Authorization code"), "example-code");
+  await user.click(screen.getByRole("button", { name: "Connect" }));
+  expect(await screen.findByText("Signed in for you")).toBeVisible();
+});
+
+it("finishes an asynchronous token flow without resubmitting the authorization code", async () => {
+  const user = userEvent.setup();
+  const flowId = "00000000-0000-4000-8000-000000000001";
+  let connected = false;
+  let polls = 0;
+  server.use(
+    http.get(accountUrl, () =>
+      HttpResponse.json(
+        connected ? { state: "connected" } : { state: "connecting", flowId },
+      ),
+    ),
+    http.post(`${accountUrl}/complete`, async ({ request }) => {
+      expect(await request.json()).toEqual({ flowId });
+      polls++;
+      connected = true;
+      return HttpResponse.json({ state: "connected" });
+    }),
+  );
+  renderAccount("compact");
+  await screen.findByText("Sign in to use this agent.");
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
+  await screen.findByText("Signed in for you", {}, { timeout: 5000 });
+  expect(polls).toBe(1);
+  await waitFor(() =>
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+  );
+});
+
+it("says the account could not be checked instead of offering a sign-in that cannot start", async () => {
+  const user = userEvent.setup();
+  server.use(
+    http.get(accountUrl, () =>
+      HttpResponse.json(
+        { error: { message: "Runtime unavailable" } },
+        { status: 503 },
+      ),
+    ),
+    http.post(accountUrl, () =>
+      HttpResponse.json(
+        { error: { message: "Runtime unavailable" } },
+        { status: 503 },
+      ),
+    ),
+  );
+  renderAccount("compact");
+  await screen.findByText("Could not check connection");
+  await user.click(screen.getByRole("button", { name: "Sign in" }));
+  await screen.findByText("Could not check Claude Code");
+  expect(
+    screen.queryByRole("button", { name: "Sign in with Claude" }),
+  ).not.toBeInTheDocument();
+});
+
+it("offers no new sign-in once Claude Code is turned off, and says so in plain words", async () => {
+  server.use(
+    http.get(accountUrl, () => HttpResponse.json({ state: "disconnected" })),
+  );
+  queryClient.setQueryData(organizationKeys.details(), {
+    modelProviderOverrides: {
+      anthropic: { plans: { personal: { hidden: true } } },
+    },
+  });
+  renderAccount("compact");
+
+  expect(
+    await screen.findByText(
+      "Claude Code is turned off for this organization. Ask an administrator to turn it on under Settings → LLM → Model providers.",
+    ),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Sign in" }),
+  ).not.toBeInTheDocument();
+});

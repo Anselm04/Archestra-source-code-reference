@@ -1,0 +1,168 @@
+import {
+  INTERACTION_SOURCE_DISPLAY,
+  type InteractionSource,
+} from "@archestra/shared";
+import {
+  CalendarClock,
+  Database,
+  Globe,
+  LayoutGrid,
+  Mail,
+  Minimize2,
+  Route,
+  ShieldCheck,
+  Sparkles,
+  Type,
+  Wrench,
+} from "lucide-react";
+import Image from "next/image";
+import type { ReactNode } from "react";
+import { Badge } from "@/components/ui/badge";
+import { useAppIconLogo } from "@/lib/hooks/use-app-name";
+import { cn } from "@/lib/utils/tailwind";
+
+export function SourceIcon({
+  source,
+}: {
+  source: InteractionSource | null | undefined;
+}) {
+  const appIconLogo = useAppIconLogo();
+
+  if (!source) return null;
+
+  return getSourceIcon({
+    source,
+    chatIconLogo: appIconLogo,
+  });
+}
+
+export function SourceLabel({
+  source,
+  className,
+}: {
+  source: InteractionSource | null | undefined;
+  className?: string;
+}) {
+  if (!source) return null;
+
+  const display = INTERACTION_SOURCE_DISPLAY[source];
+
+  return (
+    <span className={cn("flex min-w-0 items-center gap-1.5", className)}>
+      <SourceIcon source={source} />
+      <span className="truncate">{display.label}</span>
+    </span>
+  );
+}
+
+export function SourceBadge({
+  source,
+  className,
+  labelClassName,
+}: {
+  source: InteractionSource | null | undefined;
+  className?: string;
+  labelClassName?: string;
+}) {
+  if (!source) return null;
+
+  return (
+    <Badge variant="outline" className={cn("max-w-full text-xs", className)}>
+      <SourceLabel
+        source={source}
+        className={cn("max-w-full", labelClassName)}
+      />
+    </Badge>
+  );
+}
+
+function getSourceIcon({
+  source,
+  chatIconLogo,
+}: {
+  source: InteractionSource;
+  chatIconLogo: string;
+}): ReactNode {
+  if (source === "chat") {
+    return (
+      <Image
+        src={chatIconLogo}
+        alt="Chat"
+        width={12}
+        height={12}
+        className="shrink-0 rounded-sm"
+      />
+    );
+  }
+
+  const sourceIcon: Record<Exclude<InteractionSource, "chat">, ReactNode> = {
+    api: <Globe className="h-3 w-3 shrink-0" />,
+    model_router: <Route className="h-3 w-3 shrink-0" />,
+    "opencode:main": <Route className="h-3 w-3 shrink-0" />,
+    "opencode:subagent": <Sparkles className="h-3 w-3 shrink-0" />,
+    "opencode:title": <Type className="h-3 w-3 shrink-0" />,
+    "opencode:compaction": <Minimize2 className="h-3 w-3 shrink-0" />,
+    "kilo:main": <Route className="h-3 w-3 shrink-0" />,
+    "kilo:subagent": <Sparkles className="h-3 w-3 shrink-0" />,
+    "kilo:title": <Type className="h-3 w-3 shrink-0" />,
+    "kilo:compaction": <Minimize2 className="h-3 w-3 shrink-0" />,
+    "chat:compaction": <Minimize2 className="h-3 w-3 shrink-0" />,
+    "a2a:compaction": <Minimize2 className="h-3 w-3 shrink-0" />,
+    "chat:title_generation": <Type className="h-3 w-3 shrink-0" />,
+    "chat:tool_call_repair": <Wrench className="h-3 w-3 shrink-0" />,
+    "a2a:tool_call_repair": <Wrench className="h-3 w-3 shrink-0" />,
+    "skill:description_generation": <Sparkles className="h-3 w-3 shrink-0" />,
+    "guardrail:dual_llm": <ShieldCheck className="h-3 w-3 shrink-0" />,
+    "guardrail:annotator": <ShieldCheck className="h-3 w-3 shrink-0" />,
+    "guardrail:sanitizer": <ShieldCheck className="h-3 w-3 shrink-0" />,
+    "guardrail:hitl_summary": <ShieldCheck className="h-3 w-3 shrink-0" />,
+    "chatops:slack": (
+      <Image
+        src="/icons/slack.png"
+        alt="Slack"
+        width={12}
+        height={12}
+        className="shrink-0 rounded-sm"
+      />
+    ),
+    "chatops:ms-teams": (
+      <Image
+        src="/icons/ms-teams.png"
+        alt="MS Teams"
+        width={12}
+        height={12}
+        className="shrink-0 rounded-sm"
+      />
+    ),
+    "chatops:telegram": (
+      <Image
+        src="/icons/telegram.png"
+        alt="Telegram"
+        width={12}
+        height={12}
+        className="shrink-0 rounded-sm"
+      />
+    ),
+    "chatops:jira": (
+      <Image
+        src="/icons/jira.png"
+        alt="Jira"
+        width={12}
+        height={12}
+        className="shrink-0 rounded-sm"
+      />
+    ),
+    email: <Mail className="h-3 w-3 shrink-0" />,
+    "schedule-trigger": <CalendarClock className="h-3 w-3 shrink-0" />,
+    "knowledge:embedding": <Database className="h-3 w-3 shrink-0" />,
+    "knowledge:reranker": <Database className="h-3 w-3 shrink-0" />,
+    "knowledge:query-expansion": <Database className="h-3 w-3 shrink-0" />,
+    "knowledge:contextual-retrieval": <Database className="h-3 w-3 shrink-0" />,
+    "knowledge:ocr": <Database className="h-3 w-3 shrink-0" />,
+    "app:llm_complete": <LayoutGrid className="h-3 w-3 shrink-0" />,
+    "app:recording_enhancement": <Sparkles className="h-3 w-3 shrink-0" />,
+    "tool_search_text:generation": <Sparkles className="h-3 w-3 shrink-0" />,
+  };
+
+  return sourceIcon[source];
+}

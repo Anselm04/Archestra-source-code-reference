@@ -1,0 +1,133 @@
+import { WEBSITE_URL } from "./consts";
+
+export function getDocsBaseUrl(): string {
+  if (typeof process !== "undefined" && process.env) {
+    const customDocsUrl =
+      process.env.NEXT_PUBLIC_ARCHESTRA_DOCS_URL ||
+      process.env.ARCHESTRA_DOCS_URL;
+    if (customDocsUrl) {
+      return customDocsUrl.replace(/\/+$/, "");
+    }
+    const websiteUrl = process.env.NEXT_PUBLIC_WEBSITE_URL;
+    if (websiteUrl) {
+      const base = websiteUrl.replace(/\/+$/, "");
+      return base.endsWith("/docs") ? base : `${base}/docs`;
+    }
+    if (process.env.NODE_ENV === "test" || process.env.VITEST) {
+      return `${WEBSITE_URL}/docs`;
+    }
+  }
+
+  if (typeof window !== "undefined" && window.location) {
+    const host = window.location.hostname || "";
+    if (host.startsWith("stack") && host.includes(".localhost")) {
+      const port =
+        (typeof process !== "undefined" &&
+          process.env?.NEXT_PUBLIC_ARCHESTRA_DOCS_PORT) ||
+        `305${host.replace(/^stack(\d+)\..*/, "$1")}`;
+      return `${window.location.protocol}//${host}:${port}/docs`;
+    }
+  }
+
+  return `${WEBSITE_URL}/docs`;
+}
+
+export const COMMUNITY_DOCS_URL = getDocsUrl("get-started");
+
+/**
+ * All valid documentation page slugs.
+ * Keep this in sync with docs/pages/*.md file names (without .md extension).
+ */
+export const DocsPage = {
+  Contributing: "contributing",
+  McpAuthentication: "mcp/authentication",
+  McpIdpTokenExchange: "mcp/authentication/idp-token-exchange",
+  McpGatewayAuthentication: "mcp/authentication/gateway",
+  Security: "contributing",
+  // Platform
+  PlatformAccessControl: "admin/access-control",
+  PlatformAddingLlmProviders: "contributing/extending-archestra",
+  PlatformAgentTriggersEmail: "agents/triggers-and-channels/email",
+  PlatformAgentTriggersWebhookA2a: "agents/triggers-and-channels/webhook-a2a",
+  PlatformAgentHooks: "agents/hooks",
+  PlatformAgentRuntime: "agents/runtime",
+  PlatformAgentRuntimeSetup: "agents/runtime/setup",
+  PlatformCredentials: "admin/credentials",
+  PlatformAgents: "agents",
+  PlatformApps: "chat/apps",
+  PlatformArchestraMcpServer: "reference/archestra-mcp-server",
+  PlatformApiReference: "reference/api",
+  PlatformBlobProviders: "admin/blob-providers",
+  PlatformBuiltInSubagents: "agents/subagents/built-in",
+  PlatformChat: "chat",
+  PlatformClaudeCodeExample: "integrations/ai-clients/claude-code",
+  PlatformClaudeDesktopExample: "integrations/ai-clients/claude-desktop",
+  PlatformConnection: "get-started/connect",
+  PlatformCostExports: "llm-proxy/cost-controls/exports",
+  PlatformCostsAndLimits: "llm-proxy/cost-controls",
+  PlatformDeployment: "admin/deployment",
+  PlatformDeploymentConfiguration: "admin/deployment/configuration",
+  PlatformDeploymentNetworking: "admin/deployment/networking",
+  PlatformDeveloperQuickstart: "contributing/developer-quickstart",
+  PlatformAiToolGuardrails: "agents/guardrails",
+  PlatformAiToolGuardrailsClients: "agents/guardrails/clients",
+  PlatformAiToolGuardrailsGitSync: "agents/guardrails/git-sync",
+  PlatformAiToolGuardrailsPolicies: "agents/guardrails/policies",
+  PlatformEnterpriseManagedAuth: "admin/identity/sso",
+  PlatformAgentIdentity: "agents/identity",
+  PlatformAgentIdentityActorTokens: "agents/identity/actor-tokens",
+  PlatformAgentIdentityOkta: "agents/identity/okta",
+  PlatformAgentIdentitySpiffe: "agents/identity/spiffe",
+  PlatformEntraAgentId: "agents/identity/entra",
+  PlatformEnvironments: "admin/environments",
+  PlatformFoundry: "integrations/ai-clients/foundry",
+  PlatformIdentityProviders: "admin/identity",
+  PlatformWorkloadIdentity: "admin/identity/workload-identity",
+  PlatformJira: "agents/triggers-and-channels/jira",
+  PlatformKnowledge: "knowledge",
+  PlatformKnowledgeConnectors: "knowledge/connectors",
+  PlatformKnowledgeSettings: "knowledge/settings",
+  PlatformLlmProxyAuthentication: "llm-proxy/authentication",
+  PlatformLlmProxyAutoRouting: "llm-proxy/auto-routing",
+  PlatformLlmProxy: "llm-proxy",
+  PlatformLlmProxyModelPools: "llm-proxy/model-pools",
+  PlatformMastraExample: "integrations/sdks-and-frameworks",
+  PlatformMcpGateway: "mcp/gateway",
+  PlatformMigrateYourAgents: "agents/migrate-from-openclaw",
+  PlatformMsTeams: "agents/triggers-and-channels/ms-teams",
+  PlatformN8nExample: "integrations/web-ui-and-automation",
+  PlatformObservability: "admin/observability",
+  PlatformObservabilityMetrics: "admin/observability/metrics",
+  PlatformOpenwebuiExample: "integrations/web-ui-and-automation",
+  PlatformOrchestrator: "mcp/servers",
+  PlatformOverview: "get-started",
+  PlatformPerformanceBenchmarks: "admin/observability",
+  PlatformTwoFactorAuthentication: "admin/identity/account-security",
+  PlatformPrivateRegistry: "mcp/servers",
+  PlatformProjects: "chat/projects",
+  PlatformPydanticExample: "integrations/sdks-and-frameworks",
+  PlatformQuickstart: "get-started",
+  PlatformResetUserPassword: "admin/identity/account-security",
+  PlatformSecretsManagement: "admin/deployment/secret-storage",
+  PlatformSecurityContentEncryption: "admin/content-encryption",
+  PlatformSlack: "agents/triggers-and-channels/slack",
+  PlatformSsoRoleMapping: "admin/identity/sso",
+  PlatformSsoTeamSync: "admin/identity/sso",
+  PlatformTelegram: "agents/triggers-and-channels/telegram",
+  PlatformSupportedLlmProviders: "llm-proxy/providers",
+  PlatformVercelAiExample: "integrations/sdks-and-frameworks",
+} as const;
+
+export type DocsPage = (typeof DocsPage)[keyof typeof DocsPage];
+
+/**
+ * Construct a full documentation URL for a given page slug and optional anchor.
+ *
+ * @example
+ * getDocsUrl(DocsPage.PlatformAgents) // "https://archestra.ai/docs/agents"
+ * getDocsUrl(DocsPage.PlatformSupportedLlmProviders, "using-vertex-ai") // "https://archestra.ai/docs/llm-proxy/providers#using-vertex-ai"
+ */
+export function getDocsUrl(page: DocsPage | string, anchor?: string): string {
+  const url = `${getDocsBaseUrl()}/${page}`;
+  return anchor ? `${url}#${anchor}` : url;
+}

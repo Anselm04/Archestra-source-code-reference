@@ -1,0 +1,1697 @@
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createCerebras } from "@ai-sdk/cerebras";
+import { createCohere } from "@ai-sdk/cohere";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createVertex } from "@ai-sdk/google-vertex";
+import { createGroq } from "@ai-sdk/groq";
+import { createMistral } from "@ai-sdk/mistral";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { createXai } from "@ai-sdk/xai";
+import type { InteractionSource } from "@archestra/shared";
+import {
+  APP_ID_HEADER,
+  APPA_PARENT_HEADER,
+  APPA_SESSION_HEADER,
+  AUTO_ROUTER_ID_HEADER,
+  anthropicThinksByDefault,
+  CHAT_API_KEY_ID_HEADER,
+  EXTERNAL_AGENT_ID_HEADER,
+  getBedrockReasoningFamily,
+  isProviderApiKeyOptional,
+  LOOPBACK_HOST,
+  MODEL_POOL_ID_HEADER,
+  PROVIDER_BASE_URL_HEADER,
+  perplexityAgentApiBaseUrl,
+  providerDisplayNames,
+  providerHasMultipleSurfaces,
+  providerRequiresPerUserCredential,
+  requiresOpenAiResponsesApi,
+  requiresPerplexityAgentApi,
+  requiresResponsesApi,
+  SESSION_ID_HEADER,
+  SOURCE_HEADER,
+  SUBSCRIPTION_CREDENTIALS,
+  type SupportedProvider,
+  type SupportedProviderEndpoint,
+  subscriptionKindFromCredential,
+  UNATTENDED_HEADER,
+  USER_ID_HEADER,
+} from "@archestra/shared";
+import {
+  type AzureModelEvidence,
+  isAzureAnthropicBackingModel,
+} from "@archestra/shared/azure-models";
+import { context, propagation } from "@opentelemetry/api";
+import {
+  extractReasoningMiddleware,
+  type streamText,
+  wrapLanguageModel,
+} from "ai";
+import { createOllama } from "ollama-ai-provider-v2";
+import {
+  isServiceAccountUserId,
+  serviceAccountIdFromUserId,
+} from "@/auth/service-account-user-id";
+import { isAnthropicNativeEndpoint } from "@/clients/anthropic-endpoint";
+import { isAnthropicKeylessAuthEnabled } from "@/clients/anthropic-keyless-auth";
+import { anthropicVertexClient } from "@/clients/anthropic-vertex";
+import { createAzureMediaLanguageModel } from "@/clients/azure-media-language-model";
+import { isAzureOpenAiEntraIdEnabled } from "@/clients/azure-openai-credentials";
+import {
+  buildAzureDeploymentBaseUrl,
+  buildAzureResponsesBaseUrl,
+  createAzureFetchWithApiVersion,
+  isAzureOpenAiFirstPartyModelName,
+  normalizeAzureApiKey,
+  shouldUseAzureOpenAiApiVersion,
+} from "@/clients/azure-url";
+import {
+  buildBedrockProvider,
+  getBedrockRegion,
+  isBedrockIamAuthEnabled,
+} from "@/clients/bedrock-credentials";
+import { resolveVertexLocation } from "@/clients/gemini-client";
+import { isVertexAiEnabled } from "@/clients/gemini-vertex-ai";
+import {
+  guardrailCallHeader,
+  internalCallHeader,
+} from "@/clients/internal-call";
+import { getLlmUpstreamDispatcher } from "@/clients/llm-upstream-dispatcher";
+import { openRouterAttributionHeaders } from "@/clients/openrouter-attribution";
+import { createResponseHealingFetch } from "@/clients/openrouter-response-healing";
+import config from "@/config";
+import { ENCRYPTED_CHAT_KEY_HEADER } from "@/content-encryption/encrypted-chat";
+import { enterpriseTier } from "@/enterprise-tier";
+import logger from "@/logging";
+import ModelModel from "@/models/model";
+import UserTokenModel from "@/models/user-token";
+import { APPA_SUBAGENT_BINDING_HEADER } from "@/openappa/subagent-binding";
+import {
+  type AzureModelCapabilities,
+  resolveAzureModelCapabilities,
+} from "@/services/azure-model-capabilities";
+import {
+  fireworksModelAliases,
+  isFireworksEndpoint,
+  resolveFireworksModel,
+} from "@/services/fireworks-model";
+import { ApiError } from "@/types";
+import { resolveProviderApiKey } from "@/utils/llm-api-key-resolution";
+import { LlmProviderAuthRequiredError } from "@/utils/llm-provider-auth-error";
+import {
+  defaultMaxOutputTokens,
+  resolveModelOutputBudget,
+} from "@/utils/llm-resolution";
+import type { ProviderKeySelection } from "@/utils/provider-key-mappings";
+
+/**
+ * Placeholder API key for providers that don't require authentication (vLLM, Ollama).
+ * The OpenAI SDK requires a non-empty apiKey string, so we pass this sentinel value.
+ */
+const KEYLESS_PROVIDER_API_KEY_PLACEHOLDER = "EMPTY";
+
+/**
+ * Note: vLLM uses the @ai-sdk/openai provider (createOpenAI) since it exposes an
+ * OpenAI-compatible API. Ollama uses @ai-sdk/openai-compatible instead so that
+ * reasoning ("thinking") streamed in the `reasoning_content` field — which the
+ * strict @ai-sdk/openai chat parser drops — surfaces as native reasoning parts.
+ */
+
+/**
+ * Type representing a model that can be passed to streamText/generateText
+ */
+export type LLMModel = Parameters<typeof streamText>[0]["model"];
+
+/**
+ * Marks native Ollama `think` as explicitly chosen by an admin rather than
+ * defaulted by ollama-ai-provider-v2. Set by `buildOllamaNativeProviderOptions`
+ * as a request header; consumed and removed by `createOllamaNativeFetch` before
+ * the request is sent, so neither the Archestra proxy nor Ollama ever sees it.
+ *
+ * It is a header rather than a field in the `options` bag because
+ * ollama-ai-provider-v2 parses `providerOptions.ollama` through a closed Zod
+ * object whose `options` shape lists ten fixed keys — Zod strips everything
+ * else, so a marker riding in that bag never reaches the wrapper. Headers pass
+ * through `combineHeaders` untouched by any schema.
+ */
+export const OLLAMA_THINK_EXPLICIT_HEADER = "x-archestra-ollama-think";
+
+/**
+ * Check if API key is required for the given provider
+ */
+export function isApiKeyRequired(
+  provider: SupportedProvider,
+  apiKey: string | undefined,
+): boolean {
+  if (apiKey) return false;
+  // Gemini with Vertex AI doesn't require an API key
+  if (provider === "gemini" && isVertexAiEnabled()) return false;
+  return !!providerModelConfigs[provider].apiKeyRequiredMessage;
+}
+
+/**
+ * Create an LLM model that calls the provider API directly (not through LLM Proxy).
+ * Use this for meta operations like title generation that don't need proxy features.
+ */
+export function createDirectLLMModel({
+  provider,
+  apiKey,
+  modelName,
+  baseUrl,
+  chatApiKeyId,
+}: {
+  provider: SupportedProvider;
+  apiKey: string | undefined;
+  modelName: string;
+  baseUrl: string | null;
+  chatApiKeyId?: string;
+}): LLMModel {
+  const cfg = providerModelConfigs[provider];
+  if (!cfg) {
+    throw new ApiError(400, `Unsupported provider: ${provider}`);
+  }
+  if (cfg.apiKeyRequiredMessage && !apiKey) {
+    throw new ApiError(400, cfg.apiKeyRequiredMessage);
+  }
+  const subscriptionKind = subscriptionKindFromCredential(apiKey);
+  if (subscriptionKind) {
+    // Subscription credentials only work through the LLM proxy adapter that
+    // decodes the marker and redeems a short-lived access token against the
+    // vendor's subscription backend. This direct AI-SDK path (built-in
+    // subagents, knowledge base) would send the encoded refresh token to the
+    // provider's metered API as a bearer — a credential leak and a guaranteed
+    // 401 — so fail closed.
+    const { label } = SUBSCRIPTION_CREDENTIALS[subscriptionKind];
+    throw new ApiError(
+      400,
+      `${label} credentials cannot be used on the direct LLM path (built-in subagents, knowledge base). Configure a standard ${providerDisplayNames[provider]} API key for these, or pick a different model.`,
+    );
+  }
+  const resolvedBaseUrl = baseUrl ?? cfg.defaultBaseUrl;
+  const baseURL =
+    resolvedBaseUrl && cfg.proxiedPathSuffix
+      ? `${resolvedBaseUrl}${cfg.proxiedPathSuffix}`
+      : resolvedBaseUrl;
+  const upstreamFetch =
+    provider === "openrouter" ? createResponseHealingFetch() : globalThis.fetch;
+  const availableFetch: typeof globalThis.fetch = async (input, init) => {
+    const resolved = await resolveFireworksModel({
+      provider,
+      model: modelName,
+      baseUrl: baseURL,
+    });
+    await ModelModel.assertAvailable({
+      provider,
+      modelId: resolved.model,
+      aliases: isFireworksEndpoint(baseURL)
+        ? fireworksModelAliases(resolved.model)
+        : undefined,
+    });
+    return upstreamFetch(input, init);
+  };
+  return withCatalogOutputBudget(
+    cfg.createModel({
+      apiKey,
+      modelName,
+      baseURL,
+      headers: providerHeaders(cfg),
+      // Direct OpenRouter models bypass the proxy adapter, so heal the request
+      // body here; the wrapper no-ops for non-healable requests.
+      fetch: availableFetch,
+      direct: true,
+    }),
+    { provider, modelName, chatApiKeyId },
+  );
+}
+
+/**
+ * Create an LLM model for the specified provider, pointing to the LLM Proxy
+ * Returns a model instance ready to use with streamText/generateText
+ */
+export function createLLMModel(params: {
+  provider: SupportedProvider;
+  apiKey: string | undefined;
+  agentId: string;
+  modelName: string;
+  userId?: string;
+  externalAgentId?: string;
+  sessionId?: string;
+  appaParentId?: string;
+  /** Signed binding of an in-process subagent run to its child trajectory. */
+  appaSubagentToken?: string;
+  /** No person is there to answer: sends UNATTENDED_HEADER. */
+  unattended?: boolean;
+  source?: InteractionSource;
+  baseUrl: string | null;
+  chatApiKeyId?: string;
+  /** The model pool the chat was set to; see MODEL_POOL_ID_HEADER. */
+  modelPoolId?: string | null;
+  /** The auto router the call runs on; see AUTO_ROUTER_ID_HEADER. */
+  autoRouterId?: string | null;
+  /**
+   * Encrypted chat key. Forwarded so the proxy can store this
+   * interaction's content encrypted under it instead of redacting it. The
+   * proxy re-validates it against the conversation's stored fingerprint and
+   * only honours it on its loopback chat path.
+   */
+  encryptedChatKey?: Buffer | null;
+  /**
+   * MCP App whose runtime is making this call, so the interaction is attributed
+   * to it rather than only to the shared App Runtime agent. Loopback-gated on
+   * the proxy side; see APP_ID_HEADER.
+   */
+  appId?: string | null;
+  /** See ProviderModelConfig.createModel — resolved only on the agent path. */
+  supportedEndpoints?: SupportedProviderEndpoint[] | null;
+  /** A platform guardrail call, exempt from blocking unrecognized clients. */
+  internalCall?: boolean;
+  azureCapabilities?: AzureModelEvidence;
+}): LLMModel {
+  const {
+    provider,
+    apiKey,
+    agentId,
+    modelName,
+    userId,
+    externalAgentId,
+    sessionId,
+    source,
+    baseUrl,
+    chatApiKeyId,
+    encryptedChatKey,
+    appId,
+    supportedEndpoints,
+  } = params;
+
+  // Build headers for LLM Proxy. Every model built here dials the proxy from
+  // this process, so every call carries a proof. The guardrail proof also
+  // tells OpenAPPA to skip enforcement, so only its own calls send it.
+  const clientHeaders: Record<string, string> = params.internalCall
+    ? guardrailCallHeader()
+    : internalCallHeader(
+        userId ? (serviceAccountIdFromUserId(userId) ?? undefined) : undefined,
+      );
+  if (externalAgentId) {
+    clientHeaders[EXTERNAL_AGENT_ID_HEADER] = externalAgentId;
+  }
+  if (userId) {
+    clientHeaders[USER_ID_HEADER] = userId;
+  }
+  if (sessionId) {
+    clientHeaders[SESSION_ID_HEADER] = sessionId;
+    // A platform guardrail call is filed under the chat's session for logs,
+    // but must not become a turn of that chat's OpenAPPA trajectory.
+    if (enterpriseTier.isOpenappaActive() && !params.internalCall)
+      clientHeaders[APPA_SESSION_HEADER] = sessionId;
+  }
+  if (enterpriseTier.isOpenappaActive() && params.appaParentId)
+    clientHeaders[APPA_PARENT_HEADER] = params.appaParentId;
+  if (enterpriseTier.isOpenappaActive() && params.appaSubagentToken)
+    clientHeaders[APPA_SUBAGENT_BINDING_HEADER] = params.appaSubagentToken;
+  if (params.unattended) clientHeaders[UNATTENDED_HEADER] = "1";
+  if (source) {
+    clientHeaders[SOURCE_HEADER] = source;
+  }
+  if (baseUrl) {
+    clientHeaders[PROVIDER_BASE_URL_HEADER] = baseUrl;
+  }
+  // Names the chat_api_keys row behind this call. With a personal platform
+  // token the proxy resolves the upstream key from it; with a raw provider
+  // secret it only looks up per-key configuration (extraHeaders), and only
+  // when the in-process proof is present. See CHAT_API_KEY_ID_HEADER.
+  if (chatApiKeyId) {
+    clientHeaders[CHAT_API_KEY_ID_HEADER] = chatApiKeyId;
+    logger.info(
+      { chatApiKeyId, provider },
+      `[${provider}Proxy] chat attaching provider-api-key-id header`,
+    );
+  }
+  if (params.modelPoolId) {
+    clientHeaders[MODEL_POOL_ID_HEADER] = params.modelPoolId;
+  }
+  if (params.autoRouterId) {
+    clientHeaders[AUTO_ROUTER_ID_HEADER] = params.autoRouterId;
+  }
+  // App runtime completions attribute their spend to the calling app; the proxy
+  // re-validates this against the executing agent's organization.
+  if (appId) {
+    clientHeaders[APP_ID_HEADER] = appId;
+  }
+
+  // Never logged: the header name is on the logging redaction denylist and
+  // OTel captures no request headers.
+  if (encryptedChatKey) {
+    clientHeaders[ENCRYPTED_CHAT_KEY_HEADER] =
+      encryptedChatKey.toString("base64url");
+  }
+
+  const headers =
+    Object.keys(clientHeaders).length > 0 ? clientHeaders : undefined;
+
+  const cfg = providerModelConfigs[provider];
+  const proxyBaseUrl = buildProxyBaseUrl(provider, agentId);
+  const baseURL = cfg.proxiedPathSuffix
+    ? `${proxyBaseUrl}${cfg.proxiedPathSuffix}`
+    : proxyBaseUrl;
+
+  return withCatalogOutputBudget(
+    cfg.createModel({
+      apiKey,
+      modelName,
+      baseURL,
+      headers,
+      fetch: createTracedFetch(),
+      supportedEndpoints,
+      azureCapabilities: params.azureCapabilities,
+    }),
+    { provider, modelName, chatApiKeyId },
+  );
+}
+
+/**
+ * Full helper to resolve API key and create LLM model.
+ * Provider must be explicitly passed - callers can use detectProviderFromModel
+ * as a fallback for backward compatibility with existing conversations.
+ */
+export async function createLLMModelForAgent(params: {
+  organizationId: string;
+  userId: string;
+  agentId: string;
+  model: string;
+  provider: SupportedProvider;
+  conversationId?: string | null;
+  externalAgentId?: string;
+  sessionId?: string;
+  source?: InteractionSource;
+  agentLlmApiKeyId?: string | null;
+  /** Explicit current selection, checked against the acting user's usable keys. */
+  providerKeySelection?: ProviderKeySelection;
+  /** The conversation's model pool; its turns go to the pool's members. */
+  modelPoolId?: string | null;
+  /** No pool or explicit tier: the call may be auto routed. */
+  autoRouterId?: string | null;
+  /**
+   * Encrypted chat key, forwarded to the proxy so this turn's
+   * interaction content is stored encrypted rather than redacted.
+   */
+  encryptedChatKey?: Buffer | null;
+  /** Signed binding of an in-process subagent run to its child trajectory. */
+  appaSubagentToken?: string;
+  /** No person is there to answer: sends UNATTENDED_HEADER. */
+  unattended?: boolean;
+}): Promise<{
+  model: LLMModel;
+  provider: SupportedProvider;
+  apiKeySource: string;
+  /**
+   * True when this resolves to genuine Anthropic (vs an Anthropic-compatible
+   * endpoint behind a custom base URL serving a non-Claude model). Gates
+   * Anthropic-only request-body features in chat normalization, mirroring the
+   * proxy's `anthropic-beta` header gating so the two can't drift.
+   */
+  anthropicNativeEndpoint: boolean;
+  /**
+   * The resolved credential row id, when a stored key was used (undefined for
+   * environment-variable keys and keyless auth). This is the credential the
+   * turn actually runs on — resolution can land on a personal/team/org key or
+   * substitute a per-user ChatGPT-subscription credential, not just the
+   * agent's own configured key.
+   */
+  chatApiKeyId?: string;
+}> {
+  const {
+    organizationId,
+    userId,
+    agentId,
+    model: modelName,
+    provider,
+    conversationId,
+    externalAgentId,
+    sessionId,
+    source,
+    agentLlmApiKeyId,
+  } = params;
+
+  const {
+    apiKey,
+    source: apiKeySource,
+    baseUrl,
+    chatApiKeyId,
+    authRequired,
+  } = await resolveProviderApiKey({
+    organizationId,
+    userId,
+    provider,
+    conversationId,
+    agentLlmApiKeyId,
+    modelName,
+    selection: params.providerKeySelection,
+  });
+
+  // Check if Gemini with Vertex AI (doesn't require API key)
+  const isGeminiWithVertexAi = provider === "gemini" && isVertexAiEnabled();
+  // Check if Bedrock with IAM auth (doesn't require API key)
+  const isBedrockWithIamAuth =
+    provider === "bedrock" && isBedrockIamAuthEnabled();
+  // Self-hosted providers (vLLM, both Ollama transports) never require a key,
+  // and Azure/Anthropic are keyless under Entra ID / workload identity. This is
+  // the same predicate `resolveProviderApiKey` uses to decide it may return an
+  // undefined key, so the two must agree — a hardcoded provider list here drifts
+  // and rejects keyless setups the resolver deliberately allowed.
+  const isApiKeyOptional = isProviderApiKeyOptional({
+    provider,
+    azureEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
+    anthropicKeylessAuthEnabled: isAnthropicKeylessAuthEnabled(),
+  });
+
+  logger.info(
+    {
+      apiKeySource,
+      provider,
+      isGeminiWithVertexAi,
+      isBedrockWithIamAuth,
+      isApiKeyOptional,
+    },
+    "Using LLM provider API key",
+  );
+
+  if (
+    !apiKey &&
+    !isGeminiWithVertexAi &&
+    !isBedrockWithIamAuth &&
+    !isApiKeyOptional
+  ) {
+    // Per-user credentials need the acting user's own linked account; surface
+    // a typed error so callers can prompt them to connect rather than showing
+    // a generic "configure a key" message. Two per-user cases: resolution
+    // refused a credential-level key (a ChatGPT subscription belonging to
+    // someone else) and said so via authRequired, or the provider itself is
+    // per-user (GitHub/Microsoft Copilot) and the user has no personal key.
+    if (authRequired) {
+      throw new LlmProviderAuthRequiredError(
+        authRequired.provider,
+        authRequired.providerLabel,
+      );
+    }
+    if (providerRequiresPerUserCredential(provider)) {
+      throw new LlmProviderAuthRequiredError(provider);
+    }
+    throw new ApiError(
+      400,
+      "LLM Provider API key not configured. Please configure it in Provider Settings.",
+    );
+  }
+
+  // Providers that serve one catalog over two wire formats need the surface
+  // this model was catalogued on; it lives on the model row because the id
+  // does not carry it. Only looked up for such providers — every other one
+  // has a single surface, and this is on the chat hot path.
+  const supportedEndpoints = providerHasMultipleSurfaces(provider)
+    ? ((await ModelModel.findByProviderAndModelId(provider, modelName))
+        ?.supportedEndpoints ?? null)
+    : null;
+
+  // A real user's call authenticates to the proxy with that user's personal
+  // platform token, so the proxy knows who is calling. The provider key still
+  // comes from the chat key row named by chatApiKeyId. System and service-account
+  // calls have no personal token and keep the key path under the internal proof.
+  const proxyCredential =
+    chatApiKeyId && userId !== "system" && !isServiceAccountUserId(userId)
+      ? await personalTokenValue({ organizationId, userId })
+      : apiKey;
+
+  const azureCapabilities: AzureModelCapabilities | undefined =
+    provider === "azure"
+      ? await resolveAzureModelCapabilities({
+          providerApiKeyId: chatApiKeyId,
+          modelId: modelName,
+        })
+      : undefined;
+  if (azureCapabilities?.status === "stale") {
+    throw new ApiError(400, azureCapabilities.reason);
+  }
+  // Unknown metadata retains the explicitly selected standard Chat surface.
+  // It cannot select a native media transport or borrow another key's facts.
+  if (azureCapabilities?.status === "unknown") {
+    logger.debug(
+      { reason: azureCapabilities.reason },
+      "Azure Chat capabilities unknown; using the explicit Chat surface",
+    );
+  }
+
+  const model = createLLMModel({
+    provider,
+    apiKey: proxyCredential,
+    agentId,
+    modelName,
+    userId,
+    externalAgentId,
+    sessionId,
+    source,
+    baseUrl,
+    chatApiKeyId,
+    modelPoolId: params.modelPoolId,
+    autoRouterId: params.autoRouterId,
+    encryptedChatKey: params.encryptedChatKey,
+    appaSubagentToken: params.appaSubagentToken,
+    unattended: params.unattended,
+    supportedEndpoints,
+    azureCapabilities:
+      azureCapabilities?.status === "known" ? azureCapabilities : undefined,
+  });
+
+  const anthropicNativeEndpoint = isAnthropicNativeEndpoint({
+    provider,
+    model: modelName,
+    baseUrl,
+  });
+
+  return {
+    model,
+    provider,
+    apiKeySource,
+    anthropicNativeEndpoint,
+    chatApiKeyId,
+  };
+}
+
+// =============================================================================
+// Internal helpers
+// =============================================================================
+
+/**
+ * Unified model creation config for each provider.
+ * A single `createModel` function handles both direct and proxied calls.
+ *
+ * For direct calls: only apiKey, modelName, baseURL are provided.
+ * For proxied calls: headers and fetch are also provided (for trace context injection).
+ */
+type ProviderModelConfig = {
+  createModel: (params: {
+    apiKey: string | undefined;
+    modelName: string;
+    baseURL: string | undefined;
+    headers?: Record<string, string>;
+    fetch?: typeof globalThis.fetch;
+    /**
+     * True when baseURL is the provider's own host (createDirectLLMModel)
+     * rather than the Archestra LLM proxy. Providers whose surfaces sit at
+     * different roots on their host need this to pick the right path — the
+     * proxy flattens both onto the agent-id prefix, the host does not.
+     */
+    direct?: boolean;
+    /**
+     * Provider surfaces the model row records for this model, for providers
+     * that serve one catalog over more than one wire format and whose ids do
+     * not reveal which (GitHub Copilot). Only the agent path resolves a model
+     * row, so this is undefined on every other caller — and undefined must
+     * mean "use the provider's default surface", never a guess.
+     */
+    supportedEndpoints?: SupportedProviderEndpoint[] | null;
+    azureCapabilities?: AzureModelEvidence;
+  }) => LLMModel;
+  /** Default base URL for direct calls (falls back to provider's built-in default when undefined) */
+  defaultBaseUrl: string | undefined;
+  /** Error message when API key is missing. Undefined = key is optional (vllm, ollama). */
+  apiKeyRequiredMessage?: string;
+  /** Path suffix appended to proxy base URL for proxied calls (e.g. "/v1" for anthropic) */
+  proxiedPathSuffix?: string;
+  /** Static headers always sent to the provider (e.g. OpenRouter attribution). */
+  extraHeaders?: Record<string, string>;
+};
+
+/** Static provider headers (e.g. OpenRouter attribution), or undefined when none. */
+function providerHeaders(
+  cfg: ProviderModelConfig,
+): Record<string, string> | undefined {
+  return cfg.extraHeaders && Object.keys(cfg.extraHeaders).length > 0
+    ? cfg.extraHeaders
+    : undefined;
+}
+
+/**
+ * Shared `createModel` for OpenAI-compatible providers whose models stream
+ * reasoning in the `reasoning_content` delta field and expect it passed back
+ * on tool-call turns. The strict @ai-sdk/openai chat converter drops reasoning
+ * parts from outgoing messages and its parser drops `reasoning_content` from
+ * responses; @ai-sdk/openai-compatible round-trips both.
+ */
+function reasoningCompatibleCreateModel(params: {
+  /** Provider id — becomes the AI-SDK model provider id (`<name>.chat`). */
+  name: string;
+  /** Thrown when no base URL resolves (per-key override or provider default). */
+  missingBaseUrlMessage: string;
+  /** Substitute the placeholder key when none is set (vllm, ollama). */
+  keyless?: boolean;
+  /**
+   * Send `response_format: json_schema` for structured outputs. Off by default:
+   * the compatible provider falls back to a schema-less `json_object`, and only
+   * upstreams known to honor a schema should be told otherwise.
+   */
+  supportsStructuredOutputs?: boolean;
+}): ProviderModelConfig["createModel"] {
+  const {
+    name,
+    missingBaseUrlMessage,
+    keyless = false,
+    supportsStructuredOutputs = false,
+  } = params;
+  return ({ apiKey, modelName, baseURL, headers, fetch }) => {
+    if (!baseURL) {
+      throw new ApiError(400, missingBaseUrlMessage);
+    }
+    return createOpenAICompatible({
+      name,
+      apiKey: keyless ? apiKey || KEYLESS_PROVIDER_API_KEY_PLACEHOLDER : apiKey,
+      baseURL,
+      headers,
+      fetch,
+      // @ai-sdk/openai always sends stream_options.include_usage; the compatible
+      // provider only sends it when asked. Keep it on so the final usage chunk
+      // still arrives and cost/usage metrics are unaffected.
+      includeUsage: true,
+      supportsStructuredOutputs,
+    }).chatModel(modelName);
+  };
+}
+
+/**
+ * Unified registry of model configs for each provider.
+ * TypeScript enforces that ALL providers in SupportedProvider have an entry.
+ * Adding a new provider to SupportedProvider will cause a compile error here
+ * until the corresponding config is added.
+ */
+const providerModelConfigs: Record<SupportedProvider, ProviderModelConfig> = {
+  // Embeddings-only provider: Voyage publishes no chat API, so there is no chat
+  // model to construct. Reaching here means something resolved a Voyage model
+  // for a conversation despite the catalog tagging every one of them as an
+  // embedding model — fail loudly rather than build a client that would 404 on
+  // every request.
+  voyage: {
+    createModel: () => {
+      throw new Error(
+        "Voyage AI is an embeddings-only provider and cannot serve chat requests",
+      );
+    },
+    defaultBaseUrl: config.llm.voyage.baseUrl,
+  },
+  // Decisions-only provider: it answers classification questions and has no
+  // chat API, so the same loud failure applies.
+  jev: {
+    createModel: () => {
+      throw new Error(
+        "Jev is a decisions-only provider and cannot serve chat requests",
+      );
+    },
+    defaultBaseUrl: config.llm.jev.baseUrl,
+  },
+
+  // --- Native SDK providers (use their own SDK, call client(modelName)) ---
+
+  anthropic: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch, direct }) =>
+      direct && anthropicVertexClient.isEnabled()
+        ? anthropicVertexClient.createModel({
+            modelId: modelName,
+            fetch: createAnthropicThinkingDisplayFetch(fetch),
+          })
+        : createAnthropic({
+            apiKey,
+            baseURL,
+            headers,
+            // Models that think by default return their thinking text only on
+            // request — see createAnthropicThinkingDisplayFetch.
+            fetch: createAnthropicThinkingDisplayFetch(fetch),
+          })(modelName),
+    defaultBaseUrl: config.llm.anthropic.baseUrl,
+    apiKeyRequiredMessage: isAnthropicKeylessAuthEnabled()
+      ? undefined
+      : "Anthropic API key is required. Please configure ANTHROPIC_API_KEY.",
+    proxiedPathSuffix: "/v1",
+  },
+
+  cerebras: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) =>
+      createCerebras({ apiKey, baseURL, headers, fetch })(modelName),
+    defaultBaseUrl: config.llm.cerebras.baseUrl,
+    apiKeyRequiredMessage:
+      "Cerebras API key is required. Please configure CEREBRAS_API_KEY.",
+  },
+
+  cohere: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) =>
+      createCohere({ apiKey, baseURL, headers, fetch })(modelName),
+    defaultBaseUrl: config.llm.cohere.baseUrl,
+    apiKeyRequiredMessage:
+      "Cohere API key is required. Please configure COHERE_API_KEY.",
+  },
+
+  mistral: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) =>
+      createMistral({ apiKey, baseURL, headers, fetch })(modelName),
+    defaultBaseUrl: config.llm.mistral.baseUrl,
+    apiKeyRequiredMessage:
+      "Mistral API key is required. Please configure MISTRAL_API_KEY.",
+  },
+
+  groq: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) =>
+      createGroq({ apiKey, baseURL, headers, fetch })(modelName),
+    defaultBaseUrl: config.llm.groq.baseUrl,
+    apiKeyRequiredMessage:
+      "Groq API key is required. Please configure ARCHESTRA_CHAT_GROQ_API_KEY.",
+  },
+
+  xai: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) =>
+      createXai({ apiKey, baseURL, headers, fetch })(modelName),
+    defaultBaseUrl: config.llm.xai.baseUrl,
+    apiKeyRequiredMessage:
+      "xAI API key is required. Please configure ARCHESTRA_CHAT_XAI_API_KEY.",
+  },
+
+  // --- OpenAI-compatible providers (use createOpenAI with .chat()) ---
+
+  openai: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) => {
+      const client = createOpenAI({ apiKey, baseURL, headers, fetch });
+      // "pro" reasoning models are Responses-API-only; routing them through
+      // .chat() hits /chat/completions and 404s. See requiresOpenAiResponsesApi.
+      if (!requiresOpenAiResponsesApi(modelName)) {
+        return client.chat(modelName);
+      }
+      // Every Responses-routed model reasons, but the SDK recognizes reasoning
+      // models by name and misses newer ones (gpt-6). For those it would not
+      // request encrypted reasoning under store:false, so the next tool step
+      // resends reasoning by id alone and OpenAI rejects it. It would also
+      // drop reasoningSummary and keep sampling parameters.
+      return withResponsesDefaults(client.responses(modelName), {
+        forceReasoning: true,
+      });
+    },
+    defaultBaseUrl: config.llm.openai.baseUrl,
+    apiKeyRequiredMessage:
+      "OpenAI API key is required. Please configure OPENAI_API_KEY.",
+  },
+
+  openrouter: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) => {
+      if (!baseURL) {
+        throw new ApiError(400, "OpenRouter base URL is required.");
+      }
+      // OpenRouter streams thinking as a `reasoning` delta field that the
+      // strict @ai-sdk/openai chat parser drops — so reasoning models' thinking
+      // never reaches the UI. @ai-sdk/openai-compatible parses
+      // `reasoning_content` / `reasoning` into native reasoning parts.
+      return createOpenAICompatible({
+        name: "openrouter",
+        apiKey,
+        baseURL,
+        headers,
+        fetch,
+        // @ai-sdk/openai always sends stream_options.include_usage; the compatible
+        // provider only sends it when asked. Keep it on so the final usage chunk
+        // still arrives and cost/usage metrics are unaffected.
+        includeUsage: true,
+        // @ai-sdk/openai always sends `response_format: json_schema` for
+        // structured outputs; the compatible provider defaults to a schema-less
+        // `json_object` (and nothing else carries the schema to the model), which
+        // breaks generateObject flows (KB reranker and other subagents) pointed
+        // at OpenRouter. OpenRouter supports json_schema; providers that can't
+        // honor it ignore it, exactly as with the strict client.
+        supportsStructuredOutputs: true,
+      }).chatModel(modelName);
+    },
+    defaultBaseUrl: config.llm.openrouter.baseUrl,
+    apiKeyRequiredMessage:
+      "OpenRouter API key is required. Please configure ARCHESTRA_CHAT_OPENROUTER_API_KEY.",
+    extraHeaders: openRouterAttributionHeaders(),
+  },
+
+  perplexity: {
+    // One provider, two transports, discriminated per model: the
+    // vendor-prefixed catalog is served by the Agent API — OpenAI-Responses-
+    // compatible, so the stock Responses transport reaches it unmodified —
+    // while the bare `sonar*` models speak chat completions. On the provider's
+    // own host the Agent API is rooted at `/v1` while chat completions sit at
+    // the bare host, so direct calls append it; through the LLM proxy both
+    // surfaces hang off the agent-id prefix and the SDK's own
+    // `/responses` / `/chat/completions` suffix is the whole path.
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch, direct }) =>
+      requiresPerplexityAgentApi(modelName)
+        ? withResponsesDefaults(
+            createOpenAI({
+              apiKey,
+              baseURL: direct ? perplexityAgentApiBaseUrl(baseURL) : baseURL,
+              headers,
+              fetch,
+            }).responses(modelName),
+            {},
+          )
+        : // Perplexity reasoning models (sonar-reasoning-pro, sonar-deep-research)
+          // stream their chain of thought as inline <think>…</think> text in
+          // `content` — there is no reasoning_content field — so no provider
+          // parser can surface it. The middleware extracts the tags into native
+          // reasoning parts; tagless responses (sonar, sonar-pro) pass through
+          // unchanged, at the accepted cost that literal <think> text in a real
+          // answer is also treated as reasoning. Reasoning parts are dropped from
+          // outgoing messages by the strict openai converter, which is correct
+          // here: Perplexity does not accept reasoning back. The Agent API branch
+          // above needs none of this — that surface has no inline <think>
+          // convention.
+          wrapLanguageModel({
+            model: createOpenAI({ apiKey, baseURL, headers, fetch }).chat(
+              modelName,
+            ),
+            middleware: extractReasoningMiddleware({ tagName: "think" }),
+          }),
+    defaultBaseUrl: config.llm.perplexity.baseUrl,
+    apiKeyRequiredMessage:
+      "Perplexity API key is required. Please configure PERPLEXITY_API_KEY.",
+  },
+
+  zhipuai: {
+    // GLM thinking mode (on by default; glm-4.7 thinks unconditionally) streams
+    // its chain of thought in `reasoning_content`. Z.ai accepts only
+    // `text`/`json_object` response formats, so this deliberately stays off
+    // supportsStructuredOutputs: generateObject falls back to bare
+    // `json_object` and the SDK validates the returned JSON against the schema.
+    createModel: reasoningCompatibleCreateModel({
+      name: "zhipuai",
+      missingBaseUrlMessage: "Zhipu AI base URL is required.",
+    }),
+    defaultBaseUrl: config.llm.zhipuai.baseUrl,
+    apiKeyRequiredMessage:
+      "Zhipu AI API key is required. Please configure ZHIPUAI_API_KEY.",
+  },
+
+  minimax: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) => {
+      if (!baseURL) {
+        throw new ApiError(400, "MiniMax base URL is required.");
+      }
+      // MiniMax M-series models always think; the proxy's minimax adapter
+      // mirrors the thinking text into DeepSeek-style `reasoning_content`
+      // deltas. The strict @ai-sdk/openai chat converter drops reasoning parts
+      // from outgoing messages and its parser drops `reasoning_content` from
+      // responses; @ai-sdk/openai-compatible round-trips both.
+      return createOpenAICompatible({
+        name: "minimax",
+        apiKey,
+        baseURL,
+        headers,
+        fetch,
+        // @ai-sdk/openai always sends stream_options.include_usage; the compatible
+        // provider only sends it when asked. Keep it on so the final usage chunk
+        // still arrives and cost/usage metrics are unaffected.
+        includeUsage: true,
+      }).chatModel(modelName);
+    },
+    defaultBaseUrl: config.llm.minimax.baseUrl,
+    apiKeyRequiredMessage:
+      "MiniMax API key is required. Please configure ARCHESTRA_CHAT_MINIMAX_API_KEY.",
+  },
+
+  deepseek: {
+    // DeepSeek thinking mode 400s when the assistant's `reasoning_content` is
+    // not passed back on tool-call turns.
+    createModel: reasoningCompatibleCreateModel({
+      name: "deepseek",
+      missingBaseUrlMessage: "DeepSeek base URL is required.",
+    }),
+    defaultBaseUrl: config.llm.deepseek.baseUrl,
+    apiKeyRequiredMessage:
+      "DeepSeek API key is required. Please configure DEEPSEEK_API_KEY.",
+  },
+
+  // Another Archestra instance's OpenAI-compatible LLM proxy. Base URL is always
+  // supplied per key (no global default), so direct calls rely on that override.
+  archestra: {
+    // The upstream Archestra streams thinking as DeepSeek-style
+    // `reasoning_content` deltas and, when it fronts DeepSeek, requires them
+    // passed back on tool-call turns. Failing closed on a missing base URL
+    // beats the old silent fallback to api.openai.com with a virtual key.
+    createModel: reasoningCompatibleCreateModel({
+      name: "archestra",
+      // white-label-ok: names the `archestra` upstream LLM provider a deployment connects to, not this deployment's own brand
+      missingBaseUrlMessage: "Archestra base URL is required.",
+      // The upstream is another Archestra unified model API, which forwards
+      // `response_format: json_schema` the same way the strict openai client
+      // sent it before. Without this the compatible client downgrades
+      // generateObject flows (KB reranker and other subagents) to a schema-less
+      // `json_object`, and nothing else carries the schema to the model.
+      supportsStructuredOutputs: true,
+    }),
+    defaultBaseUrl: config.llm.archestra.baseUrl,
+    apiKeyRequiredMessage:
+      // white-label-ok: names the `archestra` upstream LLM provider a deployment connects to, not this deployment's own brand
+      "Archestra API key is required. Please configure an Archestra API key.",
+  },
+
+  kimi: {
+    // Kimi thinking models (kimi-k3, kimi-k2.6, ...) stream reasoning in
+    // `reasoning_content` and expect it passed back on tool-call turns.
+    createModel: reasoningCompatibleCreateModel({
+      name: "kimi",
+      missingBaseUrlMessage: "Kimi base URL is required.",
+    }),
+    defaultBaseUrl: config.llm.kimi.baseUrl,
+    apiKeyRequiredMessage:
+      "Kimi API key is required. Please configure ARCHESTRA_CHAT_KIMI_API_KEY.",
+  },
+
+  "kimi-code": {
+    // Kimi Code's models think too (k3.1-pro only thinks) and replay
+    // `reasoning_content` on tool-call turns.
+    createModel: reasoningCompatibleCreateModel({
+      name: "kimi-code",
+      missingBaseUrlMessage: "Kimi Code base URL is required.",
+    }),
+    defaultBaseUrl: config.llm["kimi-code"].baseUrl,
+    apiKeyRequiredMessage:
+      "Kimi Code API key is required. Please configure ARCHESTRA_CHAT_KIMI_CODE_API_KEY.",
+  },
+
+  "github-copilot": {
+    // The model always talks to the local LLM proxy (buildProxyBaseUrl), and
+    // the proxy's github-copilot adapter exchanges the GitHub OAuth token for
+    // the short-lived Copilot bearer — exchanging here too would hand the
+    // proxy an already-exchanged bearer it cannot exchange again.
+    //
+    // One provider, two transports, discriminated per model like Perplexity's —
+    // but Copilot's id says nothing about which (`gpt-5.5` and `gpt-4o` are
+    // both bare), so the surface is read from the catalog data synced onto the
+    // model row. Absent that data the model keeps the chat-completions default,
+    // which is what every caller that does not resolve a model row gets.
+    createModel: ({
+      apiKey,
+      modelName,
+      baseURL,
+      headers,
+      fetch,
+      supportedEndpoints,
+    }) => {
+      const client = createOpenAI({ apiKey, baseURL, headers, fetch });
+      return requiresResponsesApi(supportedEndpoints)
+        ? wrapLanguageModel({
+            model: client.responses(modelName),
+            middleware: {
+              specificationVersion: "v3",
+              transformParams: async ({ params }) => ({
+                ...params,
+                providerOptions: {
+                  ...params.providerOptions,
+                  openai: {
+                    ...params.providerOptions?.openai,
+                    // Copilot cannot resolve stored output-item references.
+                    // Send the conversation contents on every turn instead.
+                    store: false,
+                  },
+                },
+              }),
+            },
+          })
+        : client.chat(modelName);
+    },
+    defaultBaseUrl: config.llm["github-copilot"].baseUrl,
+    apiKeyRequiredMessage:
+      "GitHub Copilot requires a GitHub OAuth token. Connect your GitHub account or configure ARCHESTRA_CHAT_GITHUB_COPILOT_API_KEY.",
+  },
+
+  "microsoft-365-copilot": {
+    // The model always talks to the local LLM proxy (buildProxyBaseUrl); the
+    // proxy's microsoft-365-copilot adapter redeems the Entra refresh token for a
+    // short-lived Graph access token and translates the OpenAI wire format to
+    // the Graph Chat API — redeeming here too would hand the proxy an access
+    // token it cannot redeem again.
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch }) =>
+      createOpenAI({ apiKey, baseURL, headers, fetch }).chat(modelName),
+    defaultBaseUrl: config.llm["microsoft-365-copilot"].baseUrl,
+    apiKeyRequiredMessage:
+      "Microsoft 365 Copilot requires a connected Microsoft account. Sign in with Microsoft when adding the provider key.",
+  },
+
+  azure: {
+    createModel: ({
+      apiKey,
+      modelName,
+      baseURL,
+      headers,
+      fetch: providedFetch,
+      direct,
+      azureCapabilities,
+    }) => {
+      // Azure has no usable default endpoint; without this guard createOpenAI
+      // would fall back to api.openai.com and send the Azure api-key there.
+      if (!baseURL) {
+        throw new ApiError(400, "Azure AI Foundry base URL is required.");
+      }
+      // Claude deployments serve Responses but reject Chat Completions.
+      const useResponses =
+        isAzureOpenAiFirstPartyModelName(
+          azureCapabilities?.underlyingModelName ?? modelName,
+        ) ||
+        isAzureAnthropicBackingModel({
+          underlyingModelName: azureCapabilities?.underlyingModelName,
+        });
+
+      // Only direct classic Azure calls need the AI SDK to inject api-version.
+      // Proxied calls let the adapter choose from the actual upstream URL:
+      // a date injected against the loopback URL would be forwarded as a caller
+      // override, which Foundry v1 rejects with "API version not supported".
+      const fetchWithVersion =
+        direct && shouldUseAzureOpenAiApiVersion(baseURL)
+          ? createAzureFetchWithApiVersion({
+              apiVersion: useResponses
+                ? config.llm.azure.responsesApiVersion
+                : config.llm.azure.apiVersion,
+              fetch: providedFetch,
+            })
+          : providedFetch;
+      const normalizedApiKey = normalizeAzureApiKey(apiKey);
+      const sdkApiKey =
+        normalizedApiKey ??
+        (isAzureOpenAiEntraIdEnabled()
+          ? KEYLESS_PROVIDER_API_KEY_PLACEHOLDER
+          : undefined);
+      const requestHeaders = normalizedApiKey
+        ? { ...headers, "api-key": normalizedApiKey }
+        : headers;
+
+      const kind = azureCapabilities?.kind;
+      if (
+        azureCapabilities &&
+        !azureCapabilities.operations.some((operation) =>
+          ["chat", "responses", "image-generation", "realtime-turn"].includes(
+            operation,
+          ),
+        )
+      ) {
+        throw new ApiError(
+          400,
+          "This Azure deployment does not support Chat media turns. Use its explicit media endpoint.",
+        );
+      }
+      if (direct && (kind === "realtime" || kind === "translation")) {
+        throw new ApiError(
+          400,
+          "Azure realtime media models require the LLM proxy or Chat. Select a text model for direct model tasks.",
+        );
+      }
+      if (
+        kind === "image" ||
+        kind === "audio" ||
+        kind === "realtime" ||
+        kind === "translation"
+      ) {
+        return createAzureMediaLanguageModel({
+          modelId: modelName,
+          baseURL: direct
+            ? (buildAzureDeploymentBaseUrl({
+                baseUrl: baseURL,
+                deploymentName: modelName,
+              }) ?? baseURL)
+            : baseURL,
+          headers: {
+            ...requestHeaders,
+            ...(sdkApiKey ? { authorization: `Bearer ${sdkApiKey}` } : {}),
+          },
+          fetch: fetchWithVersion,
+          kind,
+        });
+      }
+
+      // Classic Responses endpoints are resource-scoped; Chat Completions
+      // endpoints are deployment-scoped. V1 URLs pass through unchanged.
+      // On the proxy path the adapter builds the upstream URL itself.
+      const targetBaseURL = direct
+        ? useResponses
+          ? (buildAzureResponsesBaseUrl(baseURL) ?? baseURL)
+          : (buildAzureDeploymentBaseUrl({
+              baseUrl: baseURL,
+              deploymentName: modelName,
+            }) ?? baseURL)
+        : baseURL;
+
+      // Azure Chat Completions can reject function tools with reasoning on OpenAI
+      // deployments. Use native Responses, as the unified model API does, and resend
+      // conversation contents instead of server-stored item references.
+      // Foundry-hosted open models
+      // (DeepSeek-R1, gpt-oss, ...) stream thinking in a `reasoning_content`
+      // delta field the strict parser drops, so — like the Ollama entry — they
+      // go through @ai-sdk/openai-compatible, which parses it into native
+      // reasoning parts.
+      if (useResponses) {
+        return wrapLanguageModel({
+          model: createOpenAI({
+            apiKey: sdkApiKey,
+            baseURL: targetBaseURL,
+            headers: requestHeaders,
+            fetch: fetchWithVersion,
+          }).responses(modelName),
+          middleware: {
+            specificationVersion: "v3",
+            transformParams: async ({ params }) => ({
+              ...params,
+              providerOptions: {
+                ...params.providerOptions,
+                openai: {
+                  ...params.providerOptions?.openai,
+                  store: false,
+                  // Request replayable reasoning even for newer model names
+                  // that the SDK's reasoning-family heuristic does not know.
+                  include: [
+                    ...new Set([
+                      ...(Array.isArray(params.providerOptions?.openai?.include)
+                        ? params.providerOptions.openai.include
+                        : []),
+                      "reasoning.encrypted_content",
+                    ]),
+                  ],
+                },
+              },
+            }),
+          },
+        });
+      }
+
+      return createOpenAICompatible({
+        name: "azure",
+        apiKey: sdkApiKey,
+        baseURL: targetBaseURL,
+        headers: requestHeaders,
+        fetch: fetchWithVersion,
+        // @ai-sdk/openai always sends stream_options.include_usage; the compatible
+        // provider only sends it when asked. Keep it on so the final usage chunk
+        // still arrives and cost/usage metrics are unaffected.
+        includeUsage: true,
+        // @ai-sdk/openai always sends `response_format: json_schema` for
+        // structured outputs; the compatible provider defaults to a schema-less
+        // `json_object` (and nothing else carries the schema to the model),
+        // which breaks generateObject flows (KB reranker and other subagents)
+        // pointed at an Azure deployment. Foundry honours json_schema;
+        // deployments that can't ignore it, exactly as with the strict client.
+        supportsStructuredOutputs: true,
+      }).chatModel(modelName);
+    },
+    defaultBaseUrl: config.llm.azure.baseUrl || undefined,
+    apiKeyRequiredMessage:
+      "Azure AI Foundry API key is required. Please configure ARCHESTRA_CHAT_AZURE_OPENAI_API_KEY.",
+  },
+
+  // --- OpenAI-compatible providers with optional API key ---
+
+  vllm: {
+    // vLLM serves DeepSeek-style reasoning models. There is no default base
+    // URL (PROVIDERS_REQUIRING_BASE_URL): without the factory's guard a
+    // missing URL would silently route to api.openai.com.
+    createModel: reasoningCompatibleCreateModel({
+      name: "vllm",
+      missingBaseUrlMessage: "vLLM base URL is required.",
+      keyless: true,
+      // vLLM implements OpenAI's `response_format: json_schema` by compiling
+      // the schema into a decoding grammar. Without this the compatible client
+      // downgrades generateObject flows (KB reranker and other subagents) to a
+      // schema-less `json_object`, and since nothing else carries the schema to
+      // the model, the model is left to guess the shape — a reasoning model
+      // then answers with `<think>` text and a fenced object that no JSON
+      // parser accepts.
+      supportsStructuredOutputs: true,
+    }),
+    defaultBaseUrl: config.llm.vllm.baseUrl,
+    // No apiKeyRequiredMessage — key is optional
+  },
+
+  ollama: {
+    // Ollama streams reasoning ("thinking", e.g. qwen3) in `reasoning_content`.
+    createModel: reasoningCompatibleCreateModel({
+      name: "ollama",
+      missingBaseUrlMessage: "Ollama base URL is required.",
+      keyless: true,
+    }),
+    defaultBaseUrl: config.llm.ollama.baseUrl,
+    // No apiKeyRequiredMessage — key is optional
+  },
+
+  // Native Ollama transport: talks `/api/chat` via ollama-ai-provider-v2 so
+  // num_ctx/num_predict/top_k/think are sent (the `/v1` path discards them). The
+  // `/api` suffix makes the client POST to `<proxy>/ollama-native/<agent>/api/chat`.
+  "ollama-native": {
+    createModel: ({ modelName, baseURL, headers, fetch }) =>
+      createOllama({
+        baseURL,
+        headers,
+        // The package always emits `think`, defaulting it to false — see
+        // createOllamaNativeFetch.
+        fetch: createOllamaNativeFetch({ providedFetch: fetch, modelName }),
+      }).chat(modelName),
+    defaultBaseUrl: config.llm["ollama-native"].baseUrl,
+    proxiedPathSuffix: "/api",
+    // No apiKeyRequiredMessage — key is optional
+  },
+
+  // --- Special providers ---
+
+  gemini: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch, direct }) => {
+      // Proxy calls always use the Google wire, even when the server uses Vertex.
+      if (!direct) {
+        return createGoogleGenerativeAI({
+          apiKey: apiKey || "vertex-ai-mode",
+          baseURL,
+          headers,
+          fetch,
+        })(modelName);
+      }
+      // Direct path: use Vertex AI if enabled
+      if (isVertexAiEnabled()) {
+        const { vertexAi } = config.llm.gemini;
+        return createVertex({
+          fetch,
+          project: vertexAi.project,
+          location: resolveVertexLocation(modelName),
+          googleAuthOptions: {
+            projectId: vertexAi.project,
+            ...(vertexAi.credentialsFile && {
+              keyFilename: vertexAi.credentialsFile,
+            }),
+          },
+        })(modelName);
+      }
+      // Direct path without Vertex AI — key is required
+      if (!apiKey) {
+        throw new ApiError(
+          400,
+          "Gemini API key is required when Vertex AI is not enabled. Please configure GEMINI_API_KEY or enable Vertex AI.",
+        );
+      }
+      return createGoogleGenerativeAI({ apiKey, baseURL, fetch })(modelName);
+    },
+    defaultBaseUrl: undefined, // GoogleGenerativeAI has its own default
+    // apiKeyRequiredMessage is undefined — validation is inside createModel (Vertex AI special case)
+    proxiedPathSuffix: "/v1beta",
+  },
+
+  bedrock: {
+    createModel: ({ apiKey, modelName, baseURL, headers, fetch, direct }) =>
+      (direct
+        ? buildBedrockProvider({ apiKey, baseUrl: baseURL, headers, fetch })
+        : createAmazonBedrock({
+            // The proxy resolves AWS credentials. Keep the SDK from trying
+            // SigV4 on the loopback hop when chat uses a secretless IAM key.
+            apiKey: apiKey || KEYLESS_PROVIDER_API_KEY_PLACEHOLDER,
+            region: getBedrockRegion(),
+            baseURL,
+            headers,
+            fetch: apiKey
+              ? fetch
+              : (input, init) => {
+                  const proxyHeaders = new Headers(init?.headers);
+                  // Preserve keyless auth so the proxy selects its IAM chain.
+                  proxyHeaders.delete("authorization");
+                  return (fetch ?? globalThis.fetch)(input, {
+                    ...init,
+                    headers: proxyHeaders,
+                  });
+                },
+          }))(modelName),
+    defaultBaseUrl: config.llm.bedrock.baseUrl,
+    apiKeyRequiredMessage: isBedrockIamAuthEnabled()
+      ? undefined
+      : "Amazon Bedrock API key is required. Please configure ARCHESTRA_CHAT_BEDROCK_API_KEY.",
+  },
+};
+
+/**
+ * The user's personal platform token value, created on first use. The proxy
+ * resolves it to the user, the same way the MCP gateway resolves it.
+ */
+async function personalTokenValue(params: {
+  organizationId: string;
+  userId: string;
+}): Promise<string> {
+  const token = await UserTokenModel.ensureUserToken(
+    params.userId,
+    params.organizationId,
+  );
+  const value = await UserTokenModel.getTokenValue(token.id);
+  if (!value) {
+    throw new ApiError(500, "The personal platform token has no value.");
+  }
+  return value;
+}
+
+/**
+ * Creates a fetch wrapper that injects W3C trace context (traceparent/tracestate)
+ * into outgoing HTTP headers. This enables the LLM proxy handler to extract the
+ * parent context and create child spans, linking chat → LLM proxy traces together.
+ */
+function createTracedFetch(): typeof globalThis.fetch {
+  return (input, init) => {
+    const headers = new Headers(init?.headers);
+    // Inject active trace context (traceparent, tracestate) into outgoing headers.
+    // Uses a carrier object because propagation.inject expects a plain object,
+    // then copies the injected headers into the actual Headers instance.
+    const carrier: Record<string, string> = {};
+    propagation.inject(context.active(), carrier);
+    for (const [key, value] of Object.entries(carrier)) {
+      headers.set(key, value);
+    }
+    // Opt-in upstream timeout dispatcher; undefined leaves undici defaults
+    // untouched. See @/clients/llm-upstream-dispatcher.
+    const dispatcher = getLlmUpstreamDispatcher();
+
+    if (!dispatcher) {
+      return globalThis.fetch(input, { ...init, headers });
+    }
+
+    return globalThis.fetch(input, {
+      ...init,
+      headers,
+      dispatcher,
+    } as RequestInit);
+  };
+}
+
+/**
+ * Wraps fetch to reconcile `think` on native Ollama `/api/chat` requests.
+ *
+ * ollama-ai-provider-v2 emits `think: ollamaOptions?.think ?? false`, so a caller
+ * that says nothing still sends an explicit `think: false`. That is not a no-op:
+ * it disables thinking, and a qwen3-class model then returns its entire chain of
+ * thought as message `content` — closed by a bare `</think>` with no opening tag
+ * — which renders as the assistant's answer. The OpenAI-compatible `/v1` provider
+ * sends no `think` field at all, which is why it behaves correctly.
+ *
+ * The package offers no way to omit the field, so `buildOllamaNativeProviderOptions`
+ * marks a deliberate choice with the OLLAMA_THINK_EXPLICIT_HEADER request header.
+ * Here that header is consumed and removed: with it, `think` stands as
+ * configured; without it, `think` is dropped so Ollama applies the model's own
+ * default.
+ *
+ * The header is always stripped, including on the pass-through paths below — the
+ * request goes to Archestra's own LLM proxy first, and an internal marker must
+ * not travel any further than this wrapper.
+ *
+ * This wraps Archestra's own client only. Callers that POST to
+ * `/v1/ollama-native/…` themselves never pass through here and keep whatever
+ * `think` they sent.
+ */
+function createOllamaNativeFetch(params: {
+  providedFetch?: typeof globalThis.fetch;
+  modelName: string;
+}): typeof globalThis.fetch {
+  const baseFetch = params.providedFetch ?? globalThis.fetch;
+  // A request that sets no `num_ctx` (a summary, a title) would run on the
+  // server's default window, which silently cuts a prompt the caller sized to
+  // the admin's. One lookup per model instance.
+  let pinnedNumCtx: Promise<number | undefined> | undefined;
+  const resolvePinnedNumCtx = () => {
+    pinnedNumCtx ??= ModelModel.findByProviderAndModelId(
+      "ollama-native",
+      params.modelName,
+    ).then(
+      (row) =>
+        row?.configuredParameters?.num_ctx === undefined
+          ? undefined
+          : (ModelModel.resolveEffectiveContextLength(row) ??
+            row.configuredParameters.num_ctx),
+      (error) => {
+        logger.warn(
+          { error, model: params.modelName },
+          "[LLM client] could not read the model's configured num_ctx",
+        );
+        return undefined;
+      },
+    );
+    return pinnedNumCtx;
+  };
+
+  return async (input, init) => {
+    const { hasMarker: hasExplicitThink, headers } = takeMarkerHeader(
+      init?.headers,
+      OLLAMA_THINK_EXPLICIT_HEADER,
+    );
+    const forwarded: RequestInit | undefined =
+      init === undefined ? undefined : { ...init, headers };
+
+    if (typeof init?.body !== "string") {
+      return baseFetch(input, forwarded);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(init.body);
+      if (typeof parsed !== "object" || parsed === null) {
+        return baseFetch(input, forwarded);
+      }
+      body = parsed as Record<string, unknown>;
+    } catch {
+      // Not JSON we understand — forward verbatim rather than guessing.
+      return baseFetch(input, forwarded);
+    }
+
+    if (!hasExplicitThink && "think" in body) {
+      delete body.think;
+    }
+
+    const current =
+      typeof body.options === "object" && body.options !== null
+        ? (body.options as Record<string, unknown>)
+        : {};
+    if (current.num_ctx === undefined) {
+      const numCtx = await resolvePinnedNumCtx();
+      if (numCtx !== undefined) body.options = { ...current, num_ctx: numCtx };
+    }
+
+    // The package emits an `options` bag even when every key resolved to
+    // nothing; an empty object is noise upstream.
+    const options = body.options;
+    if (
+      typeof options === "object" &&
+      options !== null &&
+      Object.keys(options).length === 0
+    ) {
+      delete body.options;
+    }
+
+    return baseFetch(input, { ...forwarded, body: JSON.stringify(body) });
+  };
+}
+
+/**
+ * Default output budget for calls that set no `maxOutputTokens` (see
+ * defaultMaxOutputTokens), so a model that reasons by default never runs into
+ * a small provider or SDK default. Anthropic matters most: its SDK substitutes a per-model
+ * table that lags new model ids and Vertex `@` spellings (4096 for unknown
+ * ids on older SDKs, 128k on newer ones, which older models reject), so it
+ * gets the safe fallback. Explicit per-call values still win.
+ */
+/**
+ * Defaults for a Responses-transport model; explicit per-call values win.
+ * `store: false` because every caller resends the whole history: with the
+ * SDK's default the request names earlier items by id, which the provider
+ * never stored (Perplexity's Agent API stores nothing, and turns run
+ * stateless), so it fails. That holds for one-off requests such as
+ * compaction summaries too, not only for turns that set it.
+ */
+function withResponsesDefaults(
+  model: Parameters<typeof wrapLanguageModel>[0]["model"],
+  defaults: { forceReasoning?: boolean },
+) {
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v3",
+      transformParams: async ({ params }) => ({
+        ...params,
+        providerOptions: {
+          ...params.providerOptions,
+          openai: {
+            store: false,
+            ...defaults,
+            ...params.providerOptions?.openai,
+          },
+        },
+      }),
+    },
+  });
+}
+
+function withCatalogOutputBudget(
+  model: LLMModel,
+  target: {
+    provider: SupportedProvider;
+    modelName: string;
+    chatApiKeyId?: string;
+  },
+): LLMModel {
+  // Plain ids and v2 providers (Ollama) keep their provider default.
+  if (typeof model === "string" || model.specificationVersion !== "v3")
+    return model;
+  // OpenAI chat models take the cap as max_completion_tokens: the SDK maps
+  // maxOutputTokens to the legacy max_tokens for names its reasoning
+  // heuristic misses, which newer models reject (see the chat route). Other
+  // providers built on the OpenAI chat client (Perplexity) keep max_tokens.
+  const viaCompletionTokens =
+    target.provider === "openai" && model.provider === "openai.chat";
+  // One lookup per model instance, not per generation step.
+  let resolved: Promise<number | undefined> | undefined;
+  const resolveDefault = () => {
+    resolved ??= resolveModelOutputBudget(target).then((budget) =>
+      defaultMaxOutputTokens(target.provider, budget),
+    );
+    return resolved;
+  };
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v3",
+      transformParams: async ({ params }) => {
+        if (!viaCompletionTokens) {
+          if (params.maxOutputTokens !== undefined) return params;
+          // Chat deliberately omits the automatic cap for Nova High, whose
+          // provider contract forbids maxTokens. Do not reinsert it here.
+          // Explicit caller caps are preserved by the guard above.
+          const reasoning = params.providerOptions?.bedrock?.reasoningConfig;
+          if (
+            target.provider === "bedrock" &&
+            getBedrockReasoningFamily(target.modelName) === "nova" &&
+            reasoning !== null &&
+            typeof reasoning === "object" &&
+            !Array.isArray(reasoning) &&
+            reasoning.type === "enabled" &&
+            reasoning.maxReasoningEffort === "high"
+          ) {
+            return params;
+          }
+          const maxOutputTokens = await resolveDefault();
+          return maxOutputTokens === undefined
+            ? params
+            : { ...params, maxOutputTokens };
+        }
+        const openai = params.providerOptions?.openai;
+        const maxCompletionTokens =
+          openai?.maxCompletionTokens ??
+          params.maxOutputTokens ??
+          (await resolveDefault());
+        if (maxCompletionTokens === undefined) return params;
+        return {
+          ...params,
+          maxOutputTokens: undefined,
+          providerOptions: {
+            ...params.providerOptions,
+            openai: { ...openai, maxCompletionTokens },
+          },
+        };
+      },
+    },
+  });
+}
+
+/**
+ * Wraps fetch to surface thinking text on Anthropic models that think by
+ * default (see anthropicThinksByDefault).
+ *
+ * On those models thinking already runs — and is billed — on every request,
+ * but `display` defaults to `"omitted"`, so responses carry only empty
+ * thinking blocks with a signature and the UI has nothing to render.
+ * Requesting `thinking: {type: "adaptive", display: "summarized"}` returns the
+ * summary text. Per Anthropic's docs this changes neither billing nor prompt
+ * caching: `adaptive` is those models' default, and explicitly sending a
+ * default is equivalent to omitting it.
+ *
+ * The field is injected at the HTTP boundary because the installed
+ * @ai-sdk/anthropic (3.x) has no `display` provider option — its closed Zod
+ * schema strips unknown thinking keys, so no providerOptions value can carry
+ * it (same constraint as OLLAMA_THINK_EXPLICIT_HEADER above).
+ *
+ * A request that already carries a `thinking` configuration is forwarded
+ * untouched, as is any model where thinking is off by default (Opus 4.8 and
+ * earlier) — enabling thinking there would add cost.
+ */
+function createAnthropicThinkingDisplayFetch(
+  providedFetch?: typeof globalThis.fetch,
+): typeof globalThis.fetch {
+  const baseFetch = providedFetch ?? globalThis.fetch;
+
+  return (input, init) => {
+    if (typeof init?.body !== "string") {
+      return baseFetch(input, init);
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(init.body);
+      if (typeof parsed !== "object" || parsed === null) {
+        return baseFetch(input, init);
+      }
+      body = parsed as Record<string, unknown>;
+    } catch {
+      // Not JSON we understand — forward verbatim rather than guessing.
+      return baseFetch(input, init);
+    }
+
+    if (
+      typeof body.model !== "string" ||
+      !anthropicThinksByDefault(body.model) ||
+      "thinking" in body
+    ) {
+      return baseFetch(input, init);
+    }
+
+    body.thinking = { type: "adaptive", display: "summarized" };
+    return baseFetch(input, { ...init, body: JSON.stringify(body) });
+  };
+}
+
+/**
+ * Splits an internal marker header out of a request's headers, returning the
+ * headers to actually send. `HeadersInit` has three shapes and the AI SDK uses
+ * more than one of them, so normalize to a plain object rather than assuming.
+ */
+function takeMarkerHeader(
+  headers: HeadersInit | undefined,
+  markerName: string,
+): {
+  hasMarker: boolean;
+  headers: Record<string, string>;
+} {
+  const out: Record<string, string> = {};
+  let hasMarker = false;
+
+  const take = (key: string, value: string) => {
+    if (key.toLowerCase() === markerName) {
+      hasMarker = true;
+      return;
+    }
+    out[key] = value;
+  };
+
+  if (headers instanceof Headers) {
+    headers.forEach((value, key) => {
+      take(key, value);
+    });
+  } else if (Array.isArray(headers)) {
+    for (const [key, value] of headers) take(key, value);
+  } else if (headers) {
+    for (const [key, value] of Object.entries(headers)) take(key, value);
+  }
+
+  return { hasMarker, headers: out };
+}
+
+/**
+ * Build the proxy base URL for a provider.
+ *
+ * The proxy runs in this very process, so the dial stays on the loopback
+ * interface — addressed by {@link LOOPBACK_HOST} rather than `localhost`,
+ * which resolves to the `::1` address this IPv4-only server never listens on.
+ *
+ * @public — exported for testability
+ */
+export function buildProxyBaseUrl(provider: string, agentId: string): string {
+  return `http://${LOOPBACK_HOST}:${config.api.port}/v1/${provider}/${agentId}`;
+}

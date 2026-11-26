@@ -1,0 +1,478 @@
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  ManagedResourceSchema,
+  type Permissions,
+  ResourcePermissionActionSchema,
+} from "@archestra/shared";
+import { type QueryClient, useQuery } from "@tanstack/react-query";
+import {
+  hasPagePermissions,
+  hasPermissions,
+  pageUsesCapabilities,
+} from "@/lib/auth/auth.utils";
+import { sessionConfirmation } from "@/lib/auth/session-confirmation";
+import { authClient } from "@/lib/clients/auth/auth-client";
+import { impersonationEndedNotice } from "@/lib/impersonation-ended-notice";
+import { PERSISTED_QUERY_META } from "@/lib/query-persistence";
+import { throwOnApiError } from "@/lib/utils/api";
+
+export const authQueryKeys = {
+  all: ["auth"] as const,
+  session: () => [...authQueryKeys.all, "session"] as const,
+  sessions: () => [...authQueryKeys.all, "sessions"] as const,
+  userPermissions: () => [...authQueryKeys.all, "userPermissions"] as const,
+  // Under `all` so role, member and team changes, which invalidate it,
+  // refresh object grants along with the permission map.
+  scopedCapabilities: () =>
+    [...authQueryKeys.all, "scopedCapabilities"] as const,
+  defaultCredentialsEnabled: () =>
+    [...authQueryKeys.all, "defaultCredentialsEnabled"] as const,
+};
+
+/**
+ * Fetch the current session through the shared TanStack Query cache.
+ *
+ * Always use this hook instead of calling `authClient.getSession()` directly in
+ * components/hooks. This keeps every session consumer on one query key with the
+ * same stale-time and invalidation path, and prevents repeated session requests
+ * when many auth-aware components mount together.
+ */
+export function useSession() {
+  return useQuery({
+    queryKey: authQueryKeys.session(),
+    queryFn: async ({ client: queryClient }) => {
+      // Cold load only: a refresh restores the session from the persisted
+      // snapshot, and the shell's queries are already running by then. The
+      // seed runs alongside the session check but nothing waits on it here:
+      // the queries it fills await it themselves (awaitBootstrapSeed).
+      const isColdLoad =
+        queryClient.getQueryData(authQueryKeys.session()) === undefined;
+      if (isColdLoad) startBootstrapSeed(queryClient);
+      const previous = queryClient.getQueryData<{
+        session?: { impersonatedBy?: string | null };
+      } | null>(authQueryKeys.session());
+      const { data, error } = await authClient.getSession();
+      // An explicit authentication refusal clears the shell. An unavailable
+      // server must enter the query's error state and retain the last session.
+      if (error?.status === 401 || error?.status === 403) {
+        sessionConfirmation.set(false);
+        explainEndedImpersonation(previous);
+        return null;
+      }
+      throwOnApiError(error, { toastOnError: false });
+      sessionConfirmation.set(!!data?.user);
+      if (!data?.user) explainEndedImpersonation(previous);
+      return data;
+    },
+    // A signed-in session without an organization is a moment, not a state:
+    // the user just joined, and the server-side cache of their session can
+    // briefly lag the membership. Every organization-scoped screen reads as
+    // empty meanwhile, so it is never fresh, and the query checks again
+    // until the organization shows up.
+    staleTime: (query) =>
+      isAwaitingOrganization(query.state.data) ? 0 : 5 * 60 * 1000,
+    refetchInterval: (query) =>
+      isAwaitingOrganization(query.state.data)
+        ? AWAITING_ORGANIZATION_REFETCH_MS
+        : false,
+    gcTime: 30 * 60 * 1000,
+    // Keep focus refetching on so backgrounded tabs discover revoked or changed sessions promptly.
+    refetchOnWindowFocus: true,
+    // Restored on refresh so the shell renders straight away instead of
+    // sitting behind a session check. The persisted copy is stripped of the
+    // session token, and the request below still runs and replaces it.
+    meta: PERSISTED_QUERY_META,
+  });
+}
+
+/**
+ * Checks user permissions, resolving to true or false.
+ * Under the hood, fetches all user permissions and re-uses this permission cache.
+ */
+export function useHasPermissions(
+  permissionsToCheck: Permissions,
+  permissionScope?: string,
+) {
+  const capabilities = useScopedCapabilities(permissionScope !== undefined);
+  const {
+    data: userPermissions,
+    isPending,
+    isLoading,
+    isError,
+    error,
+    isSuccess,
+    status,
+  } = useAllPermissions();
+
+  const scopedCheck = permissionScope !== undefined;
+  const missingPermissions: Permissions = {};
+  for (const [resource, actions] of Object.entries(permissionsToCheck)) {
+    const missingActions = actions.filter((action) =>
+      scopedCheck &&
+      ManagedResourceSchema.safeParse(resource).success &&
+      ResourcePermissionActionSchema.safeParse(action).success
+        ? !capabilities.data?.some(
+            (grant) =>
+              grant.resource === resource &&
+              grant.action === action &&
+              (grant.scope === "*" || grant.scope === permissionScope),
+          )
+        : !hasPermissions(userPermissions, { [resource]: [action] }),
+    );
+    if (missingActions.length) {
+      missingPermissions[resource as keyof Permissions] = missingActions;
+    }
+  }
+  const hasPermissionResult = Object.keys(missingPermissions).length === 0;
+
+  return {
+    data: hasPermissionResult,
+    missingPermissions,
+    isPending: isPending || (scopedCheck && capabilities.isPending),
+    isLoading: isLoading || (scopedCheck && capabilities.isLoading),
+    isError,
+    error,
+    isSuccess,
+    status,
+  };
+}
+
+/**
+ * Page discovery accepts an object read grant; it does not imply global read.
+ * A page that no grant can open does not wait for the scoped capabilities.
+ */
+/** Whether the user holds at least one of `options`; false for none. */
+export function useHasAnyPagePermissions(options: Permissions[]) {
+  const needsCapabilities = options.some(pageUsesCapabilities);
+  const permissions = useAllPermissions();
+  const capabilities = useScopedCapabilities(needsCapabilities);
+  return {
+    data: options.some((required) =>
+      hasPagePermissions({
+        userPermissions: permissions.data,
+        required,
+        capabilities: capabilities.data ?? [],
+      }),
+    ),
+    isPending:
+      permissions.isPending || (needsCapabilities && capabilities.isPending),
+  };
+}
+
+export function useHasPagePermissions(required: Permissions) {
+  const needsCapabilities = pageUsesCapabilities(required);
+  const permissions = useAllPermissions();
+  const capabilities = useScopedCapabilities(needsCapabilities);
+  return {
+    data: hasPagePermissions({
+      userPermissions: permissions.data,
+      required,
+      capabilities: capabilities.data ?? [],
+    }),
+    isPending:
+      permissions.isPending || (needsCapabilities && capabilities.isPending),
+  };
+}
+
+export function useScopedCapabilities(enabled = true) {
+  const { data: session } = useSession();
+  return useQuery({
+    queryKey: authQueryKeys.scopedCapabilities(),
+    enabled: enabled && !!session?.user,
+    queryFn: async ({ client }) => {
+      const seed = await awaitBootstrapSeed(client);
+      if (seed) return seed.scopedCapabilities;
+      const { data, error } = await archestraApiSdk.getScopedCapabilities();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    // Same lifetime as the permission map it completes: page guards wait on
+    // both, so restoring only one would leave a guarded page empty on refresh.
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
+    meta: PERSISTED_QUERY_META,
+  });
+}
+
+/**
+ * Returns only the permissions the user is missing from the required set.
+ * Useful for showing specific missing permissions in tooltips.
+ */
+export function useMissingPermissions(
+  requiredPermissions: Permissions,
+): Permissions {
+  const { data: userPermissions } = useAllPermissions();
+
+  if (
+    !requiredPermissions ||
+    Object.keys(requiredPermissions).length === 0 ||
+    !userPermissions
+  ) {
+    return requiredPermissions;
+  }
+
+  const missing: Permissions = {};
+
+  for (const [resource, actions] of Object.entries(requiredPermissions)) {
+    const userActions = userPermissions[resource as keyof Permissions] ?? [];
+    const missingActions = actions.filter(
+      (a) => !(userActions as readonly string[]).includes(a),
+    );
+    if (missingActions.length > 0) {
+      missing[resource as keyof Permissions] = missingActions;
+    }
+  }
+
+  return missing;
+}
+
+/**
+ * Low-level query which fetches the dictionary of all user permissions.
+ * Avoid using directly in components and use useHasPermissions instead.
+ */
+export function useAllPermissions(options?: { revalidateOnMount?: boolean }) {
+  const { data: session, isPending: isSessionPending } = useSession();
+  const isAuthenticated = !!session?.user;
+
+  return useQuery({
+    queryKey: authQueryKeys.userPermissions(),
+    queryFn: async ({ client }) => {
+      const seed = await awaitBootstrapSeed(client);
+      if (seed) return seed.permissions;
+      const { data, error } = await archestraApiSdk.getUserPermissions();
+      throwOnApiError(error, { toastOnError: false });
+      return data;
+    },
+    retry: false,
+    throwOnError: false,
+    enabled: !isSessionPending && isAuthenticated,
+    staleTime: 5 * 60 * 1000,
+    refetchOnMount: (query) =>
+      options?.revalidateOnMount &&
+      Date.now() - query.state.dataUpdatedAt > REVALIDATE_ON_MOUNT_MIN_AGE_MS
+        ? "always"
+        : true,
+    gcTime: 30 * 60 * 1000,
+    // Decides which nav items and pages exist, so restoring it is what lets
+    // the sidebar come back with its real contents rather than empty.
+    meta: PERSISTED_QUERY_META,
+  });
+}
+
+/**
+ * True while the permission map is asked for again because the caller just
+ * mounted. The map is trusted for five minutes, and nothing tells an open tab
+ * that an administrator changed the viewer's role in the meantime. A screen
+ * about to refuse the viewer on the cached map waits for this answer first.
+ * A map answered moments ago (a page load) is not asked for again.
+ */
+export function usePermissionsRevalidatingOnMount(): boolean {
+  const { isFetching, isFetchedAfterMount } = useAllPermissions({
+    revalidateOnMount: true,
+  });
+  return isFetching && !isFetchedAfterMount;
+}
+
+/**
+ * Resolves the permission map with given keys and results of permission checks as values.
+ * Use in cases where multiple useHasPermissions calls are impossible.
+ * A key with an entry in `alternatives` is also permitted by that second set
+ * (e.g. `alternativePagePermissionsMap` for pages).
+ * @returns A record with the same keys as the input map and boolean values indicating permission checks, or null if still loading.
+ */
+export function usePermissionMap<Key extends string>(
+  map: Record<Key, Permissions>,
+  alternatives?: Partial<Record<Key, Permissions | Permissions[]>>,
+): Record<Key, boolean> | null {
+  const { isPending: isSessionPending } = useSession();
+  const { data: userPermissions, isLoading } = useAllPermissions();
+  const capabilities = useScopedCapabilities();
+
+  // Both queries sit disabled — not loading — until the session resolves, so
+  // without the session check a fresh page load briefly reads as "no
+  // permissions" and guards acting on that answer redirect a reader who has them.
+  if (
+    isSessionPending ||
+    isLoading ||
+    (userPermissions === undefined && capabilities.isLoading)
+  ) {
+    return null;
+  }
+
+  const result = {} as Record<Key, boolean>;
+
+  for (const [key, requiredPermissions] of Object.entries(map) as [
+    Key,
+    Permissions,
+  ][]) {
+    const alternative = alternatives?.[key];
+    result[key] = [requiredPermissions, ...[alternative ?? []].flat()]
+      .map((required) =>
+        hasPagePermissions({
+          userPermissions,
+          required,
+          capabilities: capabilities.data ?? [],
+        }),
+      )
+      .some(Boolean);
+  }
+
+  return result;
+}
+
+/**
+ * Whether the default admin credentials are still active. `enabled: false`
+ * skips the request. The sidebar warnings pass it for viewers who never see
+ * the default-credentials warning.
+ */
+export function useDefaultCredentialsEnabled({
+  enabled = true,
+}: {
+  enabled?: boolean;
+} = {}) {
+  return useQuery({
+    queryKey: authQueryKeys.defaultCredentialsEnabled(),
+    enabled,
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getDefaultCredentialsStatus();
+      throwOnApiError(error, { toastOnError: false });
+      return data?.enabled ?? false;
+    },
+    // Refetch when window is focused to catch password changes
+    refetchOnWindowFocus: true,
+    // Keep data fresh with shorter stale time
+    staleTime: 10000, // 10 seconds
+  });
+}
+
+/**
+ * Put a server-resolved session and bootstrap into a fresh query cache, under
+ * the keys the shell's gates and the session check read, so a server-rendered
+ * page renders signed in on the server and on the first browser render alike
+ * — and neither asks for them again while they are fresh.
+ */
+export function seedShellQueries(
+  queryClient: QueryClient,
+  seed: {
+    session: unknown;
+    bootstrap: archestraApiTypes.GetBootstrapResponses["200"];
+  },
+) {
+  queryClient.setQueryData(authQueryKeys.session(), seed.session);
+  applyBootstrap(queryClient, seed.bootstrap);
+}
+
+// ===
+
+const AWAITING_ORGANIZATION_REFETCH_MS = 10_000;
+
+/** A permission map younger than this is the page load's own answer. */
+const REVALIDATE_ON_MOUNT_MIN_AGE_MS = 2_000;
+
+/**
+ * The session is gone and the last one known was an impersonated one: it ran
+ * out (it has a fixed length) before the app could return to the admin's own
+ * session. The sign-in page follows and says why (`ImpersonationEndedNotice`).
+ */
+function explainEndedImpersonation(
+  previous: { session?: { impersonatedBy?: string | null } } | null | undefined,
+) {
+  if (!previous?.session?.impersonatedBy) return;
+  impersonationEndedNotice.remember("signed-out");
+}
+
+function isAwaitingOrganization(
+  data:
+    | {
+        user?: unknown;
+        session?: { activeOrganizationId?: string | null } | null;
+      }
+    | null
+    | undefined,
+): boolean {
+  return !!data?.user && !data.session?.activeOrganizationId;
+}
+
+type BootstrapData = NonNullable<
+  Awaited<ReturnType<typeof archestraApiSdk.getBootstrap>>["data"]
+>;
+
+/**
+ * The cold load's `/api/bootstrap` answer while it is in flight, so a query it
+ * seeds that becomes enabled first (the session usually answers sooner) waits
+ * for it instead of starting a second request. Cleared once settled: later
+ * fetches of those queries are refreshes and go to their own endpoints.
+ */
+const bootstrapSeeds = new WeakMap<
+  QueryClient,
+  Promise<BootstrapData | null>
+>();
+
+/**
+ * Await the in-flight bootstrap seed, if any. Resolves to null when there is
+ * none or it failed, and the caller fetches its own endpoint.
+ *
+ * @public — also awaited by the config, organization, appearance and member
+ * default queries
+ */
+export async function awaitBootstrapSeed(
+  queryClient: QueryClient,
+): Promise<BootstrapData | null> {
+  return (await bootstrapSeeds.get(queryClient)) ?? null;
+}
+
+/**
+ * Seeds the queries the app shell reads (permissions, scoped capabilities,
+ * organization, config, public config, appearance, and the member's default
+ * agent and model) from one `/api/bootstrap` request, fired alongside the
+ * session check on a cold load, so those queries are already fresh when the
+ * session resolves and enables them, instead of starting a second wave.
+ *
+ * Best-effort: when signed out or on any failure nothing is seeded and each
+ * query fetches its own endpoint as before. The keys are spelled out rather
+ * than imported because the modules owning them import this one.
+ */
+function startBootstrapSeed(queryClient: QueryClient) {
+  if (bootstrapSeeds.has(queryClient)) return;
+  const seed = (async () => {
+    try {
+      const { data } = await archestraApiSdk.getBootstrap();
+      if (!data) return null;
+      applyBootstrap(queryClient, data);
+      return data;
+    } catch {
+      // Fall back to the individual requests.
+      return null;
+    } finally {
+      bootstrapSeeds.delete(queryClient);
+    }
+  })();
+  bootstrapSeeds.set(queryClient, seed);
+}
+
+function applyBootstrap(
+  queryClient: QueryClient,
+  data: archestraApiTypes.GetBootstrapResponses["200"],
+) {
+  queryClient.setQueryData(authQueryKeys.userPermissions(), data.permissions);
+  queryClient.setQueryData(
+    authQueryKeys.scopedCapabilities(),
+    data.scopedCapabilities,
+  );
+  queryClient.setQueryData(["config"], data.config);
+  if (data.organization) {
+    queryClient.setQueryData(["organization", "details"], data.organization);
+  }
+  // Checked one by one: a backend from before these parts answers without them.
+  if (data.publicConfig) {
+    queryClient.setQueryData(["public-config"], data.publicConfig);
+  }
+  if (data.appearance) {
+    queryClient.setQueryData(["appearance", "public"], data.appearance);
+  }
+  if (data.memberDefaultAgent) {
+    queryClient.setQueryData(["member-default-agent"], data.memberDefaultAgent);
+  }
+}

@@ -1,0 +1,536 @@
+import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm";
+import {
+  decryptEncryptedChatMessageRow,
+  encryptEncryptedChatMessageContent,
+} from "@/content-encryption/encrypted-chat";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed; helpers pass plaintext through when the feature is off
+import { isContentEncryptionEnabled } from "@/content-encryption/index.ee";
+import {
+  decryptMessageRow,
+  encryptMessageContent,
+  // biome-ignore lint/style/noRestrictedImports: dual-licensed; helpers pass plaintext through when the feature is off
+} from "@/content-encryption/rows.ee";
+import db, { schema, withDbTransaction } from "@/database";
+import { notDeletedConversation } from "@/database/schemas/conversation";
+import {
+  ApiError,
+  type ConversationContentKey,
+  type InsertMessage,
+  type Message,
+} from "@/types";
+import { repairLoneSurrogates } from "@/utils/lone-surrogates";
+import { isUuid, uuidv7 } from "@/utils/uuid";
+
+type DbExecutor =
+  | typeof db
+  | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Encrypt content under the encrypted chat key when one is in play,
+ * otherwise under the at-rest layer (which passes through when disabled).
+ */
+function encryptContent(
+  content: unknown,
+  key: ConversationContentKey | null | undefined,
+): unknown {
+  return key
+    ? encryptEncryptedChatMessageContent(content, key)
+    : encryptMessageContent(content);
+}
+
+/** Decrypt counterpart of {@link encryptContent}, mutating the row in place. */
+function decryptRow<T extends object>(
+  row: T,
+  key: ConversationContentKey | null | undefined,
+): T {
+  return key
+    ? decryptEncryptedChatMessageRow(row, key)
+    : decryptMessageRow(row);
+}
+
+class MessageModel {
+  /**
+   * Update the conversation's timestamps when messages are added.
+   *
+   * `lastMessageAt` is forced strictly past `lastReadAt` when the two would
+   * otherwise land on the same millisecond: the unread check is a strict
+   * `lastMessageAt > lastReadAt` comparison, so a message racing markRead
+   * into the same instant would silently read as already-seen. GREATEST with
+   * a 1ms nudge keeps the invariant "written after a read ⇒ unread" without
+   * needing a sequence column.
+   */
+  private static async touchConversation(
+    conversationId: string,
+    executor: DbExecutor = db,
+  ): Promise<void> {
+    await executor
+      .update(schema.conversationsTable)
+      .set({
+        updatedAt: new Date(),
+        // now() (DB clock), not a JS Date param: node-postgres serializes
+        // Dates in host-local time and the ::timestamp cast drops the offset,
+        // shifting the stamp by the host's UTC offset on non-UTC hosts.
+        lastMessageAt: sql`GREATEST(now()::timestamp, ${schema.conversationsTable.lastReadAt} + interval '1 millisecond')`,
+      })
+      // A late message that lands in the mid-stream window after a delete must
+      // not resurrect the conversation's activity timestamp; no-op if deleted.
+      .where(
+        and(
+          notDeletedConversation,
+          eq(schema.conversationsTable.id, conversationId),
+        ),
+      );
+  }
+
+  static async create(
+    data: InsertMessage,
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message> {
+    // Insert and recency-touch are one transaction: retention eligibility is
+    // judged on `lastMessageAt`, so content must never exist with a stale
+    // recency stamp (a crash between the two statements would otherwise leave
+    // a fresh message on a conversation that still looks expired).
+    return withDbTransaction(async (tx) => {
+      const [message] = await tx
+        .insert(schema.messagesTable)
+        // Monotonic v7 id: with `created_at` at millisecond precision,
+        // back-to-back writes can tie, and every "which message is later?"
+        // question (ordering, delete-subsequent) breaks ties with the id.
+        .values({
+          id: uuidv7(),
+          ...data,
+          content: encryptContent(
+            sanitizeContent(data.content),
+            conversationKey,
+          ),
+        })
+        .returning();
+      decryptRow(message, conversationKey);
+
+      // Update conversation's updatedAt so it sorts to the top
+      await MessageModel.touchConversation(data.conversationId, tx);
+
+      return message;
+    });
+  }
+
+  static async bulkCreate(
+    messages: InsertMessage[],
+    executor: DbExecutor = db,
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<void> {
+    if (messages.length === 0) {
+      return;
+    }
+
+    await executor.insert(schema.messagesTable).values(
+      messages.map((m) => ({
+        id: uuidv7(),
+        ...m,
+        content: encryptContent(sanitizeContent(m.content), conversationKey),
+      })),
+    );
+
+    // Update conversation's updatedAt for all affected conversations. Must run
+    // on the same executor: with a transaction executor, a separate `db` query
+    // would escape the transaction (and deadlock single-connection PGlite).
+    const uniqueConversationIds = [
+      ...new Set(messages.map((m) => m.conversationId)),
+    ];
+    await Promise.all(
+      uniqueConversationIds.map((id) =>
+        MessageModel.touchConversation(id, executor),
+      ),
+    );
+  }
+
+  static async findByConversation(
+    conversationId: string,
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message[]> {
+    const messages = await db
+      .select()
+      .from(schema.messagesTable)
+      .where(eq(schema.messagesTable.conversationId, conversationId))
+      .orderBy(schema.messagesTable.createdAt, schema.messagesTable.id);
+
+    for (const message of messages) {
+      decryptRow(message, conversationKey);
+    }
+    return messages;
+  }
+
+  /** Cheap emptiness probe — avoids loading full rows just to count them. */
+  static async existsForConversation(conversationId: string): Promise<boolean> {
+    const [row] = await db
+      .select({ id: schema.messagesTable.id })
+      .from(schema.messagesTable)
+      .where(eq(schema.messagesTable.conversationId, conversationId))
+      .limit(1);
+
+    return row !== undefined;
+  }
+
+  static async delete(id: string): Promise<void> {
+    await db
+      .delete(schema.messagesTable)
+      .where(eq(schema.messagesTable.id, id));
+  }
+
+  static async deleteByConversation(conversationId: string): Promise<void> {
+    await db
+      .delete(schema.messagesTable)
+      .where(eq(schema.messagesTable.conversationId, conversationId));
+  }
+
+  static async findById(
+    messageId: string,
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message | null> {
+    const [message] = await db
+      .select()
+      .from(schema.messagesTable)
+      .where(eq(schema.messagesTable.id, messageId));
+
+    return message ? decryptRow(message, conversationKey) : null;
+  }
+
+  /**
+   * Find a message by either its database UUID or AI SDK content ID, scoped
+   * to a single conversation. Messages loaded from the DB have UUID ids, but
+   * messages created in the current session keep their AI SDK nanoid until
+   * the page reloads. Content IDs are client-supplied and carry no uniqueness
+   * guarantee across conversations, so every caller must know and pass the
+   * conversation.
+   */
+  static async findByAnyIdInConversation(
+    id: string,
+    conversationId: string,
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message | null> {
+    if (isUuid(id)) {
+      const [byDbId] = await db
+        .select()
+        .from(schema.messagesTable)
+        .where(
+          and(
+            eq(schema.messagesTable.id, id),
+            eq(schema.messagesTable.conversationId, conversationId),
+          ),
+        );
+      if (byDbId) return decryptRow(byDbId, conversationKey);
+    }
+
+    // Under content encryption (at-rest or per-conversation), content->>'id'
+    // cannot see into envelopes; scan the conversation's (bounded) messages
+    // in JS instead — decryption also passes plaintext rows through, so
+    // mixed states resolve correctly.
+    if (conversationKey || isContentEncryptionEnabled()) {
+      const rows = await MessageModel.findByConversation(
+        conversationId,
+        conversationKey,
+      );
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const content = rows[i].content as { id?: unknown } | null;
+        if (content && content.id === id) return rows[i];
+      }
+      return null;
+    }
+
+    // Content IDs carry no uniqueness guarantee even within one conversation
+    // (client-supplied), so pick the newest match deterministically instead of
+    // whatever row the planner returns first.
+    const [byContentId] = await db
+      .select()
+      .from(schema.messagesTable)
+      .where(
+        and(
+          sql`${schema.messagesTable.content}->>'id' = ${id}`,
+          eq(schema.messagesTable.conversationId, conversationId),
+        ),
+      )
+      .orderBy(
+        desc(schema.messagesTable.createdAt),
+        desc(schema.messagesTable.id),
+      )
+      .limit(1);
+
+    return byContentId ? decryptMessageRow(byContentId) : null;
+  }
+
+  /**
+   * Set or clear the owner's feedback on a message. Deliberately does not
+   * touch the conversation's recency — a rating is not new activity.
+   * Returns null when the row vanished between lookup and update (e.g. a
+   * concurrent regeneration deleted it).
+   */
+  static async updateFeedback(
+    messageId: string,
+    feedback: Message["feedback"],
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message | null> {
+    const [updatedMessage] = await db
+      .update(schema.messagesTable)
+      .set({
+        feedback,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.messagesTable.id, messageId))
+      .returning();
+
+    return updatedMessage ? decryptRow(updatedMessage, conversationKey) : null;
+  }
+
+  static async updateTextPart(
+    messageId: string,
+    partIndex: number,
+    newText: string,
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message> {
+    // Fetch the current message
+    const message = await MessageModel.findById(messageId, conversationKey);
+
+    if (!message) {
+      throw new ApiError(404, "Message not found");
+    }
+
+    // biome-ignore lint/suspicious/noExplicitAny: UIMessage content is dynamic
+    const content = message.content as any;
+
+    // Validate that the part exists
+    if (!content.parts?.[partIndex]) {
+      throw new ApiError(400, "Invalid part index");
+    }
+
+    // Validate that the part is a text part to prevent data corruption
+    // Only text parts can have their text property modified
+    if (content.parts[partIndex].type !== "text") {
+      throw new ApiError(
+        400,
+        `Cannot update non-text part: part at index ${partIndex} is of type "${content.parts[partIndex].type}"`,
+      );
+    }
+
+    // Update the specific part's text
+    content.parts[partIndex].text = newText;
+
+    // Content mutation + recency touch are atomic — an edit is fresh activity
+    // and must never leave the conversation looking retention-expired.
+    return withDbTransaction(async (tx) => {
+      const [updatedMessage] = await tx
+        .update(schema.messagesTable)
+        .set({
+          content: encryptContent(content, conversationKey),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.messagesTable.id, messageId))
+        .returning();
+      decryptRow(updatedMessage, conversationKey);
+
+      await MessageModel.touchConversation(updatedMessage.conversationId, tx);
+
+      return updatedMessage;
+    });
+  }
+
+  /**
+   * Replace a message's full content. Used when a turn changes after it was
+   * first persisted — e.g. a tool call that has since been approved or declined.
+   */
+  static async updateContent(
+    messageId: string,
+    content: Message["content"],
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message> {
+    // Validate the row exists so the return type holds — `.returning()`
+    // would otherwise yield `undefined` for an unknown id.
+    const message = await MessageModel.findById(messageId, conversationKey);
+    if (!message) {
+      throw new Error("Message not found");
+    }
+
+    // A content change (e.g. a tool call's final output landing in an existing
+    // assistant message) is fresh activity the owner may not have seen, so it
+    // advances the conversation's recency the same way a new message does —
+    // atomically, so content can never outrun the recency stamp.
+    return withDbTransaction(async (tx) => {
+      const [updatedMessage] = await tx
+        .update(schema.messagesTable)
+        .set({
+          content: encryptContent(content, conversationKey),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.messagesTable.id, messageId))
+        .returning();
+      decryptRow(updatedMessage, conversationKey);
+
+      await MessageModel.touchConversation(updatedMessage.conversationId, tx);
+
+      return updatedMessage;
+    });
+  }
+
+  /**
+   * Hard-delete the given message rows by their primary keys. Accepts an
+   * optional executor so a regenerate can delete the stale trailing turn and
+   * persist its replacement in one transaction. Deletion is by identity (id),
+   * never by a timestamp window, so colliding `createdAt` values can't cause
+   * the wrong rows to be removed.
+   */
+  static async deleteByIds(
+    ids: string[],
+    executor: DbExecutor = db,
+  ): Promise<number> {
+    if (ids.length === 0) {
+      return 0;
+    }
+
+    const rows = await executor
+      .delete(schema.messagesTable)
+      .where(inArray(schema.messagesTable.id, ids))
+      .returning({ id: schema.messagesTable.id });
+
+    return rows.length;
+  }
+
+  static async deleteAfterMessage(
+    conversationId: string,
+    messageId: string,
+  ): Promise<void> {
+    // Get the message to find its createdAt timestamp
+    const message = await MessageModel.findById(messageId);
+    if (!message) {
+      throw new Error("Message not found");
+    }
+
+    // Verify the message belongs to the specified conversation to prevent
+    // accidentally deleting messages from a different conversation
+    if (message.conversationId !== conversationId) {
+      throw new Error("Message does not belong to the specified conversation");
+    }
+
+    // Delete all messages in this conversation created after this message
+    await db
+      .delete(schema.messagesTable)
+      .where(
+        and(
+          eq(schema.messagesTable.conversationId, conversationId),
+          MessageModel.createdAfter(message),
+        ),
+      );
+  }
+
+  /**
+   * Update a text part and optionally delete subsequent messages atomically.
+   * Accepts an optional executor so callers can compose this with other writes
+   * (e.g. compaction invalidation) inside a single outer transaction.
+   */
+  static async updateTextPartAndDeleteSubsequent(
+    messageId: string,
+    partIndex: number,
+    newText: string,
+    deleteSubsequent: boolean,
+    executor: DbExecutor = db,
+    conversationKey?: ConversationContentKey | null,
+  ): Promise<Message> {
+    const run = async (tx: DbExecutor): Promise<Message> => {
+      const [message] = await tx
+        .select()
+        .from(schema.messagesTable)
+        .where(eq(schema.messagesTable.id, messageId));
+
+      if (!message) {
+        throw new ApiError(404, "Message not found");
+      }
+      decryptRow(message, conversationKey);
+
+      // biome-ignore lint/suspicious/noExplicitAny: UIMessage content is dynamic
+      const content = message.content as any;
+
+      // Validate that the part exists
+      if (!content.parts?.[partIndex]) {
+        throw new ApiError(400, "Invalid part index");
+      }
+
+      // Validate that the part is a text part to prevent data corruption
+      if (content.parts[partIndex].type !== "text") {
+        throw new ApiError(
+          400,
+          `Cannot update non-text part: part at index ${partIndex} is of type "${content.parts[partIndex].type}"`,
+        );
+      }
+
+      // Update the specific part's text
+      content.parts[partIndex].text = newText;
+
+      // Update the message in the database
+      const [updatedMessage] = await tx
+        .update(schema.messagesTable)
+        .set({
+          content: encryptContent(content, conversationKey),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.messagesTable.id, messageId))
+        .returning();
+      decryptRow(updatedMessage, conversationKey);
+
+      // Delete subsequent messages if requested
+      if (deleteSubsequent) {
+        await tx
+          .delete(schema.messagesTable)
+          .where(
+            and(
+              eq(schema.messagesTable.conversationId, message.conversationId),
+              MessageModel.createdAfter(message),
+            ),
+          );
+      }
+
+      // An edit is fresh activity — advance recency in the same transaction
+      // so retention eligibility can never lag the content change.
+      await MessageModel.touchConversation(message.conversationId, tx);
+
+      return updatedMessage;
+    };
+
+    // when no outer transaction is provided, wrap so update + delete remain atomic
+    if (executor === db) {
+      return await withDbTransaction(async (tx) => run(tx));
+    }
+    return await run(executor);
+  }
+
+  /**
+   * Rows that come after `message` in the canonical conversation order,
+   * `(created_at, id)`. A strict `created_at >` comparison alone misses
+   * same-millisecond neighbours (back-to-back writes routinely tie), so
+   * "subsequent" is the tuple comparison that matches exactly what
+   * findByConversation displays. New ids are monotonic UUIDv7, so for
+   * fresh data the id tiebreak IS insertion order.
+   */
+  private static createdAfter(message: Pick<Message, "id" | "createdAt">) {
+    return or(
+      gt(schema.messagesTable.createdAt, message.createdAt),
+      and(
+        eq(schema.messagesTable.createdAt, message.createdAt),
+        gt(schema.messagesTable.id, message.id),
+      ),
+    );
+  }
+}
+
+/**
+ * Strip unpaired UTF-16 surrogates out of message content before it is written.
+ *
+ * Postgres `jsonb` is UTF-8 and a lone surrogate has no encoding in it, so an
+ * insert carrying one fails with "invalid input syntax for type json" — and the
+ * message is lost rather than saved imperfectly. A truncated completion or a
+ * tool result cut mid-character is enough to trigger it, so the choice is
+ * between storing the turn with the broken half replaced by U+FFFD and not
+ * storing the turn at all.
+ */
+function sanitizeContent(content: Message["content"]): Message["content"] {
+  return repairLoneSurrogates(content).value as Message["content"];
+}
+
+export default MessageModel;

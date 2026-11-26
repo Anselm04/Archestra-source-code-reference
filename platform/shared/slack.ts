@@ -1,0 +1,129 @@
+import { DEFAULT_APP_NAME } from "./consts";
+import { urlSlugify } from "./utils";
+
+/**
+ * Slack bot scopes required by the Archestra Slack app.
+ *
+ * This is the single source of truth used by:
+ * - The Slack app manifest builder (frontend setup dialog)
+ * - Runtime scope validation (backend SlackProvider)
+ *
+ * When adding a new scope, add it here and it will automatically
+ * appear in both the manifest and the scope-drift detection.
+ */
+export const SLACK_REQUIRED_BOT_SCOPES = [
+  "assistant:write",
+  "commands",
+  "app_mentions:read",
+  "channels:history",
+  "channels:join",
+  "channels:read",
+  "chat:write",
+  "files:read",
+  "files:write",
+  "groups:history",
+  "groups:read",
+  "im:history",
+  "im:read",
+  "im:write",
+  "reactions:read",
+  "users:read",
+  "users:read.email",
+] as const;
+
+/**
+ * Native Slack slash commands.
+ *
+ * Slack command names are generated from the app name in the setup manifest,
+ * but the command suffixes are stable so the backend can route any app-name
+ * prefix to the right action.
+ */
+export const SLACK_SLASH_COMMAND_SUFFIXES = {
+  SELECT_AGENT: "-select-agent",
+  STATUS: "-status",
+  HELP: "-help",
+} as const;
+
+export type SlackSlashCommandAction = keyof typeof SLACK_SLASH_COMMAND_SUFFIXES;
+
+export const SLACK_SLASH_COMMANDS = buildSlackSlashCommands(DEFAULT_APP_NAME);
+
+export function buildSlackSlashCommands(
+  appName: string,
+): Record<SlackSlashCommandAction, string> {
+  // Slack's 32-character limit includes the slash and the action suffix.
+  // Keep one prefix for every command, reserving room for the longest suffix.
+  const maxPrefixLength =
+    32 -
+    1 -
+    Math.max(
+      ...Object.values(SLACK_SLASH_COMMAND_SUFFIXES).map(
+        (suffix) => suffix.length,
+      ),
+    );
+  const commandPrefix =
+    urlSlugify(appName).slice(0, maxPrefixLength).replace(/-+$/, "") ||
+    "archestra";
+
+  return {
+    SELECT_AGENT: `/${commandPrefix}${SLACK_SLASH_COMMAND_SUFFIXES.SELECT_AGENT}`,
+    STATUS: `/${commandPrefix}${SLACK_SLASH_COMMAND_SUFFIXES.STATUS}`,
+    HELP: `/${commandPrefix}${SLACK_SLASH_COMMAND_SUFFIXES.HELP}`,
+  };
+}
+
+export function getSlackSlashCommandAction(
+  command: string | undefined,
+): SlackSlashCommandAction | null {
+  const normalizedCommand = command?.trim().toLowerCase();
+  if (!normalizedCommand?.startsWith("/")) return null;
+
+  for (const [action, suffix] of Object.entries(SLACK_SLASH_COMMAND_SUFFIXES)) {
+    const hasPrefix = normalizedCommand.length > suffix.length + 1;
+    if (hasPrefix && normalizedCommand.endsWith(suffix)) {
+      return action as SlackSlashCommandAction;
+    }
+  }
+
+  return null;
+}
+
+export function buildSlackSlashCommandsForCommand(
+  command: string | undefined,
+): Record<SlackSlashCommandAction, string> {
+  const normalizedCommand = command?.trim().toLowerCase();
+  const suffix = Object.values(SLACK_SLASH_COMMAND_SUFFIXES).find((value) =>
+    normalizedCommand?.endsWith(value),
+  );
+
+  if (!normalizedCommand?.startsWith("/") || !suffix) {
+    return SLACK_SLASH_COMMANDS;
+  }
+
+  const commandPrefix = normalizedCommand.slice(0, -suffix.length);
+  return {
+    SELECT_AGENT: `${commandPrefix}${SLACK_SLASH_COMMAND_SUFFIXES.SELECT_AGENT}`,
+    STATUS: `${commandPrefix}${SLACK_SLASH_COMMAND_SUFFIXES.STATUS}`,
+    HELP: `${commandPrefix}${SLACK_SLASH_COMMAND_SUFFIXES.HELP}`,
+  };
+}
+
+/**
+ * Slack's rule for a bot's handle, which is what people type after @:
+ * lowercase letters, digits, `.`, `_` and `-`, at most 35 characters.
+ */
+export const SLACK_BOT_HANDLE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,34}$/;
+
+/**
+ * The default handle for an agent's Slack bot: "Archestra" + "Marketing Team"
+ * → "archestra_marketing_team".
+ */
+export function slackHandleFor(appName: string, agentName: string): string {
+  return [appName, agentName]
+    .join("_")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "")
+    .slice(0, 35);
+}

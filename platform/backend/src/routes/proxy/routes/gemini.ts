@@ -1,0 +1,384 @@
+import { RouteId } from "@archestra/shared";
+import fastifyHttpProxy from "@fastify/http-proxy";
+import type { FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import config from "@/config";
+import logger from "@/logging";
+import ModelModel from "@/models/model";
+import {
+  constructResponseSchema,
+  ErrorResponsesSchema,
+  Gemini,
+  OpenAi,
+  UuidIdSchema,
+} from "@/types";
+import { geminiEmbeddingsAdapterFactory } from "../adapters";
+import {
+  type GeminiRequestWithModel,
+  geminiAdapterFactory,
+} from "../adapters/gemini";
+import { PROXY_API_PREFIX, PROXY_BODY_LIMIT } from "../common";
+import { createPassthroughAuthenticator } from "../llm-proxy-auth";
+import { handleLLMProxy } from "../llm-proxy-handler";
+import { cleanForwardedBody } from "./proxy-prehandler";
+
+/**
+ * NOTE: Gemini uses colon-literals in their routes. For fastify, double colon is used to escape the colon-literal in
+ * the route
+ */
+const geminiProxyRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  const API_PREFIX = `${PROXY_API_PREFIX}/gemini`;
+
+  logger.debug("[UnifiedProxy] Registering unified Gemini routes");
+
+  /**
+   * Register HTTP proxy for all Gemini routes EXCEPT generateContent and streamGenerateContent.
+   * The client's API version is kept: /v1/gemini/v1beta/cachedContents goes to
+   * https://generativelanguage.googleapis.com/v1beta/cachedContents. Several
+   * endpoints, cachedContents among them, exist only on v1beta.
+   */
+  await fastify.register(fastifyHttpProxy, {
+    upstream: config.llm.gemini.baseUrl,
+    prefix: `${API_PREFIX}/v1beta`,
+    rewritePrefix: "/v1beta",
+    preHandler: createGeminiProxyPreHandler(),
+    replyOptions: { rewriteRequestHeaders: stripArchestraHeaders },
+  });
+
+  await fastify.register(fastifyHttpProxy, {
+    upstream: config.llm.gemini.baseUrl,
+    prefix: `${API_PREFIX}/:agentId/v1beta`,
+    rewritePrefix: "/v1beta",
+    preHandler: createGeminiProxyPreHandler(),
+    replyOptions: { rewriteRequestHeaders: stripArchestraHeaders },
+  });
+
+  const EMBEDDINGS_SUFFIX = "/embeddings";
+
+  /**
+   * OpenAI-compatible embeddings endpoint (default agent).
+   *
+   * Accepts an OpenAI-shaped embeddings request and translates it to Gemini's
+   * native `embedContent` API, returning an OpenAI-shaped response. This lets
+   * OpenAI SDK clients call Gemini embeddings without using Gemini's native
+   * `models/{model}:embedContent` route (still reachable via the proxy above).
+   */
+  fastify.post(
+    `${API_PREFIX}${EMBEDDINGS_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.GeminiEmbeddingsWithDefaultAgent,
+        description: "Create embeddings with Gemini (uses default agent)",
+        tags: ["LLM Proxy"],
+        body: OpenAi.API.EmbeddingRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(OpenAi.API.EmbeddingResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url },
+        "[UnifiedProxy] Handling Gemini embeddings request (default agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.EmbeddingRequest,
+        request,
+        reply,
+        geminiEmbeddingsAdapterFactory,
+      );
+    },
+  );
+
+  /**
+   * OpenAI-compatible embeddings endpoint (specific agent).
+   */
+  fastify.post(
+    `${API_PREFIX}/:agentId${EMBEDDINGS_SUFFIX}`,
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.GeminiEmbeddingsWithAgent,
+        description: "Create embeddings with Gemini for a specific agent",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          agentId: UuidIdSchema,
+        }),
+        body: OpenAi.API.EmbeddingRequestSchema,
+        headers: OpenAi.API.ChatCompletionsHeadersSchema,
+        response: constructResponseSchema(OpenAi.API.EmbeddingResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url, agentId: request.params.agentId },
+        "[UnifiedProxy] Handling Gemini embeddings request (with agent)",
+      );
+      return handleLLMProxy(
+        request.body as OpenAi.Types.EmbeddingRequest,
+        request,
+        reply,
+        geminiEmbeddingsAdapterFactory,
+      );
+    },
+  );
+
+  /**
+   * Generate route endpoint pattern for Gemini
+   * Uses regex param syntax to handle the colon-literal properly
+   */
+  const generateRouteEndpoint = (
+    verb: "generateContent" | "streamGenerateContent",
+    includeAgentId = false,
+  ) =>
+    `${API_PREFIX}/${includeAgentId ? ":agentId/" : ""}v1beta/models/:model(^.+$)::${verb}`;
+
+  /**
+   * Default agent endpoint for Gemini generateContent (non-streaming)
+   */
+  fastify.post(
+    generateRouteEndpoint("generateContent"),
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        description: "Generate content using Gemini (default agent)",
+        summary: "Generate content using Gemini",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          model: z.string().describe("The model to use"),
+        }),
+        headers: Gemini.API.GenerateContentHeadersSchema,
+        body: Gemini.API.GenerateContentRequestSchema,
+        response: constructResponseSchema(
+          Gemini.API.GenerateContentResponseSchema,
+        ),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url, model: request.params.model },
+        "[UnifiedProxy] Handling Gemini request (default agent, non-streaming)",
+      );
+      // Inject model and streaming flag into body for adapter
+      const requestWithModel: GeminiRequestWithModel = {
+        ...request.body,
+        _model: request.params.model,
+        _isStreaming: false,
+      };
+
+      return handleLLMProxy(
+        requestWithModel,
+        request,
+        reply,
+        geminiAdapterFactory,
+      );
+    },
+  );
+
+  /**
+   * Default agent endpoint for Gemini streamGenerateContent (streaming)
+   */
+  fastify.post(
+    generateRouteEndpoint("streamGenerateContent"),
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        description: "Stream generated content using Gemini (default agent)",
+        summary: "Stream generated content using Gemini",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          model: z.string().describe("The model to use"),
+        }),
+        headers: Gemini.API.GenerateContentHeadersSchema,
+        body: Gemini.API.GenerateContentRequestSchema,
+        // Streaming responses don't have a schema
+        response: ErrorResponsesSchema,
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        { url: request.url, model: request.params.model },
+        "[UnifiedProxy] Handling Gemini request (default agent, streaming)",
+      );
+      // Inject model and streaming flag into body for adapter
+      const requestWithModel: GeminiRequestWithModel = {
+        ...request.body,
+        _model: request.params.model,
+        _isStreaming: true,
+      };
+
+      return handleLLMProxy(
+        requestWithModel,
+        request,
+        reply,
+        geminiAdapterFactory,
+      );
+    },
+  );
+
+  /**
+   * Agent-specific endpoint for Gemini generateContent (non-streaming)
+   */
+  fastify.post(
+    generateRouteEndpoint("generateContent", true),
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        description: "Generate content using Gemini with specific agent",
+        summary: "Generate content using Gemini (specific agent)",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          agentId: UuidIdSchema,
+          model: z.string().describe("The model to use"),
+        }),
+        headers: Gemini.API.GenerateContentHeadersSchema,
+        body: Gemini.API.GenerateContentRequestSchema,
+        response: constructResponseSchema(
+          Gemini.API.GenerateContentResponseSchema,
+        ),
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        {
+          url: request.url,
+          agentId: request.params.agentId,
+          model: request.params.model,
+        },
+        "[UnifiedProxy] Handling Gemini request (with agent, non-streaming)",
+      );
+
+      // Inject model and streaming flag into body for adapter
+      const requestWithModel: GeminiRequestWithModel = {
+        ...request.body,
+        _model: request.params.model,
+        _isStreaming: false,
+      };
+
+      return handleLLMProxy(
+        requestWithModel,
+        request,
+        reply,
+        geminiAdapterFactory,
+      );
+    },
+  );
+
+  /**
+   * Agent-specific endpoint for Gemini streamGenerateContent (streaming)
+   */
+  fastify.post(
+    generateRouteEndpoint("streamGenerateContent", true),
+    {
+      bodyLimit: PROXY_BODY_LIMIT,
+      schema: {
+        description:
+          "Stream generated content using Gemini with specific agent",
+        summary: "Stream generated content using Gemini (specific agent)",
+        tags: ["LLM Proxy"],
+        params: z.object({
+          agentId: UuidIdSchema,
+          model: z.string().describe("The model to use"),
+        }),
+        headers: Gemini.API.GenerateContentHeadersSchema,
+        body: Gemini.API.GenerateContentRequestSchema,
+        // Streaming responses don't have a schema
+        response: ErrorResponsesSchema,
+      },
+    },
+    async (request, reply) => {
+      logger.debug(
+        {
+          url: request.url,
+          agentId: request.params.agentId,
+          model: request.params.model,
+        },
+        "[UnifiedProxy] Handling Gemini request (with agent, streaming)",
+      );
+
+      // Inject model and streaming flag into body for adapter
+      const requestWithModel: GeminiRequestWithModel = {
+        ...request.body,
+        _model: request.params.model,
+        _isStreaming: true,
+      };
+
+      return handleLLMProxy(
+        requestWithModel,
+        request,
+        reply,
+        geminiAdapterFactory,
+      );
+    },
+  );
+};
+
+export default geminiProxyRoutes;
+
+function createGeminiProxyPreHandler() {
+  const authenticateGemini = createPassthroughAuthenticator("gemini");
+  return async (request: FastifyRequest, reply: FastifyReply) => {
+    // Every request passes the platform check before anything below reads the
+    // body or forwards it upstream. Google's SDKs send the key in
+    // x-goog-api-key or ?key=; the authenticator reads a platform key there and
+    // swaps it for the mapped Gemini key in x-goog-api-key.
+    await authenticateGemini({
+      request,
+      agentId: (request.params as { agentId?: string } | undefined)?.agentId,
+    });
+
+    const urlPath = request.url.split("?")[0];
+    if (
+      request.method === "POST" &&
+      (urlPath.includes(":generateContent") ||
+        urlPath.includes(":streamGenerateContent"))
+    ) {
+      return reply.code(400).send({
+        error: {
+          code: 400,
+          message: "generateContent requests should use the dedicated endpoint",
+          status: "INVALID_ARGUMENT",
+        },
+      });
+    }
+
+    if (request.method === "POST") {
+      // Native inference methods select the model in the path, including
+      // image/video prediction and batch generation. Token counts and reads
+      // of already-started operations do not start model execution.
+      let decodedPath = urlPath;
+      try {
+        decodedPath = decodeURIComponent(urlPath);
+      } catch {
+        // Leave malformed paths for the provider's existing validation.
+      }
+      const modelMethod = decodedPath.match(/\/models\/([^/:]+):([^/:]+)\/?$/);
+      if (
+        modelMethod &&
+        !["countTokens", "fetchPredictOperation"].includes(modelMethod[2])
+      ) {
+        await ModelModel.assertAvailable({
+          provider: "gemini",
+          modelId: modelMethod[1],
+        });
+      }
+    }
+
+    await cleanForwardedBody(request);
+  };
+}
+
+function stripArchestraHeaders(
+  _request: unknown,
+  headers: Record<string, string | string[] | undefined>,
+): Record<string, string | string[] | undefined> {
+  // Gemini builds its own header set instead of using the catch-all filter.
+  return Object.fromEntries(
+    Object.entries(headers).filter(
+      ([name]) =>
+        !name.toLowerCase().startsWith("x-archestra-") &&
+        name.toLowerCase() !== "provider-api-key-id",
+    ),
+  );
+}

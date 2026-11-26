@@ -1,0 +1,692 @@
+// @vitest-environment node
+import { formSchema } from "./mcp-catalog-form.types";
+import { stripEnvVarQuotes } from "./mcp-catalog-form.utils";
+
+describe("stripEnvVarQuotes", () => {
+  describe("real-world environment variable examples", () => {
+    it.each([
+      [
+        "should handle DATABASE_URL with quotes",
+        '"postgresql://user:pass@localhost:5432/db"',
+        "postgresql://user:pass@localhost:5432/db",
+      ],
+      [
+        "should handle API_KEY with quotes",
+        '"sk-proj-abc123"',
+        "sk-proj-abc123",
+      ],
+      ["should handle PORT with quotes", '"3000"', "3000"],
+      [
+        "should handle REDIS_URL with quotes",
+        '"redis://localhost:6379"',
+        "redis://localhost:6379",
+      ],
+      ["should handle NODE_ENV with quotes", '"production"', "production"],
+      [
+        "should handle FEATURE_FLAGS with JSON",
+        '\'{"feature1":true,"feature2":false}\'',
+        '{"feature1":true,"feature2":false}',
+      ],
+    ])("%s", (_, input, expected) => {
+      expect(stripEnvVarQuotes(input)).toBe(expected);
+    });
+  });
+
+  describe("edge cases", () => {
+    it("should return empty string for empty input", () => {
+      expect(stripEnvVarQuotes("")).toBe("");
+    });
+
+    it("should return single character as-is", () => {
+      expect(stripEnvVarQuotes("a")).toBe("a");
+      expect(stripEnvVarQuotes('"')).toBe('"');
+    });
+
+    it("should not strip mismatched quotes", () => {
+      expect(stripEnvVarQuotes("\"value'")).toBe("\"value'");
+      expect(stripEnvVarQuotes("'value\"")).toBe("'value\"");
+    });
+
+    it("should not strip quotes that are not at both ends", () => {
+      expect(stripEnvVarQuotes('value"')).toBe('value"');
+      expect(stripEnvVarQuotes('"value')).toBe('"value');
+    });
+
+    it("should handle values with internal quotes", () => {
+      expect(stripEnvVarQuotes('"value with "quotes" inside"')).toBe(
+        'value with "quotes" inside',
+      );
+    });
+
+    it("should handle escaped quotes inside", () => {
+      expect(stripEnvVarQuotes('"value\\"escaped\\""')).toBe(
+        'value\\"escaped\\"',
+      );
+    });
+  });
+});
+
+describe("formSchema", () => {
+  const baseValidData = {
+    name: "Test MCP Server",
+    authMethod: "none" as const,
+    includeBearerPrefix: true,
+    authHeaderName: "",
+    additionalHeaders: [],
+    oauthConfig: undefined,
+  };
+
+  describe("remote servers", () => {
+    it("should validate remote server with valid URL", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        localConfig: undefined,
+      };
+
+      expect(formSchema.parse(data)).toEqual(data);
+    });
+
+    it("accepts RFC-valid punctuation in header names", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        additionalHeaders: [
+          {
+            headerName: "X_API.KEY",
+            promptOnInstallation: true,
+            required: false,
+            value: "",
+            description: "",
+          },
+        ],
+        localConfig: undefined,
+      };
+
+      expect(formSchema.safeParse(data).success).toBe(true);
+    });
+
+    it("should reject remote server without URL", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "remote" as const,
+        serverUrl: "",
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "Server URL is required for remote servers",
+      );
+    });
+
+    it("should reject remote server with invalid URL", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "remote" as const,
+        serverUrl: "not-a-url",
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow("Must be an http(s) URL");
+    });
+
+    it("should reject a remote server URL with a non-http scheme", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "remote" as const,
+        serverUrl: "javascript:alert(1)",
+        localConfig: undefined,
+      };
+
+      expect(formSchema.safeParse(data).success).toBe(false);
+    });
+
+    it("should reject duplicate auth and additional header names", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        authMethod: "bearer" as const,
+        includeBearerPrefix: true,
+        authHeaderName: "x-api-key",
+        additionalHeaders: [
+          {
+            headerName: "X-Api-Key",
+            promptOnInstallation: true,
+            required: false,
+            value: "",
+            description: "",
+          },
+        ],
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "Header names must be unique",
+      );
+    });
+
+    it("should reject invalid additional header names", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        additionalHeaders: [
+          {
+            headerName: "x api key",
+            promptOnInstallation: true,
+            required: false,
+            value: "",
+            description: "",
+          },
+        ],
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "Header name contains invalid HTTP header characters",
+      );
+    });
+  });
+
+  describe("local servers", () => {
+    it("should validate local server with command only", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "local" as const,
+        serverUrl: "",
+        localConfig: {
+          command: "node",
+          arguments: "",
+          environment: [],
+          dockerImage: "",
+          transportType: "stdio" as const,
+          httpPort: "",
+          httpPath: "/mcp",
+        },
+      };
+
+      expect(formSchema.parse(data)).toEqual(data);
+    });
+
+    it("should validate local server with Docker image only", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "local" as const,
+        serverUrl: "",
+        localConfig: {
+          command: "",
+          arguments: "",
+          environment: [],
+          dockerImage: "registry.example.com/my-mcp-server:latest",
+          transportType: "stdio" as const,
+          httpPort: "",
+          httpPath: "/mcp",
+        },
+      };
+
+      expect(formSchema.parse(data)).toEqual(data);
+    });
+
+    it("should validate local server with both command and Docker image", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "local" as const,
+        serverUrl: "",
+        localConfig: {
+          command: "node",
+          arguments: "/app/server.js",
+          environment: [
+            {
+              key: "NODE_ENV",
+              type: "plain_text" as const,
+              value: "production",
+              promptOnInstallation: false,
+            },
+          ],
+          dockerImage: "registry.example.com/my-mcp-server:latest",
+          transportType: "streamable-http" as const,
+          httpPort: "8080",
+          httpPath: "/mcp",
+        },
+      };
+
+      expect(formSchema.parse(data)).toEqual(data);
+    });
+
+    it("should reject local server without command or Docker image", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "local" as const,
+        serverUrl: "",
+        localConfig: {
+          command: "",
+          arguments: "",
+          environment: [],
+          dockerImage: "",
+          transportType: "stdio" as const,
+          httpPort: "",
+          httpPath: "/mcp",
+        },
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "Either command or container image must be provided",
+      );
+    });
+
+    it("should reject local server with only whitespace command", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "local" as const,
+        serverUrl: "",
+        localConfig: {
+          command: "   ",
+          arguments: "",
+          environment: [],
+          dockerImage: "",
+          transportType: "stdio" as const,
+          httpPort: "",
+          httpPath: "/mcp",
+        },
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "Either command or container image must be provided",
+      );
+    });
+
+    it("should validate streamable-http transport type", () => {
+      const data = {
+        ...baseValidData,
+        serverType: "local" as const,
+        serverUrl: "",
+        localConfig: {
+          command: "node",
+          arguments: "",
+          environment: [],
+          dockerImage: "",
+          transportType: "streamable-http" as const,
+          httpPort: "3000",
+          httpPath: "/api/mcp",
+        },
+      };
+
+      expect(formSchema.parse(data)).toEqual(data);
+    });
+
+    it("should reject enterprise-managed credentials for local stdio servers", () => {
+      const data = {
+        ...baseValidData,
+        authMethod: "enterprise_managed" as const,
+        enterpriseManagedConfig: {
+          requestedCredentialType: "bearer_token" as const,
+          tokenInjectionMode: "authorization_bearer" as const,
+        },
+        serverType: "local" as const,
+        serverUrl: "",
+        localConfig: {
+          command: "node",
+          arguments: "",
+          environment: [],
+          dockerImage: "",
+          transportType: "stdio" as const,
+          httpPort: "",
+          httpPath: "/mcp",
+        },
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "Enterprise-managed credentials require streamable-http transport for self-hosted servers.",
+      );
+    });
+  });
+
+  describe("required fields", () => {
+    it("should reject empty name", () => {
+      const data = {
+        ...baseValidData,
+        name: "",
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow("Name is required");
+    });
+
+    it("should validate OAuth configuration when authMethod is oauth", () => {
+      const data = {
+        ...baseValidData,
+        authMethod: "oauth" as const,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        oauthConfig: {
+          client_id: "test-client-id",
+          client_secret: "test-secret",
+          audience: "",
+          redirect_uris: "https://localhost:3000/oauth-callback",
+          scopes: "read,write",
+          supports_resource_metadata: true,
+          grantType: "authorization_code",
+          authServerUrl: "https://auth.example.com",
+          wellKnownUrl:
+            "https://auth.example.com/.well-known/openid-configuration",
+          resourceMetadataUrl:
+            "https://api.example.com/.well-known/oauth-protected-resource",
+        },
+        localConfig: undefined,
+      };
+
+      expect(formSchema.parse(data)).toEqual(data);
+    });
+
+    it("should reject OAuth config when only one explicit endpoint is set", () => {
+      const data = {
+        ...baseValidData,
+        authMethod: "oauth" as const,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        oauthConfig: {
+          client_id: "test-client-id",
+          client_secret: "test-secret",
+          audience: "",
+          redirect_uris: "https://localhost:3000/oauth-callback",
+          scopes: "read,write",
+          supports_resource_metadata: true,
+          grantType: "authorization_code",
+          authorizationEndpoint: "https://auth.example.com/oauth/authorize",
+        },
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "Authorization and token endpoints must be set together",
+      );
+    });
+
+    it("should reject OAuth config with empty redirect_uris", () => {
+      const data = {
+        ...baseValidData,
+        authMethod: "oauth" as const,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        oauthConfig: {
+          client_id: "test-client-id",
+          client_secret: "test-secret",
+          audience: "",
+          redirect_uris: "",
+          scopes: "read,write",
+          supports_resource_metadata: true,
+          grantType: "authorization_code",
+        },
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "At least one redirect URI is required",
+      );
+    });
+
+    it("should reject MCP OAuth redirect URIs that use the SSO callback path", () => {
+      const data = {
+        ...baseValidData,
+        authMethod: "oauth" as const,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        oauthConfig: {
+          client_id: "test-client-id",
+          client_secret: "test-secret",
+          audience: "",
+          redirect_uris:
+            "https://app.example.com/api/auth/sso/callback/EntraID",
+          scopes: "read,write",
+          supports_resource_metadata: true,
+          grantType: "authorization_code",
+        },
+        localConfig: undefined,
+      };
+
+      expect(() => formSchema.parse(data)).toThrow(
+        "MCP OAuth redirect URIs must use /oauth-callback",
+      );
+    });
+
+    it("should validate OAuth client credentials without redirect URIs", () => {
+      const data = {
+        ...baseValidData,
+        authMethod: "oauth_client_credentials" as const,
+        serverType: "remote" as const,
+        serverUrl: "https://api.example.com/mcp",
+        oauthConfig: {
+          client_id: "",
+          client_secret: "",
+          audience: "https://api.example.com",
+          redirect_uris: "",
+          scopes: "",
+          supports_resource_metadata: false,
+          grantType: "client_credentials" as const,
+          authServerUrl: "",
+          authorizationEndpoint: "",
+          wellKnownUrl: "",
+          resourceMetadataUrl: "",
+          tokenEndpoint: "https://auth.example.com/oauth/token",
+          oauthServerUrl: "",
+        },
+        localConfig: undefined,
+      };
+
+      expect(formSchema.parse(data)).toEqual({
+        ...data,
+        oauthConfig: {
+          ...data.oauthConfig,
+          authorizationEndpoint: undefined,
+          oauthServerUrl: undefined,
+        },
+      });
+    });
+  });
+});
+
+describe("inactive authentication validation", () => {
+  const values = {
+    name: "Auth transition server",
+    serverType: "remote" as const,
+    serverUrl: "https://mcp.example.com",
+    includeBearerPrefix: true,
+    authHeaderName: "",
+    oauthConfig: {
+      grantType: "authorization_code" as const,
+      supports_resource_metadata: true,
+      redirect_uris: "",
+      authorizationEndpoint: "invalid-url",
+    },
+  };
+
+  it.each([
+    "none",
+    "auth_header",
+    "bearer",
+    "enterprise_managed",
+    "idp_jwt",
+  ])("ignores an invalid OAuth draft for %s", (authMethod) => {
+    const result = formSchema.safeParse({
+      ...values,
+      authMethod,
+      enterpriseManagedConfig: { identityProviderId: "synthetic-idp" },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("still rejects the OAuth draft when OAuth is selected again", () => {
+    expect(
+      formSchema.safeParse({ ...values, authMethod: "oauth" }).success,
+    ).toBe(false);
+  });
+
+  it("ignores authorization-code-only URLs for client credentials", () => {
+    expect(
+      formSchema.safeParse({
+        ...values,
+        authMethod: "oauth_client_credentials",
+        oauthConfig: {
+          ...values.oauthConfig,
+          grantType: "client_credentials",
+          tokenEndpoint: "https://auth.example.com/token",
+          oauthServerUrl: "invalid-url",
+        },
+      }).success,
+    ).toBe(true);
+  });
+
+  it("ignores an invalid legacy header name after leaving bearer auth", () => {
+    expect(
+      formSchema.safeParse({
+        ...values,
+        authMethod: "none",
+        authHeaderName: "Invalid Header",
+      }).success,
+    ).toBe(true);
+    expect(
+      formSchema.safeParse({
+        ...values,
+        oauthConfig: undefined,
+        authMethod: "bearer",
+        authHeaderName: "Invalid Header",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps validating shared headers and server fields after switching to none", () => {
+    const result = formSchema.safeParse({
+      ...values,
+      authMethod: "none",
+      name: "",
+      additionalHeaders: [
+        {
+          headerName: "Invalid Header",
+          promptOnInstallation: true,
+          required: true,
+        },
+      ],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.path)).toEqual(
+        expect.arrayContaining([
+          ["name"],
+          ["additionalHeaders", 0, "headerName"],
+        ]),
+      );
+    }
+  });
+});
+
+describe("desktop MCP servers", () => {
+  const desktop = {
+    name: "matlab",
+    description: "Runs on the user's own computer",
+    serverType: "desktop_mcp" as const,
+    authMethod: "none" as const,
+    includeBearerPrefix: true,
+  };
+
+  it("needs a name and nothing about a connection", () => {
+    const result = formSchema.safeParse({ ...desktop, serverUrl: "" });
+    expect(result.success).toBe(true);
+    expect(formSchema.safeParse({ ...desktop, name: "" }).success).toBe(false);
+  });
+
+  it("ignores whatever another hosting choice left in the form", () => {
+    // The user filled in a remote server, then a self-hosted one, and then
+    // chose Desktop: none of those drafts may block the save or be submitted.
+    const result = formSchema.safeParse({
+      ...desktop,
+      serverUrl: "not-a-url",
+      multitenant: true,
+      authMethod: "enterprise_managed",
+      authHeaderName: "Invalid Header",
+      enterpriseManagedConfig: {},
+      oauthConfig: {
+        grantType: "authorization_code",
+        supports_resource_metadata: true,
+        redirect_uris: "",
+        authorizationEndpoint: "invalid-url",
+      },
+      additionalHeaders: [
+        {
+          headerName: "Invalid Header",
+          promptOnInstallation: true,
+          required: true,
+        },
+      ],
+      localConfig: {
+        command: "",
+        arguments: "",
+        environment: [],
+        dockerImage: "",
+        transportType: "stdio",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toMatchObject({
+        serverType: "desktop_mcp",
+        serverUrl: "",
+        multitenant: false,
+        authMethod: "none",
+        additionalHeaders: [],
+      });
+      expect(result.data.oauthConfig).toBeUndefined();
+      expect(result.data.enterpriseManagedConfig).toBeUndefined();
+      expect(result.data.localConfig).toBeUndefined();
+    }
+  });
+
+  it("accepts a command, a URL, or neither", () => {
+    for (const desktopConfig of [
+      { kind: "command", value: "" },
+      { kind: "command", value: "/Users/$USER/bins/mcp --home $HOME" },
+      { kind: "url", value: "http://127.0.0.1:8080/mcp" },
+      { kind: "url", value: "" },
+    ]) {
+      const result = formSchema.safeParse({ ...desktop, desktopConfig });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.desktopConfig).toEqual(desktopConfig);
+      }
+    }
+  });
+
+  it("rejects a URL that is not http(s), on the input that holds it", () => {
+    const result = formSchema.safeParse({
+      ...desktop,
+      desktopConfig: { kind: "url", value: "127.0.0.1:8080" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.path)).toEqual([
+        ["desktopConfig", "value"],
+      ]);
+    }
+  });
+
+  it("ignores a desktop draft once another hosting is chosen", () => {
+    // The user wrote a bad URL for a desktop MCP server, then chose Remote.
+    const result = formSchema.safeParse({
+      ...desktop,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      desktopConfig: { kind: "url", value: "not a url" },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.desktopConfig).toBeUndefined();
+    }
+  });
+});

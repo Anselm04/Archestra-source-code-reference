@@ -1,0 +1,109 @@
+{{- if and .Values.archestra.worker.enabled (ne (include "archestra-platform.maintenanceModeEnabled" .) "true") }}
+{{- $workerPodAnnotations := mergeOverwrite (dict) (.Values.archestra.podAnnotations | default dict) }}
+{{- $workerResources := .Values.archestra.worker.resources | default .Values.archestra.resources }}
+{{- if hasKey $workerPodAnnotations "prometheus.io/scrape" }}
+{{- $workerPodAnnotations = mergeOverwrite $workerPodAnnotations (dict "prometheus.io/port" "9000" "prometheus.io/path" "/metrics") }}
+{{- end }}
+{{- with include "archestra-platform.authSecretChecksum" . }}
+{{- $_ := set $workerPodAnnotations "checksum/auth-secret" . }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "archestra-platform.fullname" . }}-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "archestra-platform.workerLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.archestra.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "archestra-platform.workerSelectorLabels" . | nindent 6 }}
+  {{- with .Values.archestra.worker.deploymentStrategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "archestra-platform.workerLabels" . | nindent 8 }}
+        {{- /*
+          Grants this pod passage through the p4 shim's ingress NetworkPolicy
+          (Perforce knowledge-connector permission sync; see
+          backend/src/k8s/p4-shim-runtime).
+        */}}
+        archestra.io/p4-shim-client: "true"
+        {{- with include "archestra-platform.podLabels" . }}
+        {{- . | nindent 8 }}
+        {{- end }}
+      {{- if $workerPodAnnotations }}
+      annotations:
+        {{- toYaml $workerPodAnnotations | nindent 8 }}
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ include "archestra-platform.shutdownPodGrace" . }}
+      serviceAccountName: {{ include "archestra-platform.serviceAccountName" . }}
+      {{- with include "archestra-platform.podSecurityContext" . }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      initContainers:
+        {{- include "archestra-platform.initContainers" . | nindent 8 }}
+        {{- include "archestra-platform.waitForMigrationsInitContainer" . | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}-worker
+          image: {{ include "archestra-platform.image" . }}
+          imagePullPolicy: {{ .Values.archestra.imagePullPolicy | default "IfNotPresent" }}
+          {{- include "archestra-platform.containerSecurityContext" . | nindent 10 }}
+          workingDir: /app/backend
+          {{- if .Values.archestra.initContainers.vaultSecrets.enabled }}
+          {{- include "archestra-platform.vaultSecretsCommand" "node ./scripts/start-production.mjs" | nindent 10 }}
+          {{- else }}
+          command: ["node", "./scripts/start-production.mjs"]
+          {{- end }}
+          ports:
+            - name: backend
+              containerPort: 9000
+              protocol: TCP
+          env:
+            {{- include "archestra-platform.env" . | nindent 12 }}
+            {{- include "archestra-platform.nodeMemoryEnv" (dict "resources" $workerResources "containerName" (printf "%s-worker" .Chart.Name)) | nindent 12 }}
+            - name: ARCHESTRA_PROCESS_TYPE
+              value: "worker"
+          {{- with .Values.archestra.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $workerResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: backend
+            initialDelaySeconds: {{ .Values.archestra.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.archestra.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.archestra.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.archestra.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: backend
+            periodSeconds: {{ .Values.archestra.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.archestra.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.archestra.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: backend
+            periodSeconds: {{ .Values.archestra.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.archestra.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.archestra.probes.readiness.failureThreshold }}
+          {{- include "archestra-platform.volumeMounts" . | nindent 10 }}
+      {{- include "archestra-platform.scheduling" (dict "global" .Values.archestra "tier" .Values.archestra.worker) | nindent 6 }}
+      {{- with .Values.archestra.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- include "archestra-platform.topologySpreadConstraints" (dict "constraints" . "selectorLabels" (include "archestra-platform.workerSelectorLabels" $)) | nindent 8 }}
+      {{- end }}
+      {{- include "archestra-platform.volumes" . | nindent 6 }}
+{{- end }}

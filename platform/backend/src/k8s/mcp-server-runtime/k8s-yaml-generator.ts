@@ -1,0 +1,829 @@
+import {
+  type EnvironmentVariableSchema,
+  type ImagePullPolicy,
+  MCP_ORCHESTRATOR_DEFAULTS,
+  type McpServerResources,
+} from "@archestra/shared";
+import type * as k8s from "@kubernetes/client-node";
+import * as yaml from "js-yaml";
+import type { z } from "zod";
+import { resolveMcpServerResources } from "@/utils/mcp-server-resources";
+import { getMcpImagePullPolicy } from "./image-pull-policy";
+
+// Helper to create placeholder strings without triggering noTemplateCurlyInString lint rule
+const placeholder = (type: string, key: string) => `\${${type}.${key}}`;
+
+/**
+ * Context for generating deployment YAML template.
+ */
+interface DeploymentYamlContext {
+  serverId: string;
+  catalogId?: string;
+  resources?: McpServerResources;
+  serverName: string;
+  namespace: string;
+  dockerImage: string;
+  command?: string;
+  arguments?: string[];
+  environment?: z.infer<typeof EnvironmentVariableSchema>[];
+  serviceAccount?: string;
+  /** Transport type: "stdio" (default) or "streamable-http" */
+  transportType?: "stdio" | "streamable-http";
+  /** HTTP port for streamable-http transport (default: 8080) */
+  httpPort?: number;
+  /** imagePullSecrets for pulling container images from private registries */
+  imagePullSecrets?: Array<{ name: string }>;
+  /** Pull policy pinned on the catalog; unset derives one from the image */
+  imagePullPolicy?: ImagePullPolicy;
+}
+
+/**
+ * Validation result for deployment YAML.
+ */
+interface YamlValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+/**
+ * System-managed archestra placeholders.
+ */
+const ARCHESTRA_PLACEHOLDERS = [
+  "deployment_name",
+  "server_id",
+  "server_name",
+  "namespace",
+  "docker_image",
+  "secret_name",
+  "command",
+  "arguments",
+  "service_account",
+] as const;
+
+/**
+ * Protected fields that cannot be modified by user YAML.
+ * These are always overwritten at deployment time.
+ */
+/**
+ * Generates a deployment YAML template with placeholders for environment variables.
+ *
+ * @param context - The context for generating the template
+ * @returns YAML string with placeholders
+ */
+export function generateDeploymentYamlTemplate(
+  context: DeploymentYamlContext,
+): string {
+  const {
+    dockerImage,
+    environment = [],
+    transportType = "stdio",
+    httpPort = 8080,
+    imagePullSecrets,
+  } = context;
+  const needsHttp = transportType === "streamable-http";
+
+  // Build environment variables section
+  const envSection: Array<{
+    name: string;
+    value?: string;
+    valueFrom?: { secretKeyRef: { name: string; key: string } };
+  }> = [];
+
+  for (const envVar of environment) {
+    if (envVar.type === "secret") {
+      // Secret type: use secretKeyRef
+      envSection.push({
+        name: envVar.key,
+        valueFrom: {
+          secretKeyRef: {
+            name: placeholder("archestra", "secret_name"),
+            key: envVar.key,
+          },
+        },
+      });
+    } else {
+      // Plain text, boolean, number: use placeholder
+      envSection.push({
+        name: envVar.key,
+        value: placeholder("env", envVar.key),
+      });
+    }
+  }
+
+  // Build container spec based on transport type
+  const containerSpec: Record<string, unknown> = {
+    name: "mcp-server",
+    image: placeholder("archestra", "docker_image"),
+    imagePullPolicy: getMcpImagePullPolicy(dockerImage, {
+      configured: context.imagePullPolicy,
+    }),
+    // command and args come from basic config
+    ...(envSection.length > 0 ? { env: envSection } : {}),
+    resources: resolveMcpServerResources(context.resources, context.catalogId),
+  };
+
+  if (needsHttp) {
+    // HTTP transport: expose port
+    containerSpec.ports = [
+      {
+        containerPort: httpPort,
+        protocol: "TCP",
+      },
+    ];
+  } else {
+    // Stdio transport: enable stdin for JSON-RPC communication
+    containerSpec.stdin = true;
+    containerSpec.tty = false;
+  }
+
+  // Build the deployment spec structure
+  const deploymentSpec = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: {
+      name: placeholder("archestra", "deployment_name"),
+      labels: {
+        app: "mcp-server",
+        "mcp-server-id": placeholder("archestra", "server_id"),
+        "mcp-server-name": placeholder("archestra", "server_name"),
+      },
+    },
+    spec: {
+      replicas: MCP_ORCHESTRATOR_DEFAULTS.replicas,
+      selector: {
+        matchLabels: {
+          app: "mcp-server",
+          "mcp-server-id": placeholder("archestra", "server_id"),
+        },
+      },
+      template: {
+        metadata: {
+          labels: {
+            app: "mcp-server",
+            "mcp-server-id": placeholder("archestra", "server_id"),
+            "mcp-server-name": placeholder("archestra", "server_name"),
+          },
+          // annotations: {}
+        },
+        spec: {
+          terminationGracePeriodSeconds: 5,
+          enableServiceLinks: false,
+          serviceAccountName: placeholder("archestra", "service_account"),
+          ...(imagePullSecrets?.length ? { imagePullSecrets } : {}),
+          containers: [containerSpec],
+          restartPolicy: "Always",
+        },
+      },
+    },
+  };
+
+  // Convert to YAML
+  const yamlString = yaml.dump(deploymentSpec, {
+    lineWidth: -1, // Don't wrap lines
+    quotingType: '"',
+    forceQuotes: false,
+    noRefs: true,
+    sortKeys: false,
+  });
+
+  return yamlString;
+}
+
+/**
+ * Validates a deployment YAML string.
+ *
+ * @param yamlString - The YAML string to validate
+ * @returns Validation result with errors and warnings
+ */
+export function validateDeploymentYaml(
+  yamlString: string,
+): YamlValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // Try to parse the YAML
+  let parsed: unknown;
+  try {
+    parsed = yaml.load(yamlString);
+  } catch (e) {
+    const error = e as Error;
+    errors.push(`YAML syntax error: ${error.message}`);
+    return { valid: false, errors, warnings };
+  }
+
+  // Check if it's an object
+  if (!parsed || typeof parsed !== "object") {
+    errors.push("YAML must be a valid object");
+    return { valid: false, errors, warnings };
+  }
+
+  const spec = parsed as Record<string, unknown>;
+
+  // Check required fields
+  if (spec.apiVersion !== "apps/v1") {
+    errors.push('apiVersion must be "apps/v1"');
+  }
+
+  if (spec.kind !== "Deployment") {
+    errors.push('kind must be "Deployment"');
+  }
+
+  // Check metadata
+  if (!spec.metadata || typeof spec.metadata !== "object") {
+    errors.push("metadata is required");
+  }
+
+  // Check spec
+  if (!spec.spec || typeof spec.spec !== "object") {
+    errors.push("spec is required");
+  } else {
+    const deploymentSpec = spec.spec as Record<string, unknown>;
+
+    // Check template
+    if (
+      !deploymentSpec.template ||
+      typeof deploymentSpec.template !== "object"
+    ) {
+      errors.push("spec.template is required");
+    } else {
+      const template = deploymentSpec.template as Record<string, unknown>;
+
+      // Check template.spec
+      if (!template.spec || typeof template.spec !== "object") {
+        errors.push("spec.template.spec is required");
+      } else {
+        const podSpec = template.spec as Record<string, unknown>;
+
+        errors.push(...validateRestrictedPodFields(podSpec));
+
+        // Check containers
+        if (
+          !Array.isArray(podSpec.containers) ||
+          podSpec.containers.length === 0
+        ) {
+          errors.push(
+            "spec.template.spec.containers must have at least one container",
+          );
+        }
+      }
+    }
+  }
+
+  // Validate placeholders
+  const placeholderWarnings = validatePlaceholders(yamlString);
+  warnings.push(...placeholderWarnings);
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+  };
+}
+
+/**
+ * Validates placeholder syntax in the YAML.
+ */
+function validatePlaceholders(yamlString: string): string[] {
+  const warnings: string[] = [];
+
+  // Remove YAML comments before validating placeholders
+  // This prevents warnings for documentation examples like ${archestra.*}
+  const yamlWithoutComments = yamlString
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+
+  // Find all placeholders
+  const allPlaceholders = yamlWithoutComments.match(/\$\{[^}]+\}/g) || [];
+
+  for (const placeholder of allPlaceholders) {
+    // Extract the placeholder content
+    const content = placeholder.slice(2, -1); // Remove ${ and }
+    const [prefix, key] = content.split(".");
+
+    if (!key) {
+      warnings.push(`Invalid placeholder format: ${placeholder}`);
+      continue;
+    }
+
+    if (prefix === "archestra") {
+      // Check if it's a known archestra placeholder
+      if (
+        !ARCHESTRA_PLACEHOLDERS.includes(
+          key as (typeof ARCHESTRA_PLACEHOLDERS)[number],
+        )
+      ) {
+        warnings.push(`Unknown archestra placeholder: ${placeholder}`);
+      }
+    } else if (prefix !== "env" && prefix !== "secret") {
+      warnings.push(
+        `Unknown placeholder prefix: ${placeholder} (use env, secret, or archestra)`,
+      );
+    }
+  }
+
+  return warnings;
+}
+
+/**
+ * Resolves placeholders in a YAML string with actual values.
+ *
+ * @param yamlString - The YAML string with placeholders
+ * @param context - Values for archestra placeholders
+ * @param envValues - Values for env placeholders
+ * @param secretName - Name of the K8s secret for secret placeholders
+ * @returns Resolved YAML string
+ */
+export function resolvePlaceholders(
+  yamlString: string,
+  context: {
+    deploymentName: string;
+    serverId: string;
+    serverName: string;
+    namespace: string;
+    dockerImage: string;
+    secretName: string;
+    command?: string;
+    arguments?: string[];
+    serviceAccount?: string;
+  },
+  envValues: Record<string, string>,
+): string {
+  // Parse before interpolation so a configuration value cannot add YAML fields.
+  // Only scalar values are substituted; mapping keys and document structure stay
+  // under the control of the advanced-settings author.
+
+  // Resolve archestra placeholders
+  const archestraMap: Record<string, string> = {
+    deployment_name: context.deploymentName,
+    server_id: context.serverId,
+    server_name: context.serverName,
+    namespace: context.namespace,
+    docker_image: context.dockerImage,
+    secret_name: context.secretName,
+    command: context.command || "",
+    arguments: JSON.stringify(context.arguments || []),
+    service_account: context.serviceAccount || "default",
+  };
+
+  const visited = new WeakSet<object>();
+  const resolving = new WeakSet<object>();
+  function resolveValue(value: unknown): unknown {
+    if (typeof value === "string") {
+      if (value === placeholder("archestra", "arguments")) {
+        return context.arguments || [];
+      }
+      // Substitute in one pass: values containing placeholders remain data.
+      return value.replace(
+        /\$\{(archestra|env)\.([^}]+)\}/g,
+        (_, prefix, key) =>
+          prefix === "archestra"
+            ? archestraMap[key] || ""
+            : envValues[key] || "",
+      );
+    }
+    if (typeof value !== "object" || value === null) return value;
+    if (resolving.has(value))
+      throw new Error("Recursive YAML aliases are invalid");
+    if (visited.has(value)) return value;
+    visited.add(value);
+    resolving.add(value);
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index++) {
+        value[index] = resolveValue(value[index]);
+      }
+    } else {
+      for (const [key, child] of Object.entries(value)) {
+        (value as Record<string, unknown>)[key] = resolveValue(child);
+      }
+    }
+    resolving.delete(value);
+    return value;
+  }
+
+  try {
+    // Secret placeholders remain for Kubernetes secretKeyRef resolution.
+    return yaml.dump(resolveValue(yaml.load(yamlString)), {
+      lineWidth: -1,
+      noRefs: true,
+    });
+  } catch {
+    // An empty document fails parsing at the deployment boundary, preserving
+    // the existing default-deployment fallback without forwarding unsafe YAML.
+    return "";
+  }
+}
+
+/**
+ * The name of the container in a custom deployment YAML whose image is the
+ * `${archestra.docker_image}` placeholder, i.e. the container that runs the
+ * catalog's image. Null when no container uses the placeholder (the YAML names
+ * its own image) or the YAML does not parse.
+ */
+export function findDockerImagePlaceholderContainer(
+  yamlString: string,
+): string | null {
+  try {
+    const parsed = yaml.load(yamlString) as k8s.V1Deployment | undefined;
+    const containers = parsed?.spec?.template?.spec?.containers;
+    if (!Array.isArray(containers)) return null;
+    const container = containers.find(
+      (candidate) =>
+        candidate?.image === placeholder("archestra", "docker_image"),
+    );
+    return typeof container?.name === "string" ? container.name : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parses YAML and merges it with system-managed values.
+ *
+ * ## Protected Fields (always overwritten)
+ *
+ * These fields are system-managed and will be overwritten regardless of YAML values:
+ *
+ * - `metadata.name` - Set to system-generated deployment name
+ * - `metadata.labels` - Replaced with system labels:
+ *   - `app: "mcp-server"`
+ *   - `mcp-server-id: <serverId>`
+ *   - `mcp-server-name: <serverName>`
+ * - `spec.selector.matchLabels` - Always set to the id-only selector labels
+ *   (`app` + `mcp-server-id`); selectors are immutable, so the mutable
+ *   `mcp-server-name` label must never be part of pod identity
+ * - `spec.template.metadata.labels` - Replaced with system labels
+ * - `spec.template.spec.serviceAccountName` - Set from the catalog configuration
+ *
+ * Manifests that request privileged containers, added capabilities, host
+ * namespaces, host paths, or host ports are rejected.
+ *
+ * @param yamlString - The user's YAML string
+ * @param systemValues - System-managed values that must be applied
+ * @returns Merged K8s Deployment spec, or null if parsing failed
+ */
+export function customYamlToDeployment(
+  yamlString: string,
+  systemValues: {
+    deploymentName: string;
+    serverId: string;
+    serverName: string;
+    labels: Record<string, string>;
+    selectorLabels: Record<string, string>;
+    serviceAccountName?: string;
+  },
+): k8s.V1Deployment | null {
+  try {
+    const parsed = yaml.load(yamlString) as k8s.V1Deployment;
+
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    // Ensure required structure exists
+    if (!parsed.metadata) {
+      parsed.metadata = {};
+    }
+    if (!parsed.spec) {
+      parsed.spec = {} as k8s.V1DeploymentSpec;
+    }
+    if (!parsed.spec.template) {
+      parsed.spec.template = {};
+    }
+    if (!parsed.spec.template.metadata) {
+      parsed.spec.template.metadata = {};
+    }
+    if (!parsed.spec.template.spec) {
+      return null;
+    }
+
+    const podSpec = parsed.spec.template.spec;
+    if (validateRestrictedPodFields(podSpec).length > 0) {
+      return null;
+    }
+
+    // Override protected fields
+    parsed.metadata.name = systemValues.deploymentName;
+
+    parsed.metadata.labels = systemValues.labels;
+
+    // Set selector matchLabels (always system-managed; id-only — the mutable
+    // mcp-server-name label must not be part of the immutable selector)
+    parsed.spec.selector = {
+      matchLabels: systemValues.selectorLabels,
+    };
+
+    parsed.spec.template.metadata.labels = systemValues.labels;
+
+    // Kubernetes still accepts this deprecated alias when the canonical field
+    // is absent. Remove it before applying the catalog-owned identity.
+    delete podSpec.serviceAccount;
+    if (systemValues.serviceAccountName) {
+      podSpec.serviceAccountName = systemValues.serviceAccountName;
+    } else {
+      delete podSpec.serviceAccountName;
+    }
+
+    // YAML parser converts "true"/"false" to booleans and numbers to numbers.
+    // K8s env var values must be strings, so convert them back.
+    const containers = parsed.spec.template?.spec?.containers;
+    if (containers) {
+      for (const container of containers) {
+        if (container.env) {
+          for (const envVar of container.env) {
+            if (envVar.value != null && typeof envVar.value !== "string") {
+              envVar.value = String(envVar.value);
+            }
+          }
+        }
+      }
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Merges environment variables from localConfig into existing YAML.
+ * Preserves all user customizations (labels, resources, annotations, etc.)
+ * while syncing the env section with the current localConfig.environment.
+ *
+ * @param yamlString - The existing YAML string (may have user customizations)
+ * @param environment - Current environment variables from localConfig
+ * @param previouslyManagedKeys - Keys that were previously managed by localConfig.environment.
+ *   Any key in this set but not in the new environment will be removed from YAML.
+ *   If not provided, all existing env vars not in the new environment are preserved.
+ * @returns Updated YAML string with merged environment variables
+ */
+export function mergeLocalConfigIntoYaml(
+  yamlString: string,
+  environment: Array<{
+    key: string;
+    type: "plain_text" | "secret" | "boolean" | "number";
+    promptOnInstallation: boolean;
+    mounted?: boolean;
+  }>,
+  previouslyManagedKeys?: Set<string>,
+): string {
+  try {
+    // Extract comments from the beginning of the YAML
+    const lines = yamlString.split("\n");
+    const commentLines: string[] = [];
+    let contentStartIndex = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith("#") || trimmed === "") {
+        commentLines.push(lines[i]);
+        contentStartIndex = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    const yamlContent = lines.slice(contentStartIndex).join("\n");
+    const parsed = yaml.load(yamlContent) as Record<string, unknown>;
+
+    if (!parsed || typeof parsed !== "object") {
+      return yamlString;
+    }
+
+    // Navigate to containers array
+    const spec = parsed.spec as Record<string, unknown> | undefined;
+    const template = spec?.template as Record<string, unknown> | undefined;
+    const podSpec = template?.spec as Record<string, unknown> | undefined;
+    const containers = podSpec?.containers as
+      | Array<Record<string, unknown>>
+      | undefined;
+
+    if (!containers || containers.length === 0) {
+      return yamlString;
+    }
+
+    const container = containers[0];
+
+    // Get existing env vars from the YAML to preserve unmanaged ones
+    const existingEnv =
+      (container.env as Array<{
+        name: string;
+        value?: string;
+        valueFrom?: unknown;
+      }>) || [];
+
+    // Build new env section from localConfig.environment
+    const newEnvSection: Array<{
+      name: string;
+      value?: string;
+      valueFrom?: { secretKeyRef: { name: string; key: string } };
+    }> = [];
+
+    // Track mounted secrets for volume configuration
+    const mountedSecrets: Array<{ key: string }> = [];
+
+    // Track keys managed by localConfig.environment
+    const managedKeys = new Set<string>();
+
+    for (const envVar of environment) {
+      managedKeys.add(envVar.key);
+      if (envVar.type === "secret") {
+        if (envVar.mounted) {
+          // Mounted secrets are handled via volumes, not env vars
+          mountedSecrets.push({ key: envVar.key });
+        } else {
+          // Secret type: use secretKeyRef
+          newEnvSection.push({
+            name: envVar.key,
+            valueFrom: {
+              secretKeyRef: {
+                name: placeholder("archestra", "secret_name"),
+                key: envVar.key,
+              },
+            },
+          });
+        }
+      } else {
+        // Plain text, boolean, number: use placeholder
+        newEnvSection.push({
+          name: envVar.key,
+          value: placeholder("env", envVar.key),
+        });
+      }
+    }
+
+    // Preserve existing env vars that are not managed by localConfig.environment
+    // BUT remove env vars that were previously managed and are now removed
+    for (const existingVar of existingEnv) {
+      if (!managedKeys.has(existingVar.name)) {
+        // If we know what was previously managed, only preserve truly unmanaged vars
+        // (i.e., user-added custom env vars that were never in localConfig.environment)
+        const wasManaged =
+          previouslyManagedKeys?.has(existingVar.name) ?? false;
+        if (!wasManaged) {
+          newEnvSection.push(existingVar as (typeof newEnvSection)[number]);
+        }
+        // If wasManaged is true, this env var was removed from localConfig - don't preserve it
+      }
+    }
+
+    // Update the container's env section
+    if (newEnvSection.length > 0) {
+      container.env = newEnvSection;
+    } else {
+      // Remove env section if no env vars
+      delete container.env;
+    }
+
+    // Handle volume mounts for mounted secrets
+    if (mountedSecrets.length > 0) {
+      // Add volume mounts to container
+      const volumeMounts: Array<{
+        name: string;
+        mountPath: string;
+        subPath: string;
+        readOnly: boolean;
+      }> = mountedSecrets.map(({ key }) => ({
+        name: "mounted-secrets",
+        mountPath: `/secrets/${key}`,
+        subPath: key,
+        readOnly: true,
+      }));
+
+      container.volumeMounts = volumeMounts;
+
+      // Add volumes to pod spec
+      if (podSpec) {
+        const volumes: Array<{
+          name: string;
+          secret: {
+            secretName: string;
+            items: Array<{ key: string; path: string }>;
+          };
+        }> = [
+          {
+            name: "mounted-secrets",
+            secret: {
+              secretName: placeholder("archestra", "secret_name"),
+              items: mountedSecrets.map(({ key }) => ({ key, path: key })),
+            },
+          },
+        ];
+
+        podSpec.volumes = volumes;
+      }
+    } else {
+      // Remove volume-related config if no mounted secrets
+      delete container.volumeMounts;
+      // Only remove volumes if they were for mounted-secrets
+      if (podSpec) {
+        const existingVolumes = podSpec.volumes as
+          | Array<Record<string, unknown>>
+          | undefined;
+        if (existingVolumes) {
+          const filteredVolumes = existingVolumes.filter(
+            (v) => v.name !== "mounted-secrets",
+          );
+          if (filteredVolumes.length > 0) {
+            podSpec.volumes = filteredVolumes;
+          } else {
+            delete podSpec.volumes;
+          }
+        }
+      }
+    }
+
+    // Convert back to YAML
+    const updatedYaml = yaml.dump(parsed, {
+      lineWidth: -1,
+      quotingType: '"',
+      forceQuotes: false,
+      noRefs: true,
+      sortKeys: false,
+    });
+
+    // Prepend the original comments
+    if (commentLines.length > 0) {
+      return [...commentLines, updatedYaml].join("\n");
+    }
+
+    return updatedYaml;
+  } catch {
+    // If anything fails, return the original YAML unchanged
+    return yamlString;
+  }
+}
+
+function validateRestrictedPodFields(podSpec: object): string[] {
+  const errors: string[] = [];
+  const podFields = podSpec as Record<string, unknown>;
+
+  for (const field of ["hostNetwork", "hostPID", "hostIPC"] as const) {
+    if (podFields[field] === true) {
+      errors.push(`spec.template.spec.${field} is not allowed`);
+    }
+  }
+
+  if (
+    Array.isArray(podFields.volumes) &&
+    podFields.volumes.some(
+      (volume) => isRecord(volume) && isRecord(volume.hostPath),
+    )
+  ) {
+    errors.push("spec.template.spec.volumes[].hostPath is not allowed");
+  }
+
+  for (const field of [
+    "initContainers",
+    "containers",
+    "ephemeralContainers",
+  ] as const) {
+    const containers = podFields[field];
+    if (!Array.isArray(containers)) continue;
+
+    for (const container of containers) {
+      if (!isRecord(container)) continue;
+
+      const securityContext = container.securityContext;
+      if (isRecord(securityContext)) {
+        if (securityContext.privileged === true) {
+          errors.push(
+            `spec.template.spec.${field}[].securityContext.privileged is not allowed`,
+          );
+        }
+        if (securityContext.allowPrivilegeEscalation === true) {
+          errors.push(
+            `spec.template.spec.${field}[].securityContext.allowPrivilegeEscalation is not allowed`,
+          );
+        }
+        if (
+          isRecord(securityContext.capabilities) &&
+          Array.isArray(securityContext.capabilities.add) &&
+          securityContext.capabilities.add.length > 0
+        ) {
+          errors.push(
+            `spec.template.spec.${field}[].securityContext.capabilities.add is not allowed`,
+          );
+        }
+      }
+
+      if (
+        Array.isArray(container.ports) &&
+        container.ports.some(
+          (port) => isRecord(port) && port.hostPort !== undefined,
+        )
+      ) {
+        errors.push(
+          `spec.template.spec.${field}[].ports[].hostPort is not allowed`,
+        );
+      }
+    }
+  }
+
+  return errors;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

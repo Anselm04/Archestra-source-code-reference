@@ -1,0 +1,486 @@
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+/**
+ * OpenRouter LLM Proxy Adapter - OpenAI-compatible
+ *
+ * OpenRouter exposes an OpenAI-compatible API at https://openrouter.ai/api/v1
+ * and recommends attribution headers (HTTP-Referer, X-OpenRouter-Title).
+ */
+
+import { ApiError, ArchestraInternalErrorCode } from "@archestra/shared";
+import { get } from "lodash-es";
+import OpenAIProvider from "openai";
+import type {
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
+} from "openai/resources/chat/completions/completions";
+import { openRouterAttributionHeaders } from "@/clients/openrouter-attribution";
+import { getOpenRouterReportedCost } from "@/clients/openrouter-reported-cost";
+import { applyResponseHealing } from "@/clients/openrouter-response-healing";
+import config from "@/config";
+import { metrics } from "@/observability";
+import type {
+  CreateClientOptions,
+  LLMProvider,
+  LLMRequestAdapter,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  Openrouter,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
+import {
+  OpenAIRequestAdapter,
+  OpenAIResponseAdapter,
+  OpenAIStreamAdapter,
+} from "./openai";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+
+// =============================================================================
+// TYPE ALIASES (reuse OpenAI types since OpenRouter is OpenAI-compatible)
+// =============================================================================
+
+type OpenrouterRequest = Openrouter.Types.ChatCompletionsRequest;
+type OpenrouterResponse = Openrouter.Types.ChatCompletionsResponse;
+type OpenrouterMessages = Openrouter.Types.ChatCompletionsRequest["messages"];
+type OpenrouterMessage = Openrouter.Types.Message;
+type OpenrouterContentPart = Exclude<
+  Exclude<OpenrouterMessage["content"], string | null | undefined>,
+  string
+>[number];
+type OpenrouterHeaders = Openrouter.Types.ChatCompletionsHeaders;
+type OpenrouterStreamChunk = Openrouter.Types.ChatCompletionChunk;
+
+// =============================================================================
+// ADAPTER CLASSES (delegate to OpenAI adapters, override provider)
+// =============================================================================
+
+class OpenrouterRequestAdapter
+  implements LLMRequestAdapter<OpenrouterRequest, OpenrouterMessages>
+{
+  readonly provider = "openrouter" as const;
+  private delegate: OpenAIRequestAdapter<OpenrouterRequest>;
+  private readonly request: OpenrouterRequest;
+
+  constructor(request: OpenrouterRequest) {
+    this.request = request;
+    this.delegate = new OpenAIRequestAdapter(request);
+  }
+
+  getModel() {
+    return this.delegate.getModel();
+  }
+  isStreaming() {
+    return this.delegate.isStreaming();
+  }
+  getMessages() {
+    return this.delegate.getMessages();
+  }
+  getToolResults() {
+    return this.delegate.getToolResults();
+  }
+  getTools() {
+    return this.delegate.getTools();
+  }
+  hasTools() {
+    return this.delegate.hasTools();
+  }
+  getProviderMessages() {
+    return this.delegate.getProviderMessages();
+  }
+  getOriginalRequest() {
+    return this.delegate.getOriginalRequest();
+  }
+  setModel(model: string) {
+    return this.delegate.setModel(model);
+  }
+  updateToolResult(toolCallId: string, newContent: string) {
+    return this.delegate.updateToolResult(toolCallId, newContent);
+  }
+  applyToolResultUpdates(updates: Record<string, string>) {
+    return this.delegate.applyToolResultUpdates(updates);
+  }
+  convertToolResultContent(messages: OpenrouterMessages) {
+    return this.delegate.convertToolResultContent(messages);
+  }
+  toProviderRequest(options?: {
+    preserveToolCallIds?: boolean;
+  }): OpenrouterRequest {
+    const request = this.delegate.toProviderRequest(options);
+    const messages: OpenrouterMessages = request.messages;
+    // A tool-result update replaces the whole content, dropping a marker that
+    // sat on one of its parts; carry it over from the original message.
+    const toolMarkers = toolResultCacheControls(this.request.messages);
+    return {
+      ...request,
+      messages: messages.map((message) =>
+        withCacheControlOnTextPart(
+          message.role === "tool" && !hasCacheControl(message)
+            ? {
+                ...message,
+                cache_control: toolMarkers.get(message.tool_call_id),
+              }
+            : message,
+        ),
+      ),
+    };
+  }
+}
+
+type CacheControl = NonNullable<ToolMessage["cache_control"]>;
+type ToolMessage = Extract<OpenrouterMessage, { role: "tool" }>;
+
+function toolResultCacheControls(
+  messages: OpenrouterMessages,
+): Map<string, CacheControl> {
+  const markers = new Map<string, CacheControl>();
+  for (const message of messages) {
+    if (message.role !== "tool") continue;
+    const parts = Array.isArray(message.content) ? message.content : [];
+    const marker =
+      message.cache_control ??
+      parts
+        .map((part) => (part.type === "text" ? part.cache_control : undefined))
+        .findLast(Boolean);
+    if (marker) markers.set(message.tool_call_id, marker);
+  }
+  return markers;
+}
+
+function hasCacheControl(message: ToolMessage): boolean {
+  return (
+    !!message.cache_control ||
+    (Array.isArray(message.content) &&
+      message.content.some(
+        (part) => part.type === "text" && !!part.cache_control,
+      ))
+  );
+}
+
+// OpenRouter places Anthropic cache breakpoints on content parts, so a marker
+// sent on the message (as @ai-sdk/openai-compatible does for string content)
+// moves to the message's last text part; with no text to carry it, it drops.
+// @see https://openrouter.ai/docs/guides/best-practices/prompt-caching
+function withCacheControlOnTextPart(
+  message: OpenrouterMessage,
+): OpenrouterMessage {
+  if (message.role === "function" || !message.cache_control) {
+    return message;
+  }
+  const { cache_control, ...rest } = message;
+  const { content } = rest;
+  if (typeof content === "string") {
+    return content.length > 0
+      ? { ...rest, content: [{ type: "text", text: content, cache_control }] }
+      : rest;
+  }
+  if (!content) {
+    return rest;
+  }
+  const parts: OpenrouterContentPart[] = content;
+  const index = parts.findLastIndex((part) => part.type === "text");
+  if (index < 0) {
+    return rest;
+  }
+  return {
+    ...rest,
+    content: parts.map((part, i) =>
+      i === index && part.type === "text"
+        ? { ...part, cache_control: part.cache_control ?? cache_control }
+        : part,
+    ),
+  } as OpenrouterMessage;
+}
+
+class OpenrouterResponseAdapter
+  implements LLMResponseAdapter<OpenrouterResponse>
+{
+  readonly provider = "openrouter" as const;
+  private delegate: OpenAIResponseAdapter;
+
+  constructor(response: OpenrouterResponse) {
+    assertOpenrouterResponseHasOutput(response);
+    this.delegate = new OpenAIResponseAdapter(response);
+  }
+
+  getId() {
+    return this.delegate.getId();
+  }
+  getModel() {
+    return this.delegate.getModel();
+  }
+  getText() {
+    return this.delegate.getText();
+  }
+  getToolCalls() {
+    return this.delegate.getToolCalls();
+  }
+  hasToolCalls() {
+    return this.delegate.hasToolCalls();
+  }
+  getUsage() {
+    return withReportedCost(
+      this.delegate.getUsage(),
+      this.delegate.getOriginalResponse().usage,
+    );
+  }
+  getOriginalResponse() {
+    return this.delegate.getOriginalResponse();
+  }
+  getFinishReasons() {
+    return this.delegate.getFinishReasons();
+  }
+  toRefusalResponse(refusalMessage: string, contentMessage: string) {
+    return this.delegate.toRefusalResponse(refusalMessage, contentMessage);
+  }
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ) {
+    return this.delegate.withRewrittenToolCalls(toolCalls);
+  }
+}
+
+class OpenrouterStreamAdapter
+  implements LLMStreamAdapter<OpenrouterStreamChunk, OpenrouterResponse>
+{
+  readonly provider = "openrouter" as const;
+  private delegate: OpenAIStreamAdapter;
+
+  constructor(request?: OpenrouterRequest) {
+    this.delegate = new OpenAIStreamAdapter({ clientRequest: request });
+  }
+
+  get state() {
+    return this.delegate.state;
+  }
+
+  processChunk(chunk: OpenrouterStreamChunk) {
+    const result = this.delegate.processChunk(chunk);
+    const { state } = this.delegate;
+    if (chunk.usage && state.usage) {
+      state.usage = withReportedCost(state.usage, chunk.usage);
+    }
+    assertOpenrouterStreamChunkHasOutput(state, chunk);
+    return result;
+  }
+  getSSEHeaders() {
+    return this.delegate.getSSEHeaders();
+  }
+  formatTextDeltaSSE(text: string) {
+    return this.delegate.formatTextDeltaSSE(text);
+  }
+  setTextSuffix(getSuffix: (completedText: string) => string) {
+    this.delegate.setTextSuffix(getSuffix);
+  }
+  getRawToolCallEvents() {
+    return this.delegate.getRawToolCallEvents();
+  }
+  formatCompleteTextSSE(text: string) {
+    return this.delegate.formatCompleteTextSSE(text);
+  }
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]) {
+    return this.delegate.formatToolCallsSSE(toolCalls);
+  }
+  formatEndSSE() {
+    return this.delegate.formatEndSSE();
+  }
+  toProviderResponse() {
+    return this.delegate.toProviderResponse();
+  }
+}
+
+// =============================================================================
+// ADAPTER FACTORY
+// =============================================================================
+
+export const openrouterAdapterFactory: LLMProvider<
+  OpenrouterRequest,
+  OpenrouterResponse,
+  OpenrouterMessages,
+  OpenrouterStreamChunk,
+  OpenrouterHeaders
+> = {
+  provider: "openrouter",
+  interactionType: "openrouter:chatCompletions",
+
+  createRequestAdapter(
+    request: OpenrouterRequest,
+  ): LLMRequestAdapter<OpenrouterRequest, OpenrouterMessages> {
+    return new OpenrouterRequestAdapter(request);
+  },
+
+  createResponseAdapter(
+    response: OpenrouterResponse,
+  ): LLMResponseAdapter<OpenrouterResponse> {
+    return new OpenrouterResponseAdapter(response);
+  },
+
+  createStreamAdapter(
+    request?: OpenrouterRequest,
+  ): LLMStreamAdapter<OpenrouterStreamChunk, OpenrouterResponse> {
+    return new OpenrouterStreamAdapter(request);
+  },
+
+  extractApiKey(headers: OpenrouterHeaders): string | undefined {
+    const record = headers as unknown as Record<string, unknown>;
+    const auth = record.authorization ?? record.Authorization;
+    if (typeof auth !== "string") return undefined;
+
+    // Fastify/Zod headers schemas may strip the "Bearer " prefix via transforms.
+    // Our proxy handler already strips Bearer when resolving virtual keys, but
+    // we must still send a proper Authorization header to OpenRouter upstream.
+    return /^Bearer\s+/i.test(auth) ? auth : `Bearer ${auth}`;
+  },
+
+  getBaseUrl(): string | undefined {
+    return config.llm.openrouter.baseUrl;
+  },
+
+  spanName: "chat",
+
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): OpenAIProvider {
+    if (!apiKey) {
+      throw new Error("API key required for OpenRouter");
+    }
+
+    // The OpenAI SDK expects a raw key and will construct `Authorization: Bearer <key>`.
+    // Some upstream plumbing may already provide a Bearer-prefixed value; strip it to
+    // avoid `Bearer Bearer <key>`.
+    const rawApiKey = apiKey.replace(/^Bearer\s+/i, "");
+
+    const customFetch = options.agent
+      ? metrics.llm.getObservableFetch(
+          "openrouter",
+          options.agent,
+          options.source,
+        )
+      : undefined;
+
+    return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      apiKey: rawApiKey,
+      baseURL: options.baseUrl ?? config.llm.openrouter.baseUrl,
+      fetch: fetchWithAbortSignal(customFetch, options.abortSignal),
+      defaultHeaders: openRouterAttributionHeaders(options.defaultHeaders),
+    });
+  },
+
+  async execute(
+    client: unknown,
+    request: OpenrouterRequest,
+  ): Promise<OpenrouterResponse> {
+    const openrouterClient = client as OpenAIProvider;
+    // Force non-streaming before healing so the decision never depends on the
+    // caller having already cleared `stream`.
+    const openrouterRequest = applyResponseHealing({
+      ...request,
+      stream: false,
+    }) as unknown as ChatCompletionCreateParamsNonStreaming;
+
+    return (await openrouterClient.chat.completions.create(
+      openrouterRequest,
+    )) as unknown as OpenrouterResponse;
+  },
+
+  async executeStream(
+    client: unknown,
+    request: OpenrouterRequest,
+  ): Promise<AsyncIterable<OpenrouterStreamChunk>> {
+    const openrouterClient = client as OpenAIProvider;
+    const openrouterRequest = {
+      ...request,
+      stream: true,
+      stream_options: { include_usage: true },
+    } as unknown as ChatCompletionCreateParamsStreaming;
+
+    return streamChatCompletionChunks<OpenrouterStreamChunk>(
+      openrouterClient.chat.completions.create(openrouterRequest),
+    );
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    if (get(error, "error.code") === "context_length_exceeded") {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return undefined;
+  },
+
+  extractErrorMessage(error: unknown): string {
+    const message = get(error, "error.message");
+    if (typeof message === "string") {
+      return message;
+    }
+
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return "Internal server error";
+  },
+};
+
+function assertOpenrouterResponseHasOutput(response: OpenrouterResponse): void {
+  // OpenRouter deviates from the OpenAI schema on some error/edge payloads
+  // and omits `choices` entirely — reading [0] off it unguarded is a crash.
+  const choice = response.choices?.[0];
+  if (!choice || choice.finish_reason !== "stop") {
+    return;
+  }
+
+  const { message } = choice;
+  if (
+    hasText(message.content) ||
+    hasRefusal(message.refusal) ||
+    (message.tool_calls?.length ?? 0) > 0 ||
+    message.function_call
+  ) {
+    return;
+  }
+
+  throwEmptyOpenrouterResponseError();
+}
+
+function assertOpenrouterStreamChunkHasOutput(
+  state: StreamAccumulatorState,
+  chunk: OpenrouterStreamChunk,
+): void {
+  if (chunk.choices?.[0]?.finish_reason !== "stop") {
+    return;
+  }
+
+  if (state.text.length > 0 || state.toolCalls.length > 0) {
+    return;
+  }
+
+  throwEmptyOpenrouterResponseError();
+}
+
+function withReportedCost(usage: UsageView, rawUsage: unknown): UsageView {
+  const providerReportedCost = getOpenRouterReportedCost(rawUsage);
+  return providerReportedCost === undefined
+    ? usage
+    : { ...usage, providerReportedCost };
+}
+
+function hasText(content: string | null | undefined): boolean {
+  return typeof content === "string" && content.length > 0;
+}
+
+function hasRefusal(refusal: string | null | undefined): boolean {
+  return typeof refusal === "string" && refusal.length > 0;
+}
+
+function throwEmptyOpenrouterResponseError(): never {
+  // Tagged with the normalized internal code so downstream consumers can
+  // recognize this known-transient upstream condition: error reporting drops
+  // it as expected noise, and the chat error mapper surfaces it as the
+  // retryable EmptyResponse card instead of a generic server error.
+  throw new ApiError(
+    503,
+    "OpenRouter returned an empty response without content or tool calls",
+    ArchestraInternalErrorCode.UpstreamEmptyResponse,
+  );
+}

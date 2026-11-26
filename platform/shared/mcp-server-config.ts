@@ -1,0 +1,185 @@
+import { z } from "zod";
+import { ImagePullPolicySchema } from "./mcp-image-pull-policy";
+import type { McpRuntimeTierSize } from "./mcp-runtime-tiers";
+
+export const OAuthConfigSchema = z
+  .object({
+    name: z.string(),
+    server_url: z.string(),
+    grant_type: z.enum(["authorization_code", "client_credentials"]).optional(),
+    auth_server_url: z.string().optional(),
+    authorization_endpoint: z.string().optional(),
+    resource_metadata_url: z.string().optional(),
+    client_id: z.string(),
+    client_secret: z.string().optional(),
+    // This server needs credentials from an existing OAuth app, not registration.
+    requires_client_credentials: z.boolean().optional(),
+    audience: z.string().optional(),
+    resource: z.string().optional(),
+    redirect_uris: z.array(z.string()),
+    scopes: z.array(z.string()),
+    description: z.string().optional(),
+    well_known_url: z.string().optional(),
+    default_scopes: z.array(z.string()),
+    supports_resource_metadata: z.boolean(),
+    // Extra scopes appended to the requested scopes on the authorization_code
+    // flow, on top of configured/discovered scopes. Defaults to
+    // `["offline_access"]` when unset so the provider returns a refresh token;
+    // clear it for providers that reject `offline_access` (e.g. Google). These
+    // are additions to a scope set rather than a set of their own: when nothing
+    // is configured and discovery advertises nothing, the authorization request
+    // omits `scope` entirely and these are dropped with it.
+    additional_scopes: z.array(z.string()).optional(),
+    generic_oauth: z.boolean().optional(),
+    token_endpoint: z.string().optional(),
+    access_token_env_var: z
+      .string()
+      .regex(
+        /^[A-Za-z_][A-Za-z0-9_]*$/,
+        "Must be a valid environment variable name (letters, digits, underscores)",
+      )
+      .optional(),
+    requires_proxy: z.boolean().optional(),
+    provider_name: z.string().optional(),
+    browser_auth: z.boolean().optional(),
+    streamable_http_url: z.string().optional(),
+    streamable_http_port: z.number().optional(),
+  })
+  .superRefine((value, ctx) => {
+    const grantType = value.grant_type ?? "authorization_code";
+    const requiresAuthorizationEndpoint = grantType !== "client_credentials";
+
+    if (
+      requiresAuthorizationEndpoint &&
+      Boolean(value.authorization_endpoint) !== Boolean(value.token_endpoint)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "authorization_endpoint and token_endpoint must be set together",
+        path: ["authorization_endpoint"],
+      });
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "authorization_endpoint and token_endpoint must be set together",
+        path: ["token_endpoint"],
+      });
+    }
+
+    if (
+      grantType === "client_credentials" &&
+      value.authorization_endpoint &&
+      !value.token_endpoint
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "token_endpoint is required when authorization_endpoint is set for client credentials",
+        path: ["token_endpoint"],
+      });
+    }
+  });
+
+/** An absolute http(s) URL, for servers Archestra connects to. */
+export const HttpUrlSchema = z.url({
+  protocol: /^https?$/,
+  error: "Must be an http(s) URL",
+});
+
+export const LocalConfigEnvironmentDefaultSchema = z
+  .union([z.string(), z.number(), z.boolean()])
+  .meta({
+    id: "LocalConfigEnvironmentDefault",
+  });
+
+// Kubernetes rejects other container environment variable names.
+const ENVIRONMENT_VARIABLE_KEY_REGEX = /^[-._a-zA-Z][-._a-zA-Z0-9]*$/;
+
+export const EnvironmentVariableSchema = z.object({
+  key: z
+    .string()
+    .min(1, "Key is required")
+    .regex(
+      ENVIRONMENT_VARIABLE_KEY_REGEX,
+      "Use only letters, digits, _, - and ., not starting with a digit",
+    ),
+  type: z.enum(["plain_text", "secret", "boolean", "number"]),
+  value: z.string().optional(),
+  credentialId: z.string().min(1).max(128).optional(),
+  credentialScope: z.enum(["personal", "organization"]).optional(),
+  promptOnInstallation: z.boolean(),
+  required: z.boolean().optional(),
+  description: z.string().optional(),
+  default: LocalConfigEnvironmentDefaultSchema.optional(),
+  mounted: z.boolean().optional(),
+});
+
+export const ImagePullSecretExistingSchema = z.object({
+  source: z.literal("existing"),
+  name: z.string().min(1),
+});
+
+export const ImagePullSecretCredentialsSchema = z.object({
+  source: z.literal("credentials"),
+  server: z.string().min(1),
+  username: z.string().min(1),
+  password: z.string().optional(),
+  email: z.string().optional(),
+});
+
+export const ImagePullSecretConfigSchema = z.discriminatedUnion("source", [
+  ImagePullSecretExistingSchema,
+  ImagePullSecretCredentialsSchema,
+]);
+
+export type ImagePullSecretConfig = z.infer<typeof ImagePullSecretConfigSchema>;
+
+export const EnvFromSchema = z.object({
+  type: z.enum(["secret", "configMap"]),
+  name: z.string().min(1, "Name is required"),
+  prefix: z.string().optional(),
+});
+
+/** The CPU/RAM portion of a resolved runtime tier; never agent disk or pooling settings. */
+export type McpServerResources = Pick<
+  McpRuntimeTierSize,
+  "cpuRequest" | "cpuLimit" | "memoryRequestMiB" | "memoryLimitMiB"
+>;
+
+export const LocalConfigSchema = z
+  .object({
+    command: z.string().optional(),
+    arguments: z.array(z.string()).optional(),
+    environment: z.array(EnvironmentVariableSchema).optional(),
+    envFrom: z.array(EnvFromSchema).optional(),
+    dockerImage: z.string().optional(),
+    transportType: z.enum(["stdio", "streamable-http"]).optional(),
+    httpPort: z.number().int().min(1).max(65535).optional(),
+    httpPath: z.string().startsWith("/", "Must start with /").optional(),
+    nodePort: z.number().optional(),
+    serviceAccount: z.string().optional(),
+    imagePullSecrets: z.array(ImagePullSecretConfigSchema).optional(),
+    imagePullPolicy: ImagePullPolicySchema.optional(),
+    runtimeTier: z.string().trim().min(1).max(32).optional(),
+  })
+  .refine((data) => data.command || data.dockerImage, {
+    message:
+      "Either command or dockerImage must be provided. If dockerImage is set, command is optional (Docker image's default CMD will be used).",
+    path: ["command"],
+  });
+
+export const LocalConfigFormSchema = z.object({
+  command: z.string().optional(),
+  arguments: z.string(),
+  environment: z.array(EnvironmentVariableSchema),
+  envFrom: z.array(EnvFromSchema).optional(),
+  dockerImage: z.string().optional(),
+  transportType: z.enum(["stdio", "streamable-http"]).optional(),
+  httpPort: z.string().optional(),
+  httpPath: z.string().optional(),
+  serviceAccount: z.string().optional(),
+  imagePullSecrets: z.array(ImagePullSecretConfigSchema).optional(),
+  imagePullPolicy: ImagePullPolicySchema.optional(),
+  runtimeTier: z.string().trim().min(1).max(32).optional(),
+});

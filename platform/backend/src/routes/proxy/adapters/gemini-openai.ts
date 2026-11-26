@@ -1,0 +1,463 @@
+import type {
+  CommonToolCall,
+  Gemini,
+  LLMProvider,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  OpenAi,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import { encodeSignedToolCallId } from "../utils/tool-call-ids";
+import { geminiAdapterFactory } from "./gemini";
+import {
+  type GeminiOpenaiContext,
+  geminiResponseToOpenai,
+  geminiUsageViewToOpenai,
+  mapGeminiFinishReason,
+} from "./gemini-openai-translator";
+import { GeminiToolNameCodec } from "./gemini-tool-names";
+import {
+  formatOpenAiChunkSse,
+  type OpenAiStreamUsage,
+} from "./openai-sse-chunk";
+
+type GeminiRequest = Gemini.Types.GenerateContentRequest & {
+  _model?: string;
+  _isStreaming?: boolean;
+};
+type GeminiResponse = Gemini.Types.GenerateContentResponse;
+type GeminiMessages = Gemini.Types.GenerateContentRequest["contents"];
+type GeminiHeaders = Gemini.Types.GenerateContentHeaders;
+type GeminiStreamChunk = Parameters<
+  ReturnType<typeof geminiAdapterFactory.createStreamAdapter>["processChunk"]
+>[0];
+
+// The OpenAI translator exposes one choice. Policy, wire output and audit
+// must all use that same candidate, for streamed and complete responses.
+function selectCandidateZero<T extends { candidates?: { index?: number }[] }>(
+  response: T,
+): T {
+  return {
+    ...response,
+    candidates: response.candidates?.filter(
+      (candidate, position) => (candidate.index ?? position) === 0,
+    ),
+  };
+}
+
+// A call Gemini gave no id gets one here, once: policy, the client's wire and
+// the audit log name the call by it, and a signed call and an unsigned one
+// of the same response stay apart.
+function withCallIds(response: GeminiResponse): GeminiResponse {
+  const seed = Date.now();
+  let calls = 0;
+  return {
+    ...response,
+    candidates: response.candidates?.map((candidate) => {
+      if (!candidate.content?.parts) return candidate;
+      const parts = candidate.content.parts.map((part) => {
+        if (!("functionCall" in part) || !part.functionCall) return part;
+        const id =
+          part.functionCall.id ??
+          `gemini-call-${part.functionCall.name}-${seed + calls}`;
+        calls += 1;
+        return { ...part, functionCall: { ...part.functionCall, id } };
+      });
+      return { ...candidate, content: { ...candidate.content, parts } };
+    }),
+  };
+}
+
+class GeminiOpenaiResponseAdapter
+  implements LLMResponseAdapter<GeminiResponse>
+{
+  readonly provider = "gemini" as const;
+  private inner: LLMResponseAdapter<GeminiResponse>;
+  // The inner (logged-shape) response after a dispatch-mode repair, so
+  // getLoggedResponse persists the rewritten turn rather than the original.
+  private rewrittenInner: GeminiResponse | null = null;
+  private ctx: GeminiOpenaiContext;
+
+  constructor(response: GeminiResponse, ctx: GeminiOpenaiContext) {
+    this.inner = geminiAdapterFactory.createResponseAdapter(
+      withCallIds(selectCandidateZero(response)),
+    );
+    this.ctx = ctx;
+  }
+
+  getId(): string {
+    return this.inner.getId();
+  }
+
+  getModel(): string {
+    return this.ctx.requestedModel;
+  }
+
+  getText(): string {
+    return this.inner.getText();
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    return this.inner.getToolCalls();
+  }
+
+  hasToolCalls(): boolean {
+    return this.inner.hasToolCalls();
+  }
+
+  getUsage(): UsageView {
+    return this.inner.getUsage();
+  }
+
+  getOriginalResponse(): GeminiResponse {
+    return geminiResponseToOpenai(
+      this.inner.getOriginalResponse(),
+      this.ctx,
+    ) as unknown as GeminiResponse;
+  }
+
+  getLoggedResponse(): GeminiResponse {
+    return this.rewrittenInner ?? this.inner.getOriginalResponse();
+  }
+
+  getFinishReasons(): string[] {
+    return this.inner.getFinishReasons();
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): GeminiResponse {
+    // Rewrite in the inner wire shape (which is what gets logged), then
+    // translate for the client exactly as getOriginalResponse does. If the
+    // inner adapter cannot rewrite, hand back the untouched translation — the
+    // handler only reaches here when the planner produced a rewrite, and a
+    // silent no-op would strand the client with a call it cannot execute; but
+    // every inner adapter this wraps does implement it.
+    const inner =
+      this.inner.withRewrittenToolCalls?.(toolCalls) ??
+      this.inner.getOriginalResponse();
+    this.rewrittenInner = inner;
+    return geminiResponseToOpenai(inner, this.ctx) as unknown as GeminiResponse;
+  }
+
+  withReplacedText(text: string): GeminiResponse {
+    // Replaced in the inner wire shape (which is what gets logged), then
+    // translated for the client as getOriginalResponse does.
+    const inner = this.inner.withReplacedText?.(text);
+    if (!inner) {
+      throw new Error("Wrapped response adapter cannot replace response text");
+    }
+    this.rewrittenInner = inner;
+    return geminiResponseToOpenai(inner, this.ctx) as unknown as GeminiResponse;
+  }
+
+  toRefusalResponse(
+    refusalMessage: string,
+    contentMessage: string,
+  ): GeminiResponse {
+    // Stores the refusal in the inner Gemini format for interaction logging.
+    // This prevents logging the blocked tool call payload.
+    this.rewrittenInner = this.inner.toRefusalResponse(
+      refusalMessage,
+      contentMessage,
+    );
+    const usage = this.inner.getUsage();
+    const response: OpenAi.Types.ChatCompletionsResponse = {
+      id: this.ctx.chatcmplId,
+      object: "chat.completion",
+      created: this.ctx.createdUnix,
+      model: this.ctx.requestedModel,
+      choices: [
+        {
+          index: 0,
+          logprobs: null,
+          finish_reason: "stop",
+          message: { role: "assistant", content: contentMessage },
+        },
+      ],
+      usage: geminiUsageViewToOpenai(usage),
+    };
+    return response as unknown as GeminiResponse;
+  }
+}
+
+class GeminiOpenaiStreamAdapter
+  implements LLMStreamAdapter<GeminiStreamChunk, GeminiResponse>
+{
+  readonly provider = "gemini" as const;
+  private inner: LLMStreamAdapter<GeminiStreamChunk, GeminiResponse>;
+  private ctx: GeminiOpenaiContext;
+  private toolNameCodec: GeminiToolNameCodec;
+  private pendingToolCallEvents: string[] = [];
+  // Gemini 3 thought signatures per stable call id, mirrored from the chunks
+  // so both SSE emission paths can encode them into the wire tool-call ids.
+  private toolCallSignatures: Map<string, string> = new Map();
+  private seenToolCalls = 0;
+
+  constructor(ctx: GeminiOpenaiContext, request?: GeminiRequest) {
+    this.inner = geminiAdapterFactory.createStreamAdapter();
+    this.ctx = ctx;
+    this.toolNameCodec = new GeminiToolNameCodec(request);
+  }
+
+  get state(): StreamAccumulatorState {
+    return this.inner.state;
+  }
+
+  processChunk(chunk: GeminiStreamChunk) {
+    const decodedChunk = this.toolNameCodec.decodeResponse(
+      selectCandidateZero(chunk),
+    );
+    // Prompt refusals have no candidate, but are complete responses, just as
+    // the non-streaming translator's promptFeedback branch treats them.
+    const blockReason = decodedChunk.promptFeedback?.blockReason;
+    const promptBlocked =
+      !decodedChunk.candidates?.[0] &&
+      blockReason !== undefined &&
+      blockReason !== "BLOCKED_REASON_UNSPECIFIED";
+    const innerResult = this.inner.processChunk(decodedChunk);
+    for (const part of decodedChunk.candidates?.[0]?.content?.parts ?? []) {
+      if ("functionCall" in part && part.functionCall) {
+        if (part.thoughtSignature) {
+          this.toolCallSignatures.set(
+            this.state.toolCalls[this.seenToolCalls].id,
+            part.thoughtSignature,
+          );
+        }
+        this.seenToolCalls += 1;
+      }
+    }
+    if (promptBlocked) {
+      this.state.stopReason = "SAFETY";
+      innerResult.isFinal = true;
+    }
+    const sseData = this.toOpenaiSse(decodedChunk, "text");
+
+    if (innerResult.isToolCallChunk) {
+      const tools = this.toOpenaiSse(decodedChunk, "tools");
+      if (tools) this.pendingToolCallEvents.push(tools);
+    }
+
+    return {
+      ...innerResult,
+      sseData,
+    };
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    };
+  }
+
+  formatTextDeltaSSE(text: string): string {
+    return this.formatChunk({ delta: { content: text }, finishReason: null });
+  }
+
+  getRawToolCallEvents(): string[] {
+    return this.pendingToolCallEvents;
+  }
+
+  wireToolCallId(params: {
+    toolCall: { id: string; name: string };
+    index: number;
+  }): string {
+    return encodeSignedToolCallId({
+      id: params.toolCall.id,
+      name: params.toolCall.name,
+      thoughtSignature: this.toolCallSignatures.get(params.toolCall.id),
+    });
+  }
+
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // The inner (Gemini-shaped) read is a side effect only — it marks the calls
+    // as handed over so inner.toProviderResponse() names them — while the wire
+    // event below is the OpenAI-shaped one this surface speaks. The buffered
+    // OpenAI events are dropped rather than replayed: they name the tool the
+    // model called directly, which is the call being repaired.
+    this.inner.formatToolCallsSSE?.(toolCalls);
+    this.pendingToolCallEvents = [];
+    return [
+      this.formatChunk({
+        delta: {
+          tool_calls: toolCalls.map((toolCall, index) => ({
+            index,
+            id: this.wireToolCallId({ toolCall, index }),
+            type: "function" as const,
+            function: { name: toolCall.name, arguments: toolCall.arguments },
+          })),
+        },
+        finishReason: null,
+      }),
+    ];
+  }
+
+  formatCompleteTextSSE(text: string): string[] {
+    // Mark the inner adapter as refusal-replaced (side effect only; its
+    // Gemini-format events are unused here) so it persists the refusal rather
+    // than the blocked calls. The finish reason is emitted once, by formatEndSSE.
+    this.inner.formatCompleteTextSSE(text);
+    return [
+      this.formatChunk({
+        delta: { role: "assistant", content: text },
+        finishReason: null,
+      }),
+    ];
+  }
+
+  getOpenAiFinishReason(): string {
+    // Gemini ends a function-calling turn with STOP, but OpenAI clients read a
+    // "stop" finish as a finished turn and never run the calls. The inner
+    // response names only the calls that were handed over (a refusal replaces
+    // them), matching the non-streaming translation.
+    const candidate = this.inner.toProviderResponse().candidates?.[0];
+    const hasToolCalls = candidate?.content?.parts?.some(
+      (part) => "functionCall" in part && part.functionCall,
+    );
+    return hasToolCalls
+      ? "tool_calls"
+      : mapGeminiFinishReason(candidate?.finishReason);
+  }
+
+  formatEndSSE(): string {
+    return `${this.formatChunk({
+      delta: {},
+      finishReason: this.getOpenAiFinishReason(),
+      usage: geminiUsageViewToOpenai(this.state.usage),
+    })}data: [DONE]\n\n`;
+  }
+
+  toProviderResponse(): GeminiResponse {
+    const response = this.inner.toProviderResponse();
+    const candidate = response.candidates?.[0];
+    const parts = candidate?.content?.parts;
+    if (!candidate?.content || !parts || this.state.toolCalls.length === 0)
+      return response;
+    // This wrapper emits the approved batch order; native Gemini emits provider
+    // order. Keep its Gemini-shaped audit record aligned with the OpenAI frames.
+    const byId = new Map(
+      parts.flatMap((part) =>
+        "functionCall" in part && part.functionCall
+          ? [[part.functionCall.id, part] as const]
+          : [],
+      ),
+    );
+    const calls = this.state.toolCalls.flatMap((call) => {
+      const part = byId.get(call.id);
+      return part ? [part] : [];
+    });
+    let index = 0;
+    return {
+      ...response,
+      candidates: [
+        {
+          ...candidate,
+          content: {
+            ...candidate.content,
+            parts: parts.map((part) =>
+              "functionCall" in part && part.functionCall
+                ? (calls[index++] ?? part)
+                : part,
+            ),
+          },
+        },
+      ],
+    };
+  }
+
+  private toOpenaiSse(
+    chunk: GeminiStreamChunk,
+    kind: "text" | "tools",
+  ): string | null {
+    const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+    // The inner processChunk appends one call per functionCall part. Subtract
+    // this chunk's count to recover its first index in the accumulated calls.
+    let toolIndex =
+      this.state.toolCalls.length -
+      parts.filter((part) => part.functionCall).length;
+    const events: string[] = [];
+    for (const part of parts) {
+      if (kind === "text" && part.text && !part.thought) {
+        events.push(
+          this.formatChunk({
+            delta: { content: part.text },
+            finishReason: null,
+          }),
+        );
+      }
+      if (part.functionCall) {
+        if (kind === "tools") {
+          const call = this.state.toolCalls[toolIndex];
+          events.push(
+            this.formatChunk({
+              delta: {
+                tool_calls: [
+                  {
+                    index: toolIndex,
+                    id: encodeSignedToolCallId({
+                      id: call.id,
+                      name: call.name,
+                      thoughtSignature: part.thoughtSignature,
+                    }),
+                    type: "function",
+                    function: { name: call.name, arguments: call.arguments },
+                  },
+                ],
+              },
+              finishReason: null,
+            }),
+          );
+        }
+        toolIndex++;
+      }
+    }
+    return events.join("") || null;
+  }
+
+  private formatChunk(params: {
+    delta: Record<string, unknown>;
+    finishReason: string | null;
+    /** Only the final chunk passes this; delta chunks must stay usage-free. */
+    usage?: OpenAiStreamUsage;
+  }): string {
+    return formatOpenAiChunkSse({
+      id: this.ctx.chatcmplId,
+      created: this.ctx.createdUnix,
+      model: this.ctx.requestedModel,
+      delta: params.delta,
+      finishReason: params.finishReason,
+      usage: params.usage,
+    });
+  }
+}
+
+export function makeGeminiOpenaiAdapterFactory(
+  ctx: GeminiOpenaiContext,
+): LLMProvider<
+  GeminiRequest,
+  GeminiResponse,
+  GeminiMessages,
+  GeminiStreamChunk,
+  GeminiHeaders
+> {
+  return {
+    ...geminiAdapterFactory,
+    translatesWireFormat: true,
+    extractApiKey(headers) {
+      const authorization = (headers as Record<string, unknown>).authorization;
+      if (typeof authorization === "string") {
+        return authorization.replace(/^Bearer\s+/i, "");
+      }
+      return geminiAdapterFactory.extractApiKey(headers);
+    },
+    createResponseAdapter(response) {
+      return new GeminiOpenaiResponseAdapter(response, ctx);
+    },
+    createStreamAdapter(request) {
+      return new GeminiOpenaiStreamAdapter(ctx, request);
+    },
+  };
+}

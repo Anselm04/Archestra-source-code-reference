@@ -1,0 +1,3045 @@
+import type { UIMessage } from "@ai-sdk/react";
+import type { archestraApiTypes } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+type MockChatSession = {
+  earlyToolUiStarts: Record<string, never>;
+  contextCompaction: undefined;
+  pendingMcpElicitations: unknown[];
+  mcpTasks: Record<string, never>;
+  resolveMcpElicitation: ReturnType<typeof vi.fn>;
+  sendMessage: ReturnType<typeof vi.fn>;
+};
+
+const mockHasKnowledgeBaseToolCall = vi.hoisted(() =>
+  vi.fn((_parts: unknown[]) => false),
+);
+const mockChatSession = vi.hoisted(() => ({
+  current: null as MockChatSession | null,
+}));
+const mockIconSources = vi.hoisted(() => ({
+  agentTools: [] as { name: string; catalogId: string | null }[],
+  catalogItems: [] as { id: string; name: string; icon: string | null }[],
+}));
+
+vi.mock("@/components/ai-elements/conversation", () => ({
+  Conversation: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  ConversationContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  ConversationScrollButton: () => null,
+}));
+
+const mockStopScroll = vi.hoisted(() => vi.fn());
+
+vi.mock("use-stick-to-bottom", () => ({
+  useStickToBottomContext: () => ({
+    isAtBottom: true,
+    scrollRef: { current: null },
+    scrollToBottom: vi.fn(),
+    stopScroll: mockStopScroll,
+  }),
+}));
+
+vi.mock("@/components/ai-elements/message", () => ({
+  Message: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  MessageContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+
+vi.mock("@/components/ai-elements/reasoning", () => ({
+  Reasoning: ({
+    children,
+    isStreaming,
+    keepOpen,
+  }: {
+    children: React.ReactNode;
+    isStreaming?: boolean;
+    keepOpen?: boolean;
+  }) => (
+    <div
+      data-testid="reasoning"
+      data-streaming={String(Boolean(isStreaming))}
+      data-keep-open={String(Boolean(keepOpen))}
+    >
+      {children}
+    </div>
+  ),
+  ReasoningContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  ReasoningTrigger: () => null,
+}));
+
+vi.mock("@/components/ai-elements/response", () => ({
+  Response: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+
+vi.mock("@/components/ai-elements/tool", () => ({
+  Tool: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  ToolContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  ToolHeader: ({ type }: { type: string }) => <div>{type}</div>,
+  ToolInput: ({ input }: { input: unknown }) => (
+    <pre>{JSON.stringify(input)}</pre>
+  ),
+  // Like the real one: a failed call's error text and its result, in one section.
+  ToolOutput: ({
+    output,
+    errorText,
+  }: {
+    output: unknown;
+    errorText?: string;
+  }) => (
+    <div>
+      {errorText ? <div>{errorText}</div> : null}
+      <pre>{JSON.stringify(output)}</pre>
+    </div>
+  ),
+  SectionLabel: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+}));
+
+vi.mock("@/components/chat/editable-assistant-message", () => ({
+  EditableAssistantMessage: ({
+    text,
+    citationParts,
+  }: {
+    text: string;
+    citationParts?: unknown[];
+  }) => (
+    <div>
+      <span>{text}</span>
+      {citationParts ? <span data-testid="knowledge-citations" /> : null}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/chat/editable-user-message", () => ({
+  EditableUserMessage: ({
+    text,
+    skill,
+  }: {
+    text: string;
+    skill?: { name: string; href?: string };
+  }) => (
+    <div>
+      {text}
+      {skill && (
+        <span data-testid="skill-attribution" data-href={skill.href}>
+          {skill.name}
+        </span>
+      )}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/chat/inline-chat-error", () => ({
+  InlineChatError: ({
+    error,
+    onRetry,
+  }: {
+    error: Error;
+    onRetry?: () => void;
+  }) => (
+    <div
+      data-testid="inline-chat-error"
+      data-has-retry={onRetry ? "true" : "false"}
+    >
+      {error.message}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/chat/mcp-install-dialogs", () => ({
+  McpInstallDialogs: () => null,
+}));
+
+vi.mock("@/components/chat/auth-error-tool", () => ({
+  AuthErrorTool: ({
+    title,
+    description,
+    buttonText,
+    buttonUrl,
+    onAction,
+    openInNewTab = true,
+  }: {
+    title: string;
+    description: ReactNode;
+    buttonText?: string;
+    buttonUrl?: string;
+    onAction?: () => void;
+    openInNewTab?: boolean;
+  }) => (
+    <div>
+      <div>auth-error:{title}</div>
+      <div>{description}</div>
+      {onAction && buttonText ? (
+        <button type="button" onClick={onAction}>
+          {buttonText}
+        </button>
+      ) : buttonText && buttonUrl ? (
+        <a
+          href={buttonUrl}
+          target={openInNewTab ? "_blank" : undefined}
+          rel={openInNewTab ? "noopener noreferrer" : undefined}
+        >
+          {buttonText}
+        </a>
+      ) : null}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/chat/todo-write-tool", () => ({
+  TodoWriteTool: () => <div>todo-write-tool</div>,
+}));
+
+vi.mock("@/components/chat/mcp-app-container", () => ({
+  McpAppSection: (props: { uiResourceUri: string; appId?: string }) => (
+    <div
+      data-testid="mcp-app-section"
+      data-app-id={props.appId ?? ""}
+      data-uri={props.uiResourceUri}
+    />
+  ),
+  McpAppEntryPill: (props: { appId?: string; toolName: string }) => (
+    <div
+      data-testid="mcp-app-pill"
+      data-app-id={props.appId ?? ""}
+      data-tool-name={props.toolName}
+    />
+  ),
+  // The content half carries the app-binding contract (uri + appId), so it
+  // keeps the mcp-app-section testid the binding assertions target.
+  McpAppEntryContent: (props: { uiResourceUri: string; appId?: string }) => (
+    <div
+      data-testid="mcp-app-section"
+      data-app-id={props.appId ?? ""}
+      data-uri={props.uiResourceUri}
+    />
+  ),
+  McpToolOutput: null,
+}));
+
+vi.mock("@/components/chat/tool-error-logs-button", () => ({
+  ToolErrorLogsButton: () => null,
+}));
+
+vi.mock("@/components/chat/tool-status-row", () => ({
+  ToolStatusRow: ({
+    title,
+    description,
+    actions = [],
+  }: {
+    title: string;
+    description?: string;
+    actions?: Array<{ label: string; onClick: () => void }>;
+  }) => (
+    <div>
+      <div>{title}</div>
+      {description ? <div>{description}</div> : null}
+      {actions.map((action) => (
+        <button key={action.label} type="button" onClick={action.onClick}>
+          {action.label}
+        </button>
+      ))}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/chat/knowledge-graph-citations", () => ({
+  hasKnowledgeBaseToolCall: mockHasKnowledgeBaseToolCall,
+  KnowledgeGraphCitations: () => <div data-testid="knowledge-citations" />,
+}));
+
+vi.mock("@/lib/auth/auth.query");
+
+vi.mock("@/lib/agent.query", () => ({
+  useProfile: () => ({ data: { tools: mockIconSources.agentTools } }),
+}));
+
+vi.mock("@/lib/chat/chat.query", () => ({
+  useCancelChatMcpTask: () => ({ mutateAsync: vi.fn() }),
+  // Read once for the whole transcript, to decide whether an attachment chip
+  // offers "Save to knowledge". An ordinary (unencrypted) chat here.
+  useConversation: () => ({ data: { encryptedChat: false } }),
+}));
+
+vi.mock("@/lib/chat/chat-message.query", () => ({
+  useUpdateChatMessage: () => ({
+    mutateAsync: vi.fn(),
+  }),
+}));
+
+vi.mock("@/lib/mcp/internal-mcp-catalog.query", () => ({
+  useMcpCatalogCredentialPreflight: () => ({ data: [] }),
+}));
+
+vi.mock("@/lib/mcp/mcp-registry.query", () => ({
+  useMcpCatalogDirectory: () => ({ data: mockIconSources.catalogItems }),
+}));
+
+const { mockUseMcpInstallOrchestrator } = vi.hoisted(() => ({
+  mockUseMcpInstallOrchestrator: vi.fn((_options?: { enabled?: boolean }) => ({
+    triggerInstallByCatalogId: vi.fn(),
+    triggerReauthByCatalogIdAndServerId: vi.fn(),
+    connectedCatalogIds: new Set<string>(),
+  })),
+}));
+
+vi.mock("@/lib/mcp/use-mcp-install-orchestrator", () => ({
+  useMcpInstallOrchestrator: mockUseMcpInstallOrchestrator,
+}));
+
+vi.mock("@/lib/organization.query");
+
+vi.mock("@/lib/hooks/use-app-name");
+
+vi.mock("@/lib/chat/global-chat.context", () => ({
+  useChatSessionSnapshot: () => mockChatSession.current,
+}));
+
+vi.mock("@/lib/mcp/archestra-mcp-server", () => ({
+  useArchestraMcpIdentity: () => ({
+    getToolName: (shortName: string) => `sparky__${shortName}`,
+    getToolShortName: (toolName: string) =>
+      toolName.startsWith("sparky__") ? toolName.replace("sparky__", "") : null,
+    isToolName: (toolName: string) => toolName.startsWith("sparky__"),
+  }),
+}));
+
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { PERSISTED_MESSAGE_ID_METADATA_KEY } from "@/lib/chat/chat-utils";
+import { useAppIconLogo } from "@/lib/hooks/use-app-name";
+import { useOrganization } from "@/lib/organization.query";
+import { ChatMessages } from "./chat-messages";
+
+describe("ChatMessages", () => {
+  it.each([
+    ["preview_guardrails_policy_change", false],
+    ["update_guardrails_policy", false],
+    ["preview_guardrails_policy_change", true],
+    ["update_guardrails_policy", true],
+  ] as const)("shows the request in the full %s card, as for any tool (wrapped: %s)", (shortName, wrapped) => {
+    const toolName = `sparky__${wrapped ? "run_tool" : shortName}`;
+    const args = {
+      expectedRevision: 3,
+      edits: [{ oldText: "old", newText: "new" }],
+    };
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        status="ready"
+        messages={
+          [
+            {
+              id: "assistant-policy",
+              role: "assistant",
+              parts: [
+                {
+                  type: `tool-${toolName}`,
+                  toolCallId: "policy",
+                  state: "approval-requested",
+                  approval: { id: "review" },
+                  input: wrapped
+                    ? { tool_name: `sparky__${shortName}`, tool_args: args }
+                    : args,
+                  output: {
+                    structuredContent: {
+                      stage: "preview",
+                      delivery: "revision",
+                      before: "old",
+                      after: "new",
+                    },
+                  },
+                },
+              ],
+            },
+          ] as unknown as UIMessage[]
+        }
+      />,
+    );
+    expect(screen.getByLabelText("Policy diff")).toBeVisible();
+    expect(screen.getByText(/expectedRevision/)).toHaveTextContent("3");
+    expect(
+      screen.queryByRole("button", { name: "Arguments" }),
+    ).not.toBeInTheDocument();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: true,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { name: "Joey" } },
+    } as ReturnType<typeof useSession>);
+    vi.mocked(useOrganization).mockReturnValue({
+      data: null,
+    } as unknown as ReturnType<typeof useOrganization>);
+    vi.mocked(useAppIconLogo).mockReturnValue("/custom-logo.png");
+    mockHasKnowledgeBaseToolCall.mockReturnValue(false);
+    mockChatSession.current = null;
+    mockIconSources.agentTools = [];
+    mockIconSources.catalogItems = [];
+  });
+
+  it("shows an assigned tool's catalog icon from the agent's tool list", () => {
+    // The tool's name prefix does not match its catalog's name, so only the
+    // agent's own tool list can link the call to the catalog.
+    mockIconSources.agentTools = [
+      { name: "ledger_tools__sum_rows", catalogId: "catalog-finance" },
+    ];
+    mockIconSources.catalogItems = [
+      { id: "catalog-finance", name: "Finance", icon: "🧾" },
+    ];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        agentId="agent-1"
+        messages={
+          [
+            {
+              id: "assistant-1",
+              role: "assistant",
+              parts: [
+                {
+                  type: "tool-ledger_tools__sum_rows",
+                  toolCallId: "call-1",
+                  state: "output-available",
+                  input: {},
+                  output: { total: 3 },
+                },
+              ],
+            },
+          ] as UIMessage[]
+        }
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByText("🧾")).toBeInTheDocument();
+  });
+
+  it("mounts only the end of a long transcript, and earlier messages on request", async () => {
+    const messages = Array.from({ length: 100 }, (_, i) => ({
+      id: `m-${i}`,
+      role: i % 2 === 0 ? "user" : "assistant",
+      parts: [{ type: "text", text: `Turn ${i}` }],
+    })) as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByText("Turn 99")).toBeInTheDocument();
+    expect(screen.getByText("Turn 70")).toBeInTheDocument();
+    expect(screen.queryByText("Turn 69")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show earlier messages (70 not shown)",
+      }),
+    );
+    expect(await screen.findByText("Turn 40")).toBeInTheDocument();
+    expect(screen.queryByText("Turn 39")).not.toBeInTheDocument();
+    expect(screen.getByText("Turn 99")).toBeInTheDocument();
+  });
+
+  it("opens the window around a deep-linked message", async () => {
+    const messages = Array.from({ length: 100 }, (_, i) => ({
+      id: `m-${i}`,
+      role: i % 2 === 0 ? "user" : "assistant",
+      parts: [{ type: "text", text: `Turn ${i}` }],
+    })) as UIMessage[];
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    window.history.replaceState({}, "", "/chat/conv-1#message-m-20");
+    try {
+      render(
+        <ChatMessages
+          conversationId="conv-1"
+          messages={messages}
+          status="ready"
+        />,
+      );
+
+      expect(await screen.findByText("Turn 20")).toBeInTheDocument();
+      // Ten items of context above it.
+      expect(screen.getByText("Turn 10")).toBeInTheDocument();
+      expect(screen.queryByText("Turn 9")).not.toBeInTheDocument();
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
+    } finally {
+      window.history.replaceState({}, "", "/");
+    }
+  });
+
+  it("ignores a malformed message fragment without losing the transcript", () => {
+    const messages = Array.from({ length: 100 }, (_, index) => ({
+      id: `m-${index}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+      parts: [{ type: "text", text: `Turn ${index}` }],
+    })) as UIMessage[];
+    window.history.replaceState({}, "", "/chat/conv-1#message-%");
+    try {
+      render(
+        <ChatMessages
+          conversationId="conv-1"
+          messages={messages}
+          status="ready"
+        />,
+      );
+
+      expect(screen.getByText("Turn 99")).toBeInTheDocument();
+      expect(screen.queryByText("Turn 69")).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name: "Show earlier messages (70 not shown)",
+        }),
+      ).toBeVisible();
+    } finally {
+      window.history.replaceState({}, "", "/");
+    }
+  });
+
+  it("keeps the window's start when new messages arrive", () => {
+    const messages = Array.from({ length: 50 }, (_, i) => ({
+      id: `m-${i}`,
+      role: i % 2 === 0 ? "user" : "assistant",
+      parts: [{ type: "text", text: `Turn ${i}` }],
+    })) as UIMessage[];
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+    const more = [
+      ...messages,
+      {
+        id: "m-50",
+        role: "user",
+        parts: [{ type: "text", text: "Turn 50" }],
+      } as UIMessage,
+    ];
+    rerender(
+      <ChatMessages conversationId="conv-1" messages={more} status="ready" />,
+    );
+
+    expect(screen.getByText("Turn 50")).toBeInTheDocument();
+    // Still mounted: appending does not push the oldest rendered one out.
+    expect(screen.getByText("Turn 20")).toBeInTheDocument();
+  });
+
+  it("renders external MCP Skill attribution from message metadata", () => {
+    const messages = [
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Prepare the release" }],
+        metadata: {
+          externalMcpSkill: {
+            id: "11111111-1111-4111-8111-111111111111",
+            mcpServerId: "33333333-3333-4333-8333-333333333333",
+            uri: "skill://example/release/SKILL.md",
+            name: "release-checklist",
+            serverName: "Operations server",
+            commandValue: "/operations-server-release-checklist",
+            displayName:
+              "Operations server [team:33333333] / release-checklist",
+          },
+        },
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByTestId("skill-attribution")).toHaveTextContent(
+      "Operations server [team:33333333] / release-checklist",
+    );
+    expect(screen.getByTestId("skill-attribution")).toHaveAttribute(
+      "data-href",
+      "/skills/external/11111111-1111-4111-8111-111111111111?mcpServerId=33333333-3333-4333-8333-333333333333",
+    );
+  });
+
+  it("keeps a completed turn's knowledge image visible while a later turn streams", () => {
+    mockHasKnowledgeBaseToolCall.mockImplementation((parts: unknown[]) =>
+      parts.some(
+        (part) =>
+          (part as { type?: string }).type ===
+          "tool-archestra__query_knowledge_sources",
+      ),
+    );
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-archestra__query_knowledge_sources",
+            toolCallId: "tool-1",
+            state: "output-available",
+            input: { query: "lobsters" },
+            output: { content: "[image]" },
+          },
+          { type: "text", text: "I found an image." },
+        ],
+      },
+      {
+        id: "user-2",
+        role: "user",
+        parts: [{ type: "text", text: "What else?" }],
+      },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        parts: [{ type: "text", text: "Still working..." }],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="streaming"
+      />,
+    );
+
+    expect(screen.getByTestId("knowledge-citations")).toBeInTheDocument();
+  });
+
+  it("does not render an accordion for an empty reasoning part", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "reasoning", text: "" },
+          { type: "reasoning", text: "   " },
+          { type: "text", text: "the answer" },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.queryByTestId("reasoning")).not.toBeInTheDocument();
+    expect(screen.getByText("the answer")).toBeInTheDocument();
+  });
+
+  it("renders an accordion only for reasoning parts with real text", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "reasoning", text: "" },
+          { type: "reasoning", text: "weighing the options" },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getAllByTestId("reasoning")).toHaveLength(1);
+    expect(screen.getByText("weighing the options")).toBeInTheDocument();
+  });
+
+  it("folds thinking blocks that touch on screen into one accordion", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "reasoning", text: "first pass" },
+          { type: "reasoning", text: "second pass" },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getAllByTestId("reasoning")).toHaveLength(1);
+    expect(screen.getByText(/first pass/)).toBeInTheDocument();
+    expect(screen.getByText(/second pass/)).toBeInTheDocument();
+  });
+
+  it("keeps thinking split when narration comes between", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "reasoning", text: "first pass" },
+          { type: "reasoning", text: "second pass" },
+          { type: "text", text: "Here are the tasks." },
+          { type: "reasoning", text: "third pass" },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getAllByTestId("reasoning")).toHaveLength(2);
+  });
+
+  it("keeps thinking below the MCP App panel it follows", () => {
+    // When narration separates earlier tools from an MCP App, the app mounts
+    // under its own row (consuming data-tool-ui-start without a duplicate card)
+    // and thinking that came after the app stays below it.
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "reasoning", text: "first pass" },
+          {
+            type: "tool-google__search",
+            toolCallId: "call_1",
+            state: "input-available",
+            input: { q: "weather" },
+          },
+          {
+            type: "tool-google__search",
+            toolCallId: "call_1",
+            state: "output-available",
+            input: { q: "weather" },
+            output: "sunny",
+          },
+          { type: "text", text: "Rendering the chart." },
+          { type: "reasoning", text: "second pass" },
+          {
+            type: "tool-charts__render",
+            toolCallId: "call_2",
+            state: "input-available",
+            input: {},
+          },
+          {
+            type: "data-tool-ui-start",
+            data: {
+              toolCallId: "call_2",
+              toolName: "charts__render",
+              uiResourceUri: "ui://chart",
+            },
+          },
+          {
+            type: "tool-charts__render",
+            toolCallId: "call_2",
+            state: "output-available",
+            input: {},
+            output: { _meta: { ui: { resourceUri: "ui://chart" } } },
+          },
+          { type: "reasoning", text: "third pass" },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    const { container } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        agentId="agent-1"
+        messages={messages}
+        status="streaming"
+      />,
+    );
+
+    expect(screen.getAllByTestId("reasoning")).toHaveLength(3);
+    // Consuming data-tool-ui-start avoids rendering a duplicate bare card.
+    expect(screen.queryByText("tool-charts__render")).not.toBeInTheDocument();
+
+    // Document order: the app's section must precede the thinking that followed it.
+    const landmarks = [...container.querySelectorAll("*")].flatMap((el) => {
+      if (el.getAttribute("data-testid") === "reasoning") return ["thinking"];
+      if (el.getAttribute("data-testid") === "mcp-app-section") return ["app"];
+      return [];
+    });
+
+    expect(landmarks).toContain("app");
+    expect(landmarks.indexOf("app")).toBeLessThan(
+      landmarks.lastIndexOf("thinking"),
+    );
+  });
+
+  it("holds a still-growable run open and releases it once narration lands", () => {
+    const growable = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "reasoning", text: "first pass" }],
+      },
+    ] as UIMessage[];
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={growable}
+        status="streaming"
+      />,
+    );
+
+    expect(screen.getByTestId("reasoning")).toHaveAttribute(
+      "data-keep-open",
+      "true",
+    );
+
+    const settled = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "reasoning", text: "first pass" },
+          { type: "text", text: "Here are the tasks." },
+        ],
+      },
+    ] as UIMessage[];
+
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={settled}
+        status="streaming"
+      />,
+    );
+
+    expect(screen.getByTestId("reasoning")).toHaveAttribute(
+      "data-keep-open",
+      "false",
+    );
+  });
+
+  it("marks the last reasoning part of the last message as streaming", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "reasoning", text: "earlier thought" }],
+      },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        parts: [{ type: "reasoning", text: "current thought" }],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="streaming"
+      />,
+    );
+
+    const accordions = screen.getAllByTestId("reasoning");
+    expect(accordions).toHaveLength(2);
+    // Only the last part of the last message streams; earlier blocks are done.
+    expect(accordions[0]).toHaveAttribute("data-streaming", "false");
+    expect(accordions[1]).toHaveAttribute("data-streaming", "true");
+  });
+
+  it("marks no reasoning as streaming once the response is ready", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "reasoning", text: "settled thought" }],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByTestId("reasoning")).toHaveAttribute(
+      "data-streaming",
+      "false",
+    );
+  });
+
+  it("keeps the loading logo visible for the whole streaming response", () => {
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={
+          [
+            {
+              id: "assistant-1",
+              role: "assistant",
+              parts: [{ type: "text", text: "partial response" }],
+            },
+          ] as UIMessage[]
+        }
+        status="streaming"
+      />,
+    );
+
+    const loadingLogo = screen.getByAltText("Loading logo");
+    expect(loadingLogo).toBeInTheDocument();
+  });
+
+  it("renders persisted chat errors between messages by timestamp", () => {
+    const messages = [
+      {
+        id: "user-1",
+        role: "user",
+        metadata: { createdAt: "2026-04-22T12:00:00.000Z" },
+        parts: [{ type: "text", text: "first try" }],
+      },
+      {
+        id: "user-2",
+        role: "user",
+        metadata: { createdAt: "2026-04-22T12:02:00.000Z" },
+        parts: [{ type: "text", text: "try again" }],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        chatErrors={[
+          {
+            id: "error-1",
+            conversationId: "conv-1",
+            createdAt: "2026-04-22T12:01:00.000Z",
+            error: {
+              code: "server_error",
+              message: "Provider failed",
+              isRetryable: true,
+            },
+          },
+        ]}
+      />,
+    );
+
+    const firstTry = screen.getByText("first try");
+    const error = screen.getByTestId("inline-chat-error");
+    const retry = screen.getByText("try again");
+
+    expect(firstTry.compareDocumentPosition(error)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(error.compareDocumentPosition(retry)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    // A retry resends the last user turn, but this error precedes a later
+    // message — offering retry here would rerun the wrong turn.
+    expect(error.getAttribute("data-has-retry")).toBe("false");
+  });
+
+  it("offers retry only on the trailing persisted error, not an older one", () => {
+    const messages = [
+      {
+        id: "user-1",
+        role: "user",
+        metadata: { createdAt: "2026-04-22T12:00:00.000Z" },
+        parts: [{ type: "text", text: "first try" }],
+      },
+      {
+        id: "user-2",
+        role: "user",
+        metadata: { createdAt: "2026-04-22T12:02:00.000Z" },
+        parts: [{ type: "text", text: "second try" }],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        onChatErrorRetry={vi.fn()}
+        chatErrors={[
+          {
+            id: "error-old",
+            conversationId: "conv-1",
+            createdAt: "2026-04-22T12:01:00.000Z",
+            error: {
+              code: "network_error",
+              message: "Older failure",
+              isRetryable: true,
+            },
+          },
+          {
+            id: "error-latest",
+            conversationId: "conv-1",
+            createdAt: "2026-04-22T12:05:00.000Z",
+            error: {
+              code: "network_error",
+              message: "Latest failure",
+              isRetryable: true,
+            },
+          },
+        ]}
+      />,
+    );
+
+    const errors = screen.getAllByTestId("inline-chat-error");
+    const older = errors.find((el) =>
+      el.textContent?.includes("Older failure"),
+    );
+    const latest = errors.find((el) =>
+      el.textContent?.includes("Latest failure"),
+    );
+    expect(older?.getAttribute("data-has-retry")).toBe("false");
+    expect(latest?.getAttribute("data-has-retry")).toBe("true");
+  });
+
+  it("renders unavailable tool failures as tool rows without global chat errors", () => {
+    const unavailableToolError =
+      'The requested tool is not available in this chat. Available tools are listed in the details below; use an exact available tool name for the next tool call.\n\nDetails:\n{"requestedToolName":"missing_tool"}';
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "missing_tool",
+            toolCallId: "call-1",
+            state: "output-error",
+            input: {},
+            errorText: unavailableToolError,
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.queryByTestId("inline-chat-error")).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button")[0]);
+    expect(screen.getByText("tool-missing_tool")).toBeInTheDocument();
+    expect(
+      screen.getByText(/The requested tool is not available in this chat/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/requestedToolName/)).toBeInTheDocument();
+  });
+
+  it("does not render persisted chat errors before live messages without timestamps", () => {
+    const messages = [
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "live retry" }],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        chatErrors={[
+          {
+            id: "error-1",
+            conversationId: "conv-1",
+            createdAt: "2026-04-22T12:01:00.000Z",
+            error: {
+              code: "server_error",
+              message: "Provider failed",
+              isRetryable: true,
+            },
+          },
+        ]}
+      />,
+    );
+
+    const retry = screen.getByText("live retry");
+    const error = screen.getByTestId("inline-chat-error");
+
+    expect(retry.compareDocumentPosition(error)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("renders context compaction feedback after existing messages", () => {
+    const messages = [
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "keep this visible first" }],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        contextCompactionFeedback={{
+          status: "skipped",
+          message:
+            "Only the latest user turn is available, so there is no completed earlier context to compact yet.",
+        }}
+      />,
+    );
+
+    const message = screen.getByText("keep this visible first");
+    const feedback = screen.getByText(
+      "Only the latest user turn is available, so there is no completed earlier context to compact yet.",
+    );
+
+    expect(message.compareDocumentPosition(feedback)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("renders compaction timeline events anchored by persisted message metadata", () => {
+    const messages = [
+      {
+        id: "client-assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "visible assistant response" }],
+        metadata: {
+          [PERSISTED_MESSAGE_ID_METADATA_KEY]: "db-assistant-1",
+        },
+      },
+    ] as UIMessage[];
+    const compactions: archestraApiTypes.GetChatConversationResponses["200"]["compactions"] =
+      [
+        {
+          id: "compaction-1",
+          conversationId: "conv-1",
+          summary: "older context summary",
+          compactedThroughMessageId: "db-assistant-1",
+          trigger: "manual",
+          provider: "openai",
+          model: "gpt-4o-mini",
+          originalTokenEstimate: 120,
+          compactedTokenEstimate: 35,
+          createdAt: "2026-05-19T12:00:00.000Z",
+        },
+      ];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        compactions={compactions}
+      />,
+    );
+
+    const message = screen.getByText("visible assistant response");
+    const compaction = screen.getByText("Conversation context compacted");
+
+    expect(message.compareDocumentPosition(compaction)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("keeps an expanded compact tool panel open when later tool calls append to the same message", () => {
+    const initialMessages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-github__list_issues",
+            toolCallId: "call-1",
+            state: "input-available",
+            input: { owner: "a", repo: "b" },
+          },
+          {
+            type: "tool-github__list_issues",
+            toolCallId: "call-1",
+            state: "output-available",
+            output: { issue: 1 },
+          },
+          {
+            type: "tool-github__list_pull_requests",
+            toolCallId: "call-2",
+            state: "input-available",
+            input: { owner: "a", repo: "b" },
+          },
+          {
+            type: "tool-github__list_pull_requests",
+            toolCallId: "call-2",
+            state: "output-available",
+            output: { pr: 2 },
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={initialMessages}
+        status="ready"
+      />,
+    );
+
+    const toolButtons = screen.getAllByRole("button");
+    fireEvent.click(toolButtons[0]);
+    expect(screen.getByText('{"issue":1}')).toBeInTheDocument();
+
+    const updatedMessages = [
+      {
+        ...initialMessages[0],
+        parts: [
+          ...initialMessages[0].parts,
+          {
+            type: "tool-github__get_issue",
+            toolCallId: "call-3",
+            state: "input-available",
+            input: { owner: "a", repo: "b", issue_number: 1 },
+          },
+          {
+            type: "tool-github__get_issue",
+            toolCallId: "call-3",
+            state: "output-available",
+            output: { issue: 3 },
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={updatedMessages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByText('{"issue":1}')).toBeInTheDocument();
+  });
+
+  it("renders branded built-in todo_write with the specialized todo tool UI", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__todo_write",
+            toolCallId: "call-1",
+            state: "output-available",
+            input: {
+              todos: [{ content: "Find GitHub tools", status: "completed" }],
+            },
+            output: { ok: true },
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByText("todo-write-tool")).toBeInTheDocument();
+    expect(
+      screen.queryByText("tool-sparky__todo_write"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders a persisted ask_user result in its grouped transcript slot", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__ask_user",
+            toolCallId: "call-1",
+            state: "output-available",
+            input: {
+              question: "Who should see the app?",
+              options: [{ label: "Only me" }, { label: "My team" }],
+              remedy_offers: [
+                { protected: "e30", payload: "{}", signature: "sig" },
+              ],
+            },
+            output: {
+              content: [
+                {
+                  type: "text",
+                  text: "The user dismissed the question. Do not proceed with the question.",
+                },
+              ],
+              structuredContent: { action: "cancel", selected: [] },
+            },
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    const summary = screen.getByTestId("ask-user-tool-group");
+    expect(summary).toHaveTextContent("Who should see the app?");
+    expect(summary).toHaveTextContent("Dismissed");
+    expect(screen.getByRole("list", { name: "Answers" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /ask user/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a parallel ask_user batch in one stable slot while results arrive apart", () => {
+    const resolveMcpElicitation = vi.fn().mockResolvedValue(true);
+    const initialMessages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "step-start" },
+          askUserInput("call-color", "Pick a color"),
+          {
+            type: "tool-sparky__todo_write",
+            toolCallId: "call-search",
+            state: "output-available",
+            input: { todos: [] },
+            output: { ok: true },
+          },
+          askUserInput("call-fruit", "Pick a fruit"),
+        ],
+      },
+    ] as UIMessage[];
+    mockChatSession.current = chatSession({
+      requests: [
+        choiceRequest("q-color", "call-color", "Pick a color", [
+          "Blue",
+          "Green",
+        ]),
+        choiceRequest("q-fruit", "call-fruit", "Pick a fruit", [
+          "Apple",
+          "Pear",
+        ]),
+      ],
+      resolveMcpElicitation,
+    });
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={initialMessages}
+        status="streaming"
+      />,
+    );
+
+    const group = screen.getByTestId("ask-user-tool-group");
+    expect(screen.getByText("todo-write-tool")).toBeInTheDocument();
+
+    const oneResult = [
+      {
+        ...initialMessages[0],
+        parts: [
+          ...initialMessages[0].parts,
+          askUserResult("call-color", "Blue"),
+        ],
+      },
+    ] as UIMessage[];
+    mockChatSession.current = chatSession({
+      requests: [
+        choiceRequest("q-fruit", "call-fruit", "Pick a fruit", [
+          "Apple",
+          "Pear",
+        ]),
+      ],
+      resolveMcpElicitation,
+    });
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={oneResult}
+        status="streaming"
+      />,
+    );
+
+    expect(screen.getByTestId("ask-user-tool-group")).toBe(group);
+
+    const completedMessages = [
+      {
+        ...oneResult[0],
+        parts: [...oneResult[0].parts, askUserResult("call-fruit", "Apple")],
+      },
+    ] as UIMessage[];
+    mockChatSession.current = chatSession({
+      requests: [],
+      resolveMcpElicitation,
+    });
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={completedMessages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByTestId("ask-user-tool-group")).toBe(group);
+    expect(screen.getAllByRole("list", { name: "Answers" })).toHaveLength(1);
+    expect(screen.getByRole("list", { name: "Answers" })).toHaveTextContent(
+      "Pick a colorBluePick a fruitApple",
+    );
+  });
+
+  it("keeps unreadable and separated error ask_user outputs in the generic renderer", () => {
+    const messages = [
+      {
+        id: "assistant-plain",
+        role: "assistant",
+        parts: [
+          askUserInput("call-plain", "Show raw output?"),
+          {
+            type: "tool-sparky__ask_user",
+            toolCallId: "call-plain",
+            state: "output-available",
+            output: { content: "plain output" },
+          },
+        ],
+      },
+      {
+        id: "assistant-error",
+        role: "assistant",
+        parts: [
+          askUserInput("call-error", "Show error?"),
+          {
+            type: "tool-sparky__ask_user",
+            toolCallId: "call-error",
+            state: "output-error",
+            errorText: "Request failed",
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.queryByTestId("ask-user-tool-group")).not.toBeInTheDocument();
+    expect(screen.getAllByText("tool-sparky__ask_user")).toHaveLength(2);
+    expect(screen.getByText("Request failed")).toBeInTheDocument();
+  });
+
+  it("settles a previously pending ask_user group when the response is stopped", () => {
+    const resolveMcpElicitation = vi.fn().mockResolvedValue(true);
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          { type: "step-start" },
+          askUserInput("call-color", "Pick a color"),
+        ],
+      },
+    ] as UIMessage[];
+    mockChatSession.current = chatSession({
+      requests: [
+        choiceRequest("q-color", "call-color", "Pick a color", [
+          "Blue",
+          "Green",
+        ]),
+      ],
+      resolveMcpElicitation,
+    });
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="streaming"
+      />,
+    );
+    const group = screen.getByTestId("ask-user-tool-group");
+
+    mockChatSession.current = chatSession({
+      requests: [],
+      resolveMcpElicitation,
+    });
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByTestId("ask-user-tool-group")).toBe(group);
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Answers" })).toHaveTextContent(
+      "Pick a colorStopped without an answer",
+    );
+  });
+
+  it("hides the proxy's signed-offer fields from execute_remedy_plan inputs", () => {
+    const remedyInput = {
+      offer_id: "offer-1",
+      plan: "Share the report with the team",
+      execution: { original_arguments: { offer_id: "offer-1" } },
+      protected: "eyJhbGciOiJIUzI1NiJ9",
+      payload: '{"offer_id":"offer-1"}',
+      signature: "c2lnbmF0dXJlLWJ5dGVz",
+    };
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__execute_remedy_plan",
+            toolCallId: "call-1",
+            state: "output-available",
+            input: remedyInput,
+            output: { content: [{ type: "text", text: "Remedy applied." }] },
+          },
+        ],
+      },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__execute_remedy_plan",
+            toolCallId: "call-2",
+            state: "approval-requested",
+            input: remedyInput,
+            approval: { id: "approval-1" },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        onToolApprovalResponse={vi.fn()}
+      />,
+    );
+
+    // Completed: a compact circle whose expanded card lists the input.
+    // The approval-requested circle is already auto-expanded under its circle.
+    fireEvent.click(screen.getByRole("button", { name: "Guardrails step" }));
+
+    const shownInputs = screen
+      .getAllByText(/Share the report with the team/)
+      .map((node) => node.textContent ?? "");
+    // One from the expanded card, one from the approval card.
+    expect(shownInputs).toHaveLength(2);
+    for (const shown of shownInputs) {
+      expect(JSON.parse(shown)).toEqual({
+        offer_id: "offer-1",
+        plan: "Share the report with the team",
+      });
+    }
+  });
+
+  it("renders a guarded call as one circle whose card shows the negotiation in order", () => {
+    const blocked = remedyChainParts({
+      prefix: "a",
+      tool: "workspace__show_board",
+      args: { board: "roadmap" },
+    });
+    const other = remedyChainParts({
+      prefix: "b",
+      tool: "sparky__list_skills",
+      args: {},
+      viaRunTool: true,
+    });
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          blocked.notice,
+          other.notice,
+          {
+            type: "tool-workspace__clock",
+            toolCallId: "call-clock",
+            state: "output-available",
+            input: {},
+            output: "noon",
+          },
+          other.remedy,
+          blocked.remedy,
+          other.retry,
+          blocked.retry,
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen
+        .getAllByRole("button", { expanded: false })
+        .map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["show board", "list skills", "clock"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "show board" }));
+
+    const card = screen.getByText("tool-workspace__show_board").parentElement;
+    expect(card).not.toBeNull();
+    const text = card?.textContent ?? "";
+    const order = [
+      '{"board":"roadmap"}',
+      "Guardrails",
+      "tool-sparky__get_remedy_plans",
+      "tool-sparky__execute_remedy_plan",
+      '"a: board shown"',
+    ].map((needle) => text.indexOf(needle));
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((x, y) => x - y));
+    // The other guarded call's negotiation stays in its own card.
+    expect(text).not.toContain("b: skills listed");
+  });
+
+  it("keeps a guarded call running until its turn ends, only in the active turn", () => {
+    const earlier = remedyChainParts({
+      prefix: "a",
+      tool: "workspace__show_board",
+      args: {},
+    });
+    const current = remedyChainParts({
+      prefix: "b",
+      tool: "workspace__close_task",
+      args: { id: 7 },
+    });
+    // Both calls were blocked and remedied, and neither was retried yet.
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [earlier.notice, earlier.remedy],
+      },
+      { id: "user-2", role: "user", parts: [{ type: "text", text: "Go on" }] },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        parts: [current.notice, current.remedy],
+      },
+    ] as unknown as UIMessage[];
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="streaming"
+      />,
+    );
+
+    // The finished turn shows its final state; the active one stays running.
+    expect(
+      screen.getByRole("button", { name: "show board (blocked)" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "close task (running)" }),
+    ).toBeInTheDocument();
+
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "close task (blocked)" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a guarded call's approval prompt visible in one full card", () => {
+    const onToolApprovalResponse = vi.fn();
+    const chain = remedyChainParts({
+      prefix: "a",
+      tool: "workspace__export_records",
+      args: { destination: "external" },
+    });
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          chain.notice,
+          chain.remedy,
+          {
+            ...chain.retry,
+            state: "approval-requested",
+            output: undefined,
+            approval: { id: "approval-1" },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        onToolApprovalResponse={onToolApprovalResponse}
+      />,
+    );
+
+    expect(screen.getAllByText("tool-workspace__export_records")).toHaveLength(
+      1,
+    );
+    expect(screen.getByText("Guardrails")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(onToolApprovalResponse).toHaveBeenCalledWith({
+      id: "approval-1",
+      approved: true,
+    });
+  });
+
+  it("renders approval controls for a direct tool call that requires approval", () => {
+    const onToolApprovalResponse = vi.fn();
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-workspace__export_records",
+            toolCallId: "call-1",
+            state: "approval-requested",
+            input: { destination: "external" },
+            approval: { id: "approval-1" },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        onToolApprovalResponse={onToolApprovalResponse}
+      />,
+    );
+
+    expect(screen.getByText("Approval required")).toBeInTheDocument();
+    expect(
+      screen.getByText("Review this tool call before it can continue."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(onToolApprovalResponse).toHaveBeenCalledWith({
+      id: "approval-1",
+      approved: true,
+    });
+  });
+
+  it("stops following the bottom when a circle is clicked, so the row stays in place", () => {
+    mockStopScroll.mockClear();
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-workspace__clock",
+            toolCallId: "call-clock",
+            state: "output-available",
+            input: {},
+            output: "noon",
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+    expect(mockStopScroll).not.toHaveBeenCalled();
+
+    // Opening the card would grow the chat and pull it to its new bottom.
+    fireEvent.click(screen.getByRole("button", { name: "clock" }));
+    expect(mockStopScroll).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders approval controls for run_tool when its target requires approval", () => {
+    const onToolApprovalResponse = vi.fn();
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__run_tool",
+            toolCallId: "call-1",
+            state: "approval-requested",
+            input: {
+              tool_name: "workspace__export_records",
+              tool_args: { destination: "external" },
+            },
+            approval: { id: "approval-1" },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        onToolApprovalResponse={onToolApprovalResponse}
+      />,
+    );
+
+    expect(screen.getByText("Approval required")).toBeInTheDocument();
+    expect(
+      screen.getByText("tool-workspace__export_records"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("tool-sparky__run_tool")).not.toBeInTheDocument();
+    expect(screen.getByText('{"destination":"external"}')).toBeInTheDocument();
+    expect(screen.queryByText(/tool_name/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Decline" }));
+    expect(onToolApprovalResponse).toHaveBeenCalledWith({
+      id: "approval-1",
+      approved: false,
+      reason: "User denied",
+    });
+  });
+
+  it("shows a run_tool target's arguments for approval when they arrive as JSON text", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__run_tool",
+            toolCallId: "call-1",
+            state: "approval-requested",
+            input: {
+              tool_name: "workspace__export_records",
+              // run_tool takes its target's arguments in this form too.
+              tool_args: '{"destination":"external"}',
+            },
+            approval: { id: "approval-1" },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        onToolApprovalResponse={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Approval required")).toBeInTheDocument();
+    expect(
+      screen.getByText("tool-workspace__export_records"),
+    ).toBeInTheDocument();
+    expect(screen.getByText('{"destination":"external"}')).toBeInTheDocument();
+  });
+
+  it("renders target approval details for a branded run_tool before identity data resolves", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-custom__run_tool",
+            toolCallId: "call-1",
+            state: "approval-requested",
+            input: {
+              tool_name: "workspace__export_records",
+              tool_args: { destination: "external" },
+            },
+            approval: { id: "approval-1" },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+        onToolApprovalResponse={() => undefined}
+      />,
+    );
+
+    expect(
+      screen.getByText("tool-workspace__export_records"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("tool-custom__run_tool")).not.toBeInTheDocument();
+    expect(screen.getByText('{"destination":"external"}')).toBeInTheDocument();
+  });
+
+  it("renders assistant expired-auth text as the inline reauth tool UI", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: 'Expired or invalid authentication for "id-jag test".\n\nYour credentials (user: usr_123) failed authentication. Please re-authenticate to continue using this tool.\nTo re-authenticate, visit this URL: http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz',
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Re-authenticate" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/To re-authenticate, visit this URL:/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("loads the MCP install helper only once the transcript shows an auth prompt", () => {
+    const plain = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Here is the summary you asked for." }],
+      },
+    ] as UIMessage[];
+    const { rerender } = render(
+      <ChatMessages conversationId="conv-1" messages={plain} status="ready" />,
+    );
+    expect(mockUseMcpInstallOrchestrator).toHaveBeenLastCalledWith({
+      enabled: false,
+    });
+
+    const withPrompt = [
+      ...plain,
+      {
+        id: "assistant-2",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: 'Authentication required for "jwks demo".\n\nNo credentials were found for your account (user: usr_123).\nTo set up your credentials, visit this URL: http://localhost:3000/mcp/registry?install=cat_abc',
+          },
+        ],
+      },
+    ] as UIMessage[];
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={withPrompt}
+        status="ready"
+      />,
+    );
+    expect(mockUseMcpInstallOrchestrator).toHaveBeenLastCalledWith({
+      enabled: true,
+    });
+  });
+
+  it("renders assistant auth-required text as the inline install tool UI", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: 'Authentication required for "jwks demo".\n\nNo credentials were found for your account (user: usr_123).\nTo set up your credentials, visit this URL: http://localhost:3000/mcp/registry?install=cat_abc',
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Set up credentials" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/To set up your credentials, visit this URL:/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders an identity-provider connect control as a same-tab link", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: 'Authentication required for "jwks demo".\n\nNo credentials were found for your account (user: usr_123).\nTo set up your credentials, visit this URL: http://localhost:3000/sso/Okta',
+          },
+        ],
+      },
+    ] as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    const link = screen.getByRole("link", { name: "Connect Okta" });
+    expect(link).toBeInTheDocument();
+    expect(link).toHaveAttribute("href", "http://localhost:3000/sso/Okta");
+    expect(link).not.toHaveAttribute("target");
+    expect(link).not.toHaveAttribute("rel");
+    expect(
+      screen.queryByRole("button", { name: "Connect Okta" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders structured auth-expired tool output as the inline reauth tool UI", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-id-jag_test__get_server_info",
+            toolCallId: "call-1",
+            state: "output-available",
+            output: {
+              isError: true,
+              _meta: {
+                archestraError: {
+                  type: "auth_expired",
+                  message:
+                    'Expired or invalid authentication for "id-jag test".',
+                  catalogId: "cat_abc",
+                  catalogName: "id-jag test",
+                  serverId: "srv_xyz",
+                  reauthUrl:
+                    "http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz",
+                },
+              },
+            },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Re-authenticate" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("tool-id-jag_test__get_server_info"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders structured assigned-credential-unavailable tool output as config error UI", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-githubcopilot__remote-mcp__issue_write",
+            toolCallId: "call-1",
+            state: "output-available",
+            output: {
+              isError: true,
+              _meta: {
+                archestraError: {
+                  type: "assigned_credential_unavailable",
+                  message: "Assigned credential unavailable",
+                  catalogId: "cat_abc",
+                  catalogName: "githubcopilot__remote-mcp",
+                },
+              },
+            },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen.getByText(/credentials for.*githubcopilot__remote-mcp.*expired/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("tool-githubcopilot__remote-mcp__issue_write"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the assistant's reply next to the auth card of a failed tool call", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-id-jag_test__get_server_info",
+            toolCallId: "call-1",
+            state: "output-available",
+            output: {
+              isError: true,
+              _meta: {
+                archestraError: {
+                  type: "auth_expired",
+                  message:
+                    'Expired or invalid authentication for "id-jag test".',
+                  catalogId: "cat_abc",
+                  catalogName: "id-jag test",
+                  serverId: "srv_xyz",
+                  reauthUrl:
+                    "http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz",
+                },
+              },
+            },
+          },
+          {
+            type: "text",
+            text: 'Your authentication for "id-jag test" is expired or invalid. Please re-authenticate by visiting this URL: http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz',
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen.getAllByRole("button", { name: "Re-authenticate" }),
+    ).toHaveLength(1);
+    expect(
+      screen.getByText(/Please re-authenticate by visiting this URL/i),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps a reply that repeats the tool's auth error word for word, without a second card", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-id-jag_test__get_server_info",
+            toolCallId: "call-1",
+            state: "output-available",
+            output: {
+              isError: true,
+              _meta: {
+                archestraError: {
+                  type: "auth_expired",
+                  message:
+                    'Expired or invalid authentication for "id-jag test".',
+                  catalogId: "cat_abc",
+                  catalogName: "id-jag test",
+                  serverId: "srv_xyz",
+                  reauthUrl:
+                    "http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz",
+                },
+              },
+            },
+          },
+          {
+            type: "text",
+            text: 'Expired or invalid authentication for "id-jag test".\n\nTo re-authenticate, visit this URL: http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz\n\nOnce that is done I will fetch the server info.',
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(
+      screen.getAllByRole("button", { name: "Re-authenticate" }),
+    ).toHaveLength(1);
+    expect(
+      screen.getByText(/Once that is done I will fetch the server info/i),
+    ).toBeInTheDocument();
+  });
+
+  it("orders tool-call circles chronologically around narration and opens policy previews under their own circle", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__load_skill",
+            toolCallId: "c1",
+            state: "output-available",
+            input: { name: "guardrails" },
+            output: "loaded",
+          },
+          { type: "text", text: "First I will inspect the current policy." },
+          {
+            type: "tool-sparky__get_guardrails_policy",
+            toolCallId: "c2",
+            state: "output-available",
+            input: {},
+            output: "current",
+          },
+          { type: "text", text: "Now I am previewing the change." },
+          {
+            type: "tool-sparky__preview_guardrails_policy_change",
+            toolCallId: "c3",
+            state: "output-available",
+            input: {
+              expectedRevision: 3,
+              edits: [{ oldText: "old", newText: "new" }],
+            },
+            output: {
+              structuredContent: {
+                stage: "preview",
+                delivery: "revision",
+                before: "old",
+                after: "new",
+              },
+            },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ChatMessages
+          conversationId="conv-1"
+          messages={messages}
+          status="ready"
+        />
+      </QueryClientProvider>,
+    );
+
+    const skillPill = screen.getByRole("status", { name: "guardrails" });
+    const firstText = screen.getByText(
+      "First I will inspect the current policy.",
+    );
+    const getPolicyCircle = screen.getByRole("button", {
+      name: "get guardrails policy",
+    });
+    const secondText = screen.getByText("Now I am previewing the change.");
+    const previewCircle = screen.getByRole("button", {
+      name: "preview guardrails policy change",
+    });
+    const previewHeader = screen.getByText(
+      "tool-sparky__preview_guardrails_policy_change",
+    );
+
+    expect(previewCircle).toHaveAttribute("aria-expanded", "true");
+    expect(
+      skillPill.compareDocumentPosition(firstText) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      firstText.compareDocumentPosition(getPolicyCircle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      getPolicyCircle.compareDocumentPosition(secondText) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      secondText.compareDocumentPosition(previewCircle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      previewCircle.compareDocumentPosition(previewHeader) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("auto-opens only the latest policy preview across split rows in a message", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__preview_guardrails_policy_change",
+            toolCallId: "preview-1",
+            state: "output-available",
+            input: {
+              expectedRevision: 3,
+              edits: [{ oldText: "old", newText: "first" }],
+            },
+            output: {
+              structuredContent: {
+                stage: "preview",
+                delivery: "revision",
+                before: "old",
+                after: "first",
+              },
+            },
+          },
+          { type: "text", text: "Adjusting the preview." },
+          {
+            type: "tool-sparky__preview_guardrails_policy_change",
+            toolCallId: "preview-2",
+            state: "output-available",
+            input: {
+              expectedRevision: 3,
+              edits: [{ oldText: "old", newText: "second" }],
+            },
+            output: {
+              structuredContent: {
+                stage: "preview",
+                delivery: "revision",
+                before: "old",
+                after: "second",
+              },
+            },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    const previewButtons = screen.getAllByRole("button", {
+      name: "preview guardrails policy change",
+    });
+    expect(previewButtons).toHaveLength(2);
+    expect(previewButtons[0]).toHaveAttribute("aria-expanded", "false");
+    expect(previewButtons[1]).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getAllByText("tool-sparky__preview_guardrails_policy_change"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps an earlier row's preview open when a pending proposal references it and a newer preview arrives (even without full-view)", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+    } as ReturnType<typeof useHasPermissions>);
+
+    const alphaContent = "[policy]\nversion = 2\n# allow alpha\n";
+    const alphaDiff =
+      "--- a/mcp/alpha.toml\n+++ b/mcp/alpha.toml\n@@ -1,2 +1,3 @@\n [policy]\n version = 2\n+# allow alpha\n";
+    const betaContent = "[policy]\nversion = 2\n# allow beta\n";
+    const betaDiff =
+      "--- a/mcp/beta.toml\n+++ b/mcp/beta.toml\n@@ -1,2 +1,3 @@\n [policy]\n version = 2\n+# allow beta\n";
+
+    const buildMessages = (
+      proposalState: "approval-requested" | "output-denied",
+    ) =>
+      [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-sparky__preview_guardrails_server_rules_change",
+              toolCallId: "preview-alpha",
+              state: "output-available",
+              input: {
+                mcpServerId: "server-alpha",
+                expectedCommit: "c1",
+                content: alphaContent,
+              },
+              output: {
+                _meta: {},
+                content: JSON.stringify({
+                  valid: true,
+                  path: "mcp/alpha.toml",
+                  mcpServer: { id: "server-alpha", name: "Alpha" },
+                  diff: alphaDiff,
+                }),
+              },
+            },
+            {
+              type: "text",
+              text: "Proposing the Alpha rules and previewing Beta next.",
+            },
+            {
+              type: "tool-sparky__propose_guardrails_server_rules_change",
+              toolCallId: "propose-alpha",
+              state: proposalState,
+              input: {
+                mcpServerId: "server-alpha",
+                expectedCommit: "c1",
+                content: alphaContent,
+                summary: "Updates Alpha rules.",
+              },
+              ...(proposalState === "approval-requested"
+                ? { approval: { id: "apr-alpha" } }
+                : { errorText: "User denied" }),
+            },
+            {
+              type: "tool-sparky__preview_guardrails_server_rules_change",
+              toolCallId: "preview-beta",
+              state: "output-available",
+              input: {
+                mcpServerId: "server-beta",
+                expectedCommit: "c2",
+                content: betaContent,
+              },
+              output: {
+                _meta: {},
+                content: JSON.stringify({
+                  valid: true,
+                  path: "mcp/beta.toml",
+                  mcpServer: { id: "server-beta", name: "Beta" },
+                  diff: betaDiff,
+                }),
+              },
+            },
+          ],
+        },
+      ] as unknown as UIMessage[];
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={buildMessages("approval-requested")}
+        status="ready"
+        onToolApprovalResponse={vi.fn()}
+      />,
+    );
+
+    // Even without chat:full-view, Alpha's preview stays open alongside Beta's
+    // newer preview because the pending proposal points to Alpha's diff.
+    expect(screen.getAllByLabelText("Policy diff")).toHaveLength(2);
+    expect(screen.getByText("# allow alpha")).toBeInTheDocument();
+    expect(screen.getByText("# allow beta")).toBeInTheDocument();
+    expect(screen.getByText("The change previewed above")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
+
+    // Once the proposal is resolved, Alpha's earlier preview collapses cleanly,
+    // leaving only Beta's newer preview open.
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={buildMessages("output-denied")}
+        status="ready"
+        onToolApprovalResponse={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByLabelText("Policy diff")).toHaveLength(1);
+    expect(screen.queryByText("# allow alpha")).not.toBeInTheDocument();
+    expect(screen.getByText("# allow beta")).toBeInTheDocument();
+  });
+
+  it("keeps an approval-requested tool in its chronological circle before and after settlement", () => {
+    const buildMessages = (state: "approval-requested" | "output-available") =>
+      [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-google__search",
+              toolCallId: "c1",
+              state: "output-available",
+              input: { q: "branches" },
+              output: "stale",
+            },
+            { type: "text", text: "Ready to delete the stale branch." },
+            {
+              type: "tool-github__delete_branch",
+              toolCallId: "c2",
+              state,
+              input: { branch: "stale" },
+              ...(state === "approval-requested"
+                ? { approval: { id: "apr-1" } }
+                : { output: "deleted" }),
+            },
+          ],
+        },
+      ] as unknown as UIMessage[];
+
+    const { rerender } = render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={buildMessages("approval-requested")}
+        status="ready"
+        onToolApprovalResponse={vi.fn()}
+      />,
+    );
+
+    const textNode = screen.getByText("Ready to delete the stale branch.");
+    const pendingCircle = screen.getByRole("button", {
+      name: "delete branch (approval required)",
+    });
+    expect(pendingCircle).toHaveAttribute("aria-expanded", "true");
+    expect(
+      textNode.compareDocumentPosition(pendingCircle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    rerender(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={buildMessages("output-available")}
+        status="ready"
+        onToolApprovalResponse={vi.fn()}
+      />,
+    );
+
+    const settledCircle = screen.getByRole("button", { name: "delete branch" });
+    expect(settledCircle).toHaveAttribute("aria-expanded", "false");
+    expect(
+      textNode.compareDocumentPosition(settledCircle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("keeps auth-error tools in a clickable circle alongside sibling tools and shows the reauth card below", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-google__search",
+            toolCallId: "c1",
+            state: "output-available",
+            input: { q: "docs" },
+            output: "ok",
+          },
+          {
+            type: "tool-id-jag_test__get_server_info",
+            toolCallId: "c2",
+            state: "output-available",
+            input: {},
+            output: {
+              isError: true,
+              _meta: {
+                archestraError: {
+                  type: "auth_expired",
+                  message:
+                    'Expired or invalid authentication for "id-jag test".',
+                  catalogId: "cat_abc",
+                  catalogName: "id-jag test",
+                  serverId: "srv_xyz",
+                  reauthUrl:
+                    "http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz",
+                },
+              },
+            },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "search" })).toBeInTheDocument();
+    const errorCircle = screen.getByRole("button", {
+      name: "get server info (error)",
+    });
+    expect(errorCircle).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.getByRole("button", { name: "Re-authenticate" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("tool-id-jag_test__get_server_info"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(errorCircle);
+    expect(errorCircle).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByText("tool-id-jag_test__get_server_info"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders optimistic pending tool calls as running circles instead of bare cards", () => {
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        messages={[]}
+        status="streaming"
+        optimisticToolCalls={[
+          {
+            toolCallId: "opt-1",
+            toolName: "google__search",
+            input: { q: "weather" },
+          },
+        ]}
+      />,
+    );
+
+    const circle = screen.getByRole("button", { name: "search (running)" });
+    expect(circle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("tool-google__search")).not.toBeInTheDocument();
+  });
+});
+
+function chatSession({
+  requests,
+  resolveMcpElicitation,
+}: {
+  requests: Array<{
+    id: string;
+    conversationId: string;
+    toolName: string;
+    toolCallId: string;
+    message: string;
+    mode: "form";
+    requestedSchema: unknown;
+  }>;
+  resolveMcpElicitation: ReturnType<typeof vi.fn>;
+}) {
+  return {
+    earlyToolUiStarts: {},
+    contextCompaction: undefined,
+    pendingMcpElicitations: requests,
+    mcpTasks: {},
+    resolveMcpElicitation,
+    sendMessage: vi.fn(),
+  };
+}
+
+function choiceRequest(
+  id: string,
+  toolCallId: string,
+  message: string,
+  options: string[],
+) {
+  return {
+    id,
+    conversationId: "conv-1",
+    toolName: "sparky__ask_user",
+    toolCallId,
+    message,
+    mode: "form" as const,
+    requestedSchema: {
+      type: "object",
+      properties: {
+        choice: { type: "string", enum: options },
+      },
+      required: ["choice"],
+    },
+  };
+}
+
+function askUserInput(toolCallId: string, question: string) {
+  return {
+    type: "tool-sparky__ask_user",
+    toolCallId,
+    state: "input-available",
+    input: { question },
+  };
+}
+
+function askUserResult(toolCallId: string, selected: string) {
+  return {
+    type: "tool-sparky__ask_user",
+    toolCallId,
+    state: "output-available",
+    output: { structuredContent: { action: "accept", selected: [selected] } },
+  };
+}
+
+describe("owned-app inline rendering", () => {
+  const APP_ID = "947051c7-ea8e-48ed-8077-a3cc904d9d61";
+  const appOutput = {
+    content: `Created app "To Do App" (${APP_ID}).`,
+    structuredContent: { id: APP_ID, name: "To Do App" },
+  };
+
+  function renderAppToolPart(partOverrides: Record<string, unknown>) {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-sparky__edit_app",
+            toolCallId: "call-app-1",
+            state: "output-available",
+            input: { name: "To Do App", html: "<h1>hi</h1>" },
+            output: appOutput,
+            ...partOverrides,
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        agentId="agent-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+  }
+
+  it.each([
+    "edit_app",
+    "render_app",
+  ])("mounts the app-bound runtime for a branded %s result", (shortName) => {
+    renderAppToolPart({ type: `tool-sparky__${shortName}` });
+
+    const section = screen.getByTestId("mcp-app-section");
+    expect(section).toHaveAttribute("data-app-id", APP_ID);
+    expect(section).toHaveAttribute("data-uri", `ui://archestra-app/${APP_ID}`);
+  });
+
+  // scaffold_app only seeds the boilerplate template — it must not mount a
+  // canvas (the template flash is noise); the first edit_app is what renders.
+  it("does not mount for a branded scaffold_app result", () => {
+    renderAppToolPart({ type: "tool-sparky__scaffold_app" });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    "sparky__edit_app",
+    "edit_app",
+  ])("mounts the app-bound runtime for a run_tool dispatch targeting %s", (targetName) => {
+    renderAppToolPart({
+      type: "tool-sparky__run_tool",
+      input: {
+        tool_name: targetName,
+        tool_args: { name: "To Do App", html: "<h1>hi</h1>" },
+      },
+    });
+
+    expect(screen.getByTestId("mcp-app-section")).toHaveAttribute(
+      "data-app-id",
+      APP_ID,
+    );
+  });
+
+  it("does not mount for a foreign-prefix edit_app result", () => {
+    renderAppToolPart({ type: "tool-other__edit_app" });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  it("does not mount for list_apps", () => {
+    renderAppToolPart({
+      type: "tool-sparky__list_apps",
+      output: {
+        content: "1 app",
+        structuredContent: { apps: [appOutput.structuredContent] },
+      },
+    });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  it("app-binds an owned app opened via its __open launch tool (ui://archestra-app URI)", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-simple_todo__open",
+            toolCallId: "call-open-1",
+            state: "output-available",
+            input: {},
+            output: {
+              _meta: { ui: { resourceUri: `ui://archestra-app/${APP_ID}` } },
+            },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        agentId="agent-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    const section = screen.getByTestId("mcp-app-section");
+    expect(section).toHaveAttribute("data-app-id", APP_ID);
+    expect(section).toHaveAttribute("data-uri", `ui://archestra-app/${APP_ID}`);
+  });
+
+  it("does not app-bind an external MCP-UI render (non-owned-app URI)", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-excalidraw__draw",
+            toolCallId: "call-ext-1",
+            state: "output-available",
+            input: {},
+            output: { _meta: { ui: { resourceUri: "ui://excalidraw" } } },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        agentId="agent-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    const section = screen.getByTestId("mcp-app-section");
+    expect(section).toHaveAttribute("data-app-id", "");
+    expect(section).toHaveAttribute("data-uri", "ui://excalidraw");
+  });
+
+  // refine_app/validate_app return an app id but are not rendering tools: they
+  // must not mount a canvas (would otherwise re-render the app on every refine).
+  it.each([
+    "refine_app",
+    "validate_app",
+  ])("does not mount for a branded %s result carrying the app id", (shortName) => {
+    renderAppToolPart({ type: `tool-sparky__${shortName}` });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  it("does not mount when the id is not a UUID", () => {
+    renderAppToolPart({
+      output: { content: "ok", structuredContent: { id: "not-a-uuid" } },
+    });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  it("keeps the error text and does not mount for an error result", () => {
+    renderAppToolPart({
+      state: "output-error",
+      errorText: "Error: html exceeds the limit",
+      output: undefined,
+    });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  it("does not mount while approval is requested", () => {
+    renderAppToolPart({
+      state: "approval-requested",
+      approval: { id: "approval-1" },
+      output: undefined,
+    });
+    expect(screen.queryByTestId("mcp-app-section")).not.toBeInTheDocument();
+  });
+
+  it("is not swallowed by compact grouping next to compact-eligible tools", () => {
+    const messages = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-google__search",
+            toolCallId: "call-plain-1",
+            state: "output-available",
+            input: { q: "a" },
+            output: { content: "results" },
+          },
+          {
+            type: "tool-sparky__edit_app",
+            toolCallId: "call-app-1",
+            state: "output-available",
+            input: { name: "To Do App", html: "<h1>hi</h1>" },
+            output: appOutput,
+          },
+          {
+            type: "tool-google__search",
+            toolCallId: "call-plain-2",
+            state: "output-available",
+            input: { q: "b" },
+            output: { content: "results" },
+          },
+        ],
+      },
+    ] as unknown as UIMessage[];
+
+    render(
+      <ChatMessages
+        conversationId="conv-1"
+        agentId="agent-1"
+        messages={messages}
+        status="ready"
+      />,
+    );
+
+    expect(screen.getByTestId("mcp-app-section")).toHaveAttribute(
+      "data-app-id",
+      APP_ID,
+    );
+  });
+});
+
+/** One guarded call as Chat receives it: notice, remedy, released retry. */
+function remedyChainParts(params: {
+  prefix: string;
+  tool: string;
+  args: Record<string, unknown>;
+  viaRunTool?: boolean;
+}) {
+  const { prefix, tool, args } = params;
+  const offerId = `${prefix.charCodeAt(0).toString(16)}0000000000000a`;
+  const ruling = `[appa] Blocked: ${tool} cannot run yet.\n  - sparky__execute_remedy_plan(offer_id: "${offerId}", plan: "Accept")`;
+  return {
+    notice: {
+      type: "tool-sparky__get_remedy_plans",
+      toolCallId: `${prefix}-notice`,
+      state: "output-available",
+      input: {
+        tool,
+        arguments: JSON.stringify(args),
+        ruling,
+        notice: { v: 1, call_id: `${prefix}-notice` },
+      },
+      output: ruling,
+    },
+    remedy: {
+      type: "tool-sparky__execute_remedy_plan",
+      toolCallId: `${prefix}-remedy`,
+      state: "output-available",
+      input: { offer_id: offerId, plan: "Accept" },
+      output: "[appa] Authorized.",
+    },
+    retry: params.viaRunTool
+      ? {
+          type: "tool-sparky__run_tool",
+          toolCallId: `${prefix}-retry`,
+          state: "output-available",
+          input: { tool_name: tool, tool_args: args },
+          output: `${prefix}: skills listed`,
+        }
+      : {
+          type: `tool-${tool}`,
+          toolCallId: `${prefix}-retry`,
+          state: "output-available",
+          input: args,
+          output: `${prefix}: board shown`,
+        },
+  };
+}

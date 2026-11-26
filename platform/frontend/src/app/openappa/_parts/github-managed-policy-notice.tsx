@@ -1,0 +1,209 @@
+"use client";
+
+import { AlertTriangle, ExternalLink, LockKeyhole } from "lucide-react";
+import Link from "next/link";
+import { Badge } from "@/components/ui/badge";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import { useAppaGithubSync } from "@/lib/openappa-github-sync.query";
+import { appaGitHost, shownFailure } from "./appa-git-host";
+import {
+  FinishSetupNotice,
+  useFinishSetupPieces,
+  useRefusalHold,
+} from "./finish-setup-dialog";
+
+type AppaGithubSyncStatus = NonNullable<
+  ReturnType<typeof useAppaGithubSync>["data"]
+>;
+
+export function GithubManagedPolicyNotice({
+  validationDirectory,
+  hideHealthy = false,
+  healthyOnly = false,
+}: {
+  validationDirectory?: string;
+  /** The page links to the repository elsewhere; show only states that ask for something. */
+  hideHealthy?: boolean;
+  /** Only the chip a healthy sync shows, to sit in a toolbar; whatever asks for something is shown elsewhere. */
+  healthyOnly?: boolean;
+} = {}) {
+  const { data } = useAppaGithubSync();
+  const pieces = useFinishSetupPieces();
+  const git = appaGitHost(data);
+  const failed = useSyncFailureShown();
+  const validations = validationDirectory !== undefined;
+  const href = managedSourceUrl(data, validationDirectory);
+
+  // Setup still waits on something, a pull request to merge among it: the
+  // one Finish setup notice, as on the Git sync settings.
+  if (pieces && !failed)
+    return healthyOnly ? null : <FinishSetupNotice pieces={pieces} />;
+
+  // A healthy sync asks for nothing, so it is a chip, not a banner.
+  if (!failed && !(validations && validationDirectory === "")) {
+    if (hideHealthy) return null;
+    const content = (
+      <>
+        <LockKeyhole aria-hidden />
+        {/* In a toolbar on a phone the lock alone says it; its name stays for a screen reader. */}
+        <span className={healthyOnly ? "sr-only sm:not-sr-only" : undefined}>
+          {`Managed in ${git.label}`}
+        </span>
+        {href && (
+          <ExternalLink
+            aria-hidden
+            className={healthyOnly ? "hidden sm:block" : undefined}
+          />
+        )}
+      </>
+    );
+    return (
+      <Badge
+        variant="outline"
+        className="font-normal"
+        title={`The ${git.repository} owns ${validations ? "these validations" : "this policy"}. Change ${validations ? "their files" : "it"} there.`}
+        asChild={Boolean(href)}
+      >
+        {href ? (
+          <a href={href} target="_blank" rel="noopener noreferrer">
+            {content}
+            <span className="sr-only">(opens in new tab)</span>
+          </a>
+        ) : (
+          <span>{content}</span>
+        )}
+      </Badge>
+    );
+  }
+  if (healthyOnly) return null;
+
+  const notice = (
+    <InlineNotice variant={failed ? "error" : "neutral"}>
+      {failed ? <AlertTriangle /> : <LockKeyhole />}
+      <span className="font-medium">
+        {failed ? "Git sync failed" : `Managed in ${git.label}`}
+      </span>
+      <InlineNoticeText>
+        The{" "}
+        {href ? (
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 underline underline-offset-2 hover:no-underline"
+          >
+            <span>repository</span>
+            <ExternalLink className="size-3" aria-hidden />
+            <span className="sr-only">(opens in new tab)</span>
+          </a>
+        ) : (
+          <span>repository</span>
+        )}{" "}
+        <span>
+          {validations
+            ? failed
+              ? "owns these validations, but its updates could not be synced."
+              : validationDirectory
+                ? "owns these validations. Change their files there."
+                : "owns these validations. Validations are disabled until you set a directory in sync settings."
+            : failed
+              ? "owns this policy, but its updates could not be synced."
+              : "owns this policy. Change its rules and batteries there."}
+        </span>
+        {(failed || validationDirectory === "") && (
+          <>
+            {" "}
+            <Link
+              href="/settings/guardrails"
+              className="underline underline-offset-2 hover:no-underline"
+            >
+              Review sync settings
+            </Link>
+            <span>.</span>
+          </>
+        )}
+      </InlineNoticeText>
+    </InlineNotice>
+  );
+  // A failed sync outranks the rest of the setup. A permission the App
+  // lacks is not what failed here (that refusal is never a failure of its
+  // own), so its notice stays beside the failure.
+  return failed && pieces?.permissions.length ? (
+    <div className="space-y-2">
+      <FinishSetupNotice pieces={pieces} />
+      {notice}
+    </div>
+  ) : (
+    notice
+  );
+}
+
+/**
+ * Whether the Guardrails pages announce the last sync as failed. GitHub
+ * refusing the App for a permission it lacks is not a failure of its own to
+ * announce: the Finish setup notice says what the App lacks. Until GitHub
+ * has said what the App holds, a refusal is not announced either, so the
+ * failure never shows first only to give way to that notice.
+ */
+export function useSyncFailureShown(): boolean {
+  const source = useAppaGithubSync().data?.source;
+  const hold = useRefusalHold(source, useFinishSetupPieces());
+  return Boolean(shownFailure(source, source?.lastSyncError, hold.held));
+}
+
+/** Where the validations (or, without a directory, the policy file) live in the repository. */
+function managedSourceUrl(
+  sync: AppaGithubSyncStatus | null | undefined,
+  validationDirectory?: string,
+) {
+  const source = sync?.source;
+  return validationDirectory !== undefined && source?.repo
+    ? `${sync?.githubWebUrl}/${source.repo}${gitPathSeparator(sync)}/tree/${encodeURIComponent(source.ref ?? "HEAD")}/${validationDirectory.split("/").map(encodeURIComponent).join("/")}`
+    : githubPolicyFileUrl(sync, "blob");
+}
+
+/** "Managed in GitHub" and the repository link, for a menu item standing in for the chip. */
+export function useManagedValidationsLink(validationDirectory: string) {
+  const { data } = useAppaGithubSync();
+  return {
+    label: `Managed in ${appaGitHost(data).label}`,
+    href: managedSourceUrl(data, validationDirectory),
+  };
+}
+
+/** The synced policy file on GitHub or GitLab, to read (`blob`) or to change (`edit`). */
+export function githubPolicyFileUrl(
+  sync: AppaGithubSyncStatus | null | undefined,
+  view: "blob" | "edit",
+): string | null {
+  const source = sync?.source;
+  if (!sync || !source?.repo || !source.path) return null;
+  const path = source.path.split("/").map(encodeURIComponent).join("/");
+  return `${sync.githubWebUrl}/${source.repo}${gitPathSeparator(sync)}/${view}/${encodeURIComponent(source.ref ?? "HEAD")}/${path}`;
+}
+
+/**
+ * A file the root includes, by its include path beside the policy file, on
+ * the repository's host.
+ */
+export function githubRepositoryFileUrl(
+  sync: AppaGithubSyncStatus | null | undefined,
+  includePath: string,
+  view: "blob" | "edit",
+): string | null {
+  const source = sync?.source;
+  if (!sync || !source?.repo || !source.path) return null;
+  const folder = source.path.slice(0, source.path.lastIndexOf("/") + 1);
+  const path = `${folder}${includePath}`
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+  return `${sync.githubWebUrl}/${source.repo}${gitPathSeparator(sync)}/${view}/${encodeURIComponent(source.ref ?? "HEAD")}/${path}`;
+}
+
+/** GitLab puts `/-` before a project's tree, blob, and edit pages. */
+function gitPathSeparator(
+  sync: Pick<AppaGithubSyncStatus, "provider"> | null | undefined,
+) {
+  return sync?.provider === "gitlab" ? "/-" : "";
+}

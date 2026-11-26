@@ -1,0 +1,37 @@
+/**
+ * Ollama Adapter - OpenAI-compatible
+ *
+ * Ollama exposes an OpenAI-compatible API, so the whole adapter is OpenAI's,
+ * configured for Ollama via createOpenAiCompatibleAdapterFactory.
+ * See: https://github.com/ollama/ollama/blob/main/docs/openai.md
+ */
+import OpenAIProvider from "openai";
+import config from "@/config";
+import { metrics } from "@/observability";
+import type { CreateClientOptions } from "@/types";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { createOpenAiCompatibleAdapterFactory } from "./openai-compatible-adapter";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+
+export const ollamaAdapterFactory = createOpenAiCompatibleAdapterFactory({
+  provider: "ollama",
+  interactionType: "ollama:chatCompletions",
+  getBaseUrl: () => config.llm.ollama.baseUrl,
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): OpenAIProvider {
+    const customFetch = options.agent
+      ? metrics.llm.getObservableFetch("ollama", options.agent, options.source)
+      : undefined;
+
+    // Ollama typically runs without auth; the OpenAI SDK still requires a non-empty key.
+    return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      apiKey: apiKey || "EMPTY",
+      baseURL: options.baseUrl,
+      fetch: fetchWithAbortSignal(customFetch, options.abortSignal),
+      defaultHeaders: options.defaultHeaders,
+    });
+  },
+});

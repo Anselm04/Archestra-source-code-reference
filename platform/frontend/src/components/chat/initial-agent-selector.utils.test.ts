@@ -1,0 +1,343 @@
+// @vitest-environment node
+import { type archestraApiTypes, BUILT_IN_AGENT_IDS } from "@archestra/shared";
+import { describe, expect, it } from "vitest";
+import {
+  filterAndSortInitialAgents,
+  groupInitialAgents,
+} from "./initial-agent-selector.utils";
+
+const userId = "user-1";
+
+function makeAgent(
+  overrides: Partial<{
+    builtIn: boolean;
+    builtInAgentConfig: archestraApiTypes.GetChatAgentRosterResponses["200"][number]["builtInAgentConfig"];
+    id: string;
+    name: string;
+    scope: "personal" | "team" | "org";
+    authorId: string | null;
+    description: string | null;
+    icon: string | null;
+    systemPrompt: string | null;
+    sharedByName: boolean;
+  }> = {},
+) {
+  return {
+    id: overrides.id ?? crypto.randomUUID(),
+    name: overrides.name ?? "Agent",
+    scope: overrides.scope ?? "org",
+    authorId: overrides.authorId ?? null,
+    description: overrides.description ?? null,
+    icon: overrides.icon ?? null,
+    systemPrompt: overrides.systemPrompt ?? null,
+    runtime: null,
+    builtIn: overrides.builtIn ?? false,
+    builtInAgentConfig: overrides.builtInAgentConfig ?? null,
+    sharedByName: overrides.sharedByName ?? false,
+  };
+}
+
+describe("filterAndSortInitialAgents", () => {
+  it("shows the built-in SRE agent when granted to the caller", () => {
+    const sre = makeAgent({
+      id: "sre",
+      builtIn: true,
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.SRE },
+    });
+    expect(
+      filterAndSortInitialAgents({
+        allAgents: [sre],
+        currentAgentId: null,
+        search: "",
+        userId,
+      }),
+    ).toEqual([sre]);
+  });
+  it("offers the chat-capable built-in while hiding platform subagents", () => {
+    const agents = [
+      makeAgent({
+        id: "policy-assistant",
+        name: "Policy Assistant",
+        builtIn: true,
+        builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+      }),
+      makeAgent({
+        id: "platform-subagent",
+        name: "Platform Subagent",
+        builtIn: true,
+      }),
+      makeAgent({
+        id: "personal",
+        name: "My Assistant",
+        scope: "personal",
+        authorId: userId,
+      }),
+    ];
+    expect(
+      filterAndSortInitialAgents({
+        allAgents: agents,
+        currentAgentId: "policy-assistant",
+        search: "",
+        userId,
+      }).map((agent) => agent.id),
+    ).toEqual(["policy-assistant", "personal"]);
+    expect(
+      filterAndSortInitialAgents({
+        allAgents: agents,
+        currentAgentId: "policy-assistant",
+        search: "Policy Assistant",
+        userId,
+      }),
+    ).toEqual([agents[0]]);
+  });
+  it("keeps another user's personal agent shared by name, after the user's own", () => {
+    const agents = [
+      makeAgent({ id: "org", name: "Org Agent", scope: "org" }),
+      makeAgent({
+        id: "shared-with-me",
+        name: "Alpha Shared With Me",
+        scope: "personal",
+        authorId: "user-2",
+        sharedByName: true,
+      }),
+      // An admin reads this one only through oversight, e.g. a saved
+      // reference whose share was revoked.
+      makeAgent({
+        id: "oversight-only",
+        name: "Beta Oversight Only",
+        scope: "personal",
+        authorId: "user-3",
+      }),
+      makeAgent({
+        id: "mine",
+        name: "Zulu My Personal Agent",
+        scope: "personal",
+        authorId: userId,
+      }),
+    ];
+
+    const result = filterAndSortInitialAgents({
+      allAgents: agents,
+      currentAgentId: null,
+      search: "",
+      userId,
+    });
+
+    expect(result.map((agent) => agent.id)).toEqual([
+      "mine",
+      "shared-with-me",
+      "org",
+    ]);
+    expect(
+      groupInitialAgents({ agents: result, userId }).map((group) => ({
+        label: group.label,
+        ids: group.agents.map((agent) => agent.id),
+      })),
+    ).toEqual([
+      { label: "Yours", ids: ["mine"] },
+      { label: "Shared with you", ids: ["shared-with-me", "org"] },
+    ]);
+  });
+
+  it("keeps an authorized personal-scoped system assistant without an author", () => {
+    const policy = makeAgent({
+      id: "named-policy",
+      name: "Named Policy Assistant",
+      scope: "personal",
+      builtIn: true,
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG },
+    });
+    expect(
+      filterAndSortInitialAgents({
+        allAgents: [policy],
+        currentAgentId: null,
+        search: "Policy",
+        userId,
+      }).map((agent) => agent.id),
+    ).toEqual([policy.id]);
+  });
+
+  it("keeps a personal-scoped SRE agent granted to another user", () => {
+    const sre = makeAgent({
+      id: "sre",
+      name: "SRE",
+      scope: "personal",
+      authorId: "admin",
+      builtIn: true,
+      builtInAgentConfig: { name: BUILT_IN_AGENT_IDS.SRE },
+    });
+    expect(
+      filterAndSortInitialAgents({
+        allAgents: [sre],
+        currentAgentId: null,
+        search: "",
+        userId,
+      }),
+    ).toEqual([sre]);
+  });
+
+  it("puts the current agent first even if it is a shared agent", () => {
+    const agents = [
+      makeAgent({
+        id: "shared",
+        name: "Alpha Shared Agent",
+        scope: "org",
+      }),
+      makeAgent({
+        id: "personal",
+        name: "Zulu Personal Agent",
+        scope: "personal",
+        authorId: userId,
+      }),
+    ];
+
+    const result = filterAndSortInitialAgents({
+      allAgents: agents,
+      currentAgentId: "shared",
+      search: "",
+      userId,
+    });
+
+    expect(result.map((agent) => agent.id)).toEqual(["shared", "personal"]);
+  });
+
+  it("keeps the selected non-personal agent first after the personal-agent priority", () => {
+    const agents = [
+      makeAgent({
+        id: "org-selected",
+        name: "Zulu Org Agent",
+        scope: "org",
+      }),
+      makeAgent({
+        id: "team",
+        name: "Alpha Team Agent",
+        scope: "team",
+      }),
+      makeAgent({
+        id: "org-other",
+        name: "Alpha Org Agent",
+        scope: "org",
+      }),
+    ];
+
+    const result = filterAndSortInitialAgents({
+      allAgents: agents,
+      currentAgentId: "org-selected",
+      search: "",
+      userId,
+    });
+
+    expect(result.map((agent) => agent.id)).toEqual([
+      "org-selected",
+      "team",
+      "org-other",
+    ]);
+  });
+
+  it("filters by name and description case-insensitively", () => {
+    const agents = [
+      makeAgent({
+        id: "name-match",
+        name: "Database Helper",
+        scope: "org",
+      }),
+      makeAgent({
+        id: "description-match",
+        name: "Support Agent",
+        description: "Finds DATABASE issues",
+        scope: "team",
+      }),
+      makeAgent({
+        id: "no-match",
+        name: "Calendar Agent",
+        scope: "org",
+      }),
+    ];
+
+    const result = filterAndSortInitialAgents({
+      allAgents: agents,
+      currentAgentId: null,
+      search: "database",
+      userId,
+    });
+
+    expect(result.map((agent) => agent.id)).toEqual([
+      "description-match",
+      "name-match",
+    ]);
+  });
+
+  it("falls back to alphabetical order inside the same scope", () => {
+    const agents = [
+      makeAgent({ id: "z", name: "Zulu Team Agent", scope: "team" }),
+      makeAgent({ id: "a", name: "Alpha Team Agent", scope: "team" }),
+      makeAgent({ id: "m", name: "Mike Team Agent", scope: "team" }),
+    ];
+
+    const result = filterAndSortInitialAgents({
+      allAgents: agents,
+      currentAgentId: null,
+      search: "",
+      userId,
+    });
+
+    expect(result.map((agent) => agent.id)).toEqual(["a", "m", "z"]);
+  });
+});
+
+describe("groupInitialAgents", () => {
+  it("splits the user's own agents from shared ones, keeping the sort order", () => {
+    const mine = makeAgent({ id: "mine", scope: "personal", authorId: userId });
+    const team = makeAgent({ id: "team", scope: "team" });
+    const org = makeAgent({ id: "org", scope: "org" });
+
+    const groups = groupInitialAgents({ agents: [team, mine, org], userId });
+
+    expect(
+      groups.map((group) => ({
+        label: group.label,
+        ids: group.agents.map((agent) => agent.id),
+      })),
+    ).toEqual([
+      { label: "Yours", ids: ["mine"] },
+      { label: "Shared with you", ids: ["team", "org"] },
+    ]);
+  });
+
+  it("puts pinned agents first, newest pin first, and out of their own group", () => {
+    const mine = makeAgent({ id: "mine", scope: "personal", authorId: userId });
+    const minePinned = makeAgent({
+      id: "mine-pinned",
+      scope: "personal",
+      authorId: userId,
+    });
+    const orgPinned = makeAgent({ id: "org-pinned", scope: "org" });
+    const org = makeAgent({ id: "org", scope: "org" });
+
+    const groups = groupInitialAgents({
+      agents: [minePinned, mine, orgPinned, org],
+      userId,
+      pinnedIds: ["org-pinned", "mine-pinned"],
+    });
+
+    expect(
+      groups.map((group) => ({
+        label: group.label,
+        ids: group.agents.map((agent) => agent.id),
+      })),
+    ).toEqual([
+      { label: "Pinned", ids: ["org-pinned", "mine-pinned"] },
+      { label: "Yours", ids: ["mine"] },
+      { label: "Shared with you", ids: ["org"] },
+    ]);
+  });
+
+  it("drops a group with nothing in it", () => {
+    const groups = groupInitialAgents({
+      agents: [makeAgent({ id: "org", scope: "org" })],
+      userId,
+    });
+
+    expect(groups.map((group) => group.label)).toEqual(["Shared with you"]);
+  });
+});

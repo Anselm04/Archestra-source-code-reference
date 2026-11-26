@@ -1,0 +1,319 @@
+import { isEncryptedChatUnavailableContent } from "../encrypted-chat-content";
+import type { SupportedProvider } from "../index";
+import AnthropicMessagesInteraction from "./llmProviders/anthropic";
+import AudioInteraction from "./llmProviders/audio";
+import AzureChatCompletionInteraction from "./llmProviders/azure";
+import AzureImagesInteraction from "./llmProviders/azure-images";
+import AzureResponsesInteraction from "./llmProviders/azure-responses";
+import BedrockConverseInteraction from "./llmProviders/bedrock";
+import CerebrasChatCompletionInteraction from "./llmProviders/cerebras";
+import CohereChatInteraction from "./llmProviders/cohere";
+import type {
+  Interaction,
+  InteractionUtils,
+  RequestedToolCall,
+} from "./llmProviders/common";
+import DeepSeekChatCompletionInteraction from "./llmProviders/deepseek";
+import GeminiGenerateContentInteraction from "./llmProviders/gemini";
+import GithubCopilotChatCompletionInteraction from "./llmProviders/github-copilot";
+import GithubCopilotResponsesInteraction from "./llmProviders/github-copilot-responses";
+import GroqChatCompletionInteraction from "./llmProviders/groq";
+import JevDecisionsInteraction from "./llmProviders/jev";
+import KimiChatCompletionInteraction from "./llmProviders/kimi";
+import KimiCodeChatCompletionInteraction from "./llmProviders/kimi-code";
+import Microsoft365CopilotChatCompletionInteraction from "./llmProviders/microsoft-365-copilot";
+import MinimaxChatCompletionInteraction from "./llmProviders/minimax";
+import MistralChatCompletionInteraction from "./llmProviders/mistral";
+import OllamaChatCompletionInteraction from "./llmProviders/ollama";
+import OllamaNativeChatInteraction from "./llmProviders/ollama-native";
+import OpenAiChatCompletionInteraction from "./llmProviders/openai";
+import OpenAiEmbeddingInteraction from "./llmProviders/openai-embedding";
+import OpenAiResponsesInteraction from "./llmProviders/openai-responses";
+import OpenrouterChatCompletionInteraction from "./llmProviders/openrouter";
+import PassthroughInteraction from "./llmProviders/passthrough";
+import PerplexityChatCompletionInteraction from "./llmProviders/perplexity";
+import PerplexityResponsesInteraction from "./llmProviders/perplexity-responses";
+import RealtimeInteraction from "./llmProviders/realtime";
+import VllmChatCompletionInteraction from "./llmProviders/vllm";
+import XaiChatCompletionInteraction from "./llmProviders/xai";
+import ZhipuaiChatCompletionInteraction from "./llmProviders/zhipuai";
+import type { PartialUIMessage } from "./types";
+
+type InteractionFactory = (interaction: Interaction) => InteractionUtils;
+
+const interactionFactories: Record<Interaction["type"], InteractionFactory> = {
+  "openai:chatCompletions": (i) => new OpenAiChatCompletionInteraction(i),
+  "openai:responses": (i) => new OpenAiResponsesInteraction(i),
+  "perplexity:responses": (i) => new PerplexityResponsesInteraction(i),
+  "openai:embeddings": (i) => new OpenAiEmbeddingInteraction(i),
+  // Gemini embeddings use the OpenAI-compatible embedding shape.
+  "gemini:embeddings": (i) => new OpenAiEmbeddingInteraction(i),
+  // Bedrock (Titan) embeddings are normalized to the OpenAI embedding shape.
+  "bedrock:embeddings": (i) => new OpenAiEmbeddingInteraction(i),
+  // Cohere (direct) embeddings are normalized to the OpenAI embedding shape.
+  "cohere:embeddings": (i) => new OpenAiEmbeddingInteraction(i),
+  "openrouter:chatCompletions": (i) =>
+    new OpenrouterChatCompletionInteraction(i),
+  "anthropic:messages": (i) => new AnthropicMessagesInteraction(i),
+  "github-copilot:messages": (i) => new AnthropicMessagesInteraction(i),
+  "bedrock:converse": (i) => new BedrockConverseInteraction(i),
+  // Bedrock InvokeModel carries the Anthropic Messages wire format.
+  "bedrock:invoke": (i) => new AnthropicMessagesInteraction(i),
+  "cerebras:chatCompletions": (i) => new CerebrasChatCompletionInteraction(i),
+  "cohere:chat": (i) => new CohereChatInteraction(i),
+  "gemini:generateContent": (i) => new GeminiGenerateContentInteraction(i),
+  "mistral:chatCompletions": (i) => new MistralChatCompletionInteraction(i),
+  "ollama:chatCompletions": (i) => new OllamaChatCompletionInteraction(i),
+  "ollama-native:chat": (i) => new OllamaNativeChatInteraction(i),
+  "perplexity:chatCompletions": (i) =>
+    new PerplexityChatCompletionInteraction(i),
+  "vllm:chatCompletions": (i) => new VllmChatCompletionInteraction(i),
+  "zhipuai:chatCompletions": (i) => new ZhipuaiChatCompletionInteraction(i),
+  "deepseek:chatCompletions": (i) => new DeepSeekChatCompletionInteraction(i),
+  "kimi:chatCompletions": (i) => new KimiChatCompletionInteraction(i),
+  "kimi-code:chatCompletions": (i) => new KimiCodeChatCompletionInteraction(i),
+  "github-copilot:chatCompletions": (i) =>
+    new GithubCopilotChatCompletionInteraction(i),
+  "github-copilot:responses": (i) => new GithubCopilotResponsesInteraction(i),
+  "microsoft-365-copilot:chatCompletions": (i) =>
+    new Microsoft365CopilotChatCompletionInteraction(i),
+  "groq:chatCompletions": (i) => new GroqChatCompletionInteraction(i),
+  "xai:chatCompletions": (i) => new XaiChatCompletionInteraction(i),
+  "minimax:chatCompletions": (i) => new MinimaxChatCompletionInteraction(i),
+  "azure:chatCompletions": (i) => new AzureChatCompletionInteraction(i),
+  "azure:realtime": (i) => new AzureChatCompletionInteraction(i),
+  "azure:images": (i) => new AzureImagesInteraction(i),
+  "openai:images": (i) => new AzureImagesInteraction(i),
+  "openai:passthrough": (i) => new PassthroughInteraction(i),
+  "anthropic:passthrough": (i) => new PassthroughInteraction(i),
+  "openai:realtime": (i) => new RealtimeInteraction(i),
+  "azure:audio": (i) => new AudioInteraction(i),
+  "openai:audio": (i) => new AudioInteraction(i),
+  "azure:responses": (i) => new AzureResponsesInteraction(i),
+  "jev:decisions": (i) => new JevDecisionsInteraction(i),
+};
+
+export interface CostSavingsInput {
+  cost: string | null | undefined;
+  baselineCost: string | null | undefined;
+}
+
+export interface CostSavingsResult {
+  /**
+   * Savings from the request running on a different model than it asked for
+   * (baselineCost - cost). Only historical interactions can carry one: the
+   * optimization rules that swapped models have been removed, and new rows
+   * record the baseline as the model actually used, so this is 0 for them.
+   */
+  modelSwapSavings: number;
+  /** Total savings from historical model swaps */
+  totalSavings: number;
+  /**
+   * Estimated cost: what the request would have cost without the savings we
+   * attribute (requested model). Equals
+   * `actualCost + totalSavings`.
+   */
+  estimatedCost: number;
+  /** Actual cost charged — the stored `cost`, already reflecting every optimization */
+  actualCost: number;
+  /** Total savings as a percentage of the estimated cost (0–100) */
+  savingsPercent: number;
+  /** Whether there are any savings at all */
+  hasSavings: boolean;
+}
+
+/**
+ * Calculate all cost savings from an interaction.
+ * Used by both the logs table and detail view for consistent display.
+ */
+export function calculateCostSavings(
+  input: CostSavingsInput,
+): CostSavingsResult {
+  const costNum = input.cost ? Number.parseFloat(input.cost) : 0;
+  const baselineCostNum = input.baselineCost
+    ? Number.parseFloat(input.baselineCost)
+    : 0;
+
+  const actualCost = costNum;
+
+  // Savings from model selection: identical token usage priced at the
+  // requested model vs. the model actually used.
+  const modelSwapSavings = baselineCostNum - costNum;
+
+  // Total savings from historical model swaps.
+  const totalSavings = modelSwapSavings;
+
+  // The estimated (non-optimized) cost sits exactly `totalSavings` above the
+  // real spend, so the breakdown always reconciles and the percentage stays
+  // within 0–100% for any non-negative savings.
+  const estimatedCost = actualCost + totalSavings;
+
+  const savingsPercent =
+    estimatedCost > 0 ? (totalSavings / estimatedCost) * 100 : 0;
+
+  return {
+    modelSwapSavings,
+    totalSavings,
+    estimatedCost,
+    actualCost,
+    savingsPercent,
+    hasSavings: totalSavings !== 0,
+  };
+}
+
+export class DynamicInteraction implements InteractionUtils {
+  private interactionClass: InteractionUtils;
+  private interaction: Interaction;
+  /**
+   * An encrypted-chat interaction stores a sentinel where the provider payload
+   * would be. Every accessor below dereferences that payload unguarded
+   * (`request.messages`, `response.choices`), so the check lives here once
+   * rather than in each provider mapper, which would have to learn a shape it
+   * never produces. Callers get the neutral answer: nothing was requested,
+   * nothing refused, nothing to render.
+   */
+  private readonly contentUnavailable: boolean;
+
+  id: string;
+  profileId: string | null;
+  externalAgentId: string | null;
+  runId: string | null;
+  type: Interaction["type"];
+  provider: SupportedProvider;
+  endpoint: string;
+  createdAt: string;
+  modelName: string;
+
+  constructor(interaction: Interaction) {
+    const [provider, endpoint] = interaction.type.split(":");
+
+    this.interaction = interaction;
+    this.contentUnavailable =
+      isEncryptedChatUnavailableContent(interaction.request) ||
+      isEncryptedChatUnavailableContent(interaction.response);
+    this.id = interaction.id;
+    this.profileId = interaction.profileId;
+    this.externalAgentId = interaction.externalAgentId;
+    this.runId = interaction.runId;
+    this.type = interaction.type;
+    this.provider = provider as SupportedProvider;
+    this.endpoint = endpoint;
+    this.createdAt = interaction.createdAt;
+
+    this.interactionClass = this.getInteractionClass(interaction);
+
+    this.modelName = this.interactionClass.modelName;
+  }
+
+  private getInteractionClass(interaction: Interaction): InteractionUtils {
+    const factory =
+      interactionFactories[this.type as keyof typeof interactionFactories];
+    if (!factory) {
+      throw new Error(`Unsupported interaction type: ${this.type}`);
+    }
+    return factory(interaction);
+  }
+
+  /**
+   * A failed interaction is persisted with the provider `type` but a
+   * `{ error }` response instead of a provider response. Returns that error
+   * string, or null when the response is a normal provider response.
+   */
+  private getErrorResponseText(): string | null {
+    const response: unknown = this.interaction.response;
+    if (
+      response !== null &&
+      typeof response === "object" &&
+      "error" in response &&
+      typeof (response as { error: unknown }).error === "string"
+    ) {
+      return (response as { error: string }).error;
+    }
+    return null;
+  }
+
+  /** True when the interaction is a persisted failure (`{ error }` response). */
+  hasErrorResponse(): boolean {
+    return this.getErrorResponseText() !== null;
+  }
+
+  isLastMessageToolCall(): boolean {
+    if (this.contentUnavailable) return false;
+    return this.interactionClass.isLastMessageToolCall();
+  }
+
+  getLastToolCallId(): string | null {
+    if (this.contentUnavailable) return null;
+    return this.interactionClass.getLastToolCallId();
+  }
+
+  getToolNamesRequested(): string[] {
+    if (this.contentUnavailable) return [];
+    if (this.getErrorResponseText() !== null) {
+      return [];
+    }
+    return this.interactionClass.getToolNamesRequested();
+  }
+
+  /** The requested tool calls with their provider ids; [] where the wire has none. */
+  getToolCallsRequested(): RequestedToolCall[] {
+    if (this.contentUnavailable) return [];
+    if (this.getErrorResponseText() !== null) return [];
+    return this.interactionClass.getToolCallsRequested?.() ?? [];
+  }
+
+  getToolNamesUsed(): string[] {
+    if (this.contentUnavailable) return [];
+    if (this.getErrorResponseText() !== null) {
+      return [];
+    }
+    return this.interactionClass.getToolNamesUsed();
+  }
+
+  getLastUserMessage(): string {
+    if (this.contentUnavailable) return "";
+    return this.interactionClass.getLastUserMessage();
+  }
+
+  getLastAssistantResponse(): string {
+    if (this.contentUnavailable) return "";
+    const errorText = this.getErrorResponseText();
+    if (errorText !== null) {
+      return errorText;
+    }
+    return this.interactionClass.getLastAssistantResponse();
+  }
+
+  /**
+   * Map request messages, combining tool calls with their results
+   */
+  mapToUiMessages(): PartialUIMessage[] {
+    // An encrypted-chat interaction stores a sentinel where the provider payload
+    // would be, so there is no conversation to render. Provider mappers read
+    // fields off it unguarded (`request.messages.length`), so this has to stop
+    // before delegating rather than relying on a mapper tolerating it. The
+    // request/response panels render their own locked affordance.
+    if (this.contentUnavailable) return [];
+    const errorText = this.getErrorResponseText();
+    if (errorText === null) {
+      return this.interactionClass.mapToUiMessages();
+    }
+    // Failed interaction: the response is `{ error }`, not a provider response.
+    // Recover the request side when the provider mapper tolerates the missing
+    // response fields, then surface the error as the assistant turn.
+    let messages: PartialUIMessage[] = [];
+    try {
+      messages = this.interactionClass.mapToUiMessages();
+    } catch {
+      messages = [];
+    }
+    return [
+      ...messages,
+      {
+        id: `${this.id}-error`,
+        role: "assistant",
+        parts: [{ type: "text", text: errorText }],
+      },
+    ];
+  }
+}

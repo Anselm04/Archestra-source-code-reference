@@ -1,0 +1,28 @@
+# The p4 shim: a minimal in-cluster HTTP proxy that executes an allowlisted
+# set of Perforce CLI commands for the knowledge-base permission-sync feature.
+#
+# The image deliberately does NOT contain the proprietary `p4` binary: the
+# platform backend downloads it (pinned version, checksum-verified) and pushes
+# it to the running pod over the in-cluster provisioning endpoint, so nothing
+# Archestra publishes redistributes Perforce software and the pod's egress can
+# stay pinned to the customer's Perforce server alone.
+#
+# The official `p4` binary needs glibc, so this image uses Debian 13.
+# The published image needs only Node, glibc and tini. Keep apt and the shell
+# in a throwaway stage, then copy the process reaper into the runtime image.
+FROM dhi.io/debian-base:trixie-debian13-dev@sha256:36cada6ceac36fc775a1ce0597dc7a02b4f97d48163d955a0b382f2a0ae6add0 AS tini-build
+RUN apt-get update && apt-get install -y --no-install-recommends tini
+FROM dhi.io/node:24.22.3-debian13@sha256:ec4735f913e91c733bee00cf5274f5db4e7c6736cfd6ec704d105a6fbf39a918
+COPY --from=tini-build /usr/bin/tini /usr/bin/tini
+
+# Explicit world-readable mode: COPY preserves the build context's file mode,
+# and the server runs as uid 65534.
+COPY --chmod=0444 server.mjs /app/server.mjs
+
+# Matches the pod securityContext (runAsNonRoot 65534, readOnlyRootFilesystem;
+# /work is an emptyDir mounted by the runtime manager).
+USER 65534:65534
+ENV NODE_ENV=production
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/bin/tini", "--", "node", "/app/server.mjs"]

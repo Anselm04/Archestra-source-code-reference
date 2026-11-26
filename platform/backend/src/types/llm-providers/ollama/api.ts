@@ -1,0 +1,108 @@
+/**
+ * Ollama API Types
+ *
+ * Ollama exposes an OpenAI-compatible API server, so we re-export OpenAI schemas.
+ * See: https://github.com/ollama/ollama/blob/main/docs/openai.md
+ */
+import { z } from "zod";
+
+import { MessageParamSchema, ToolCallSchema } from "./messages";
+import { ToolChoiceOptionSchema, ToolSchema } from "./tools";
+
+export const ChatCompletionUsageSchema = z
+  .object({
+    completion_tokens: z.number(),
+    prompt_tokens: z.number(),
+    total_tokens: z.number(),
+    completion_tokens_details: z.any().optional(),
+    prompt_tokens_details: z.any().optional(),
+  })
+  .describe("Token usage statistics for the completion");
+
+// Persist/read-back must tolerate nonconforming finish_reasons (same as OpenAI).
+export const FinishReasonSchema = z
+  .enum(["stop", "length", "tool_calls", "content_filter", "function_call"])
+  .or(z.string());
+
+const ChoiceSchema = z
+  .object({
+    finish_reason: FinishReasonSchema,
+    // Some OpenAI-compatible upstreams omit `index` on choices; without
+    // optional() the response fails serialization (500).
+    index: z.number().optional(),
+    // Log probabilities may be omitted when the upstream did not request them.
+    logprobs: z.any().nullable().optional(),
+    message: z
+      .object({
+        // Tool-call-only replies often omit `content` entirely.
+        content: z.string().nullable().optional(),
+        refusal: z.string().nullable().optional(),
+        role: z.enum(["assistant"]),
+        // Some OpenAI-compatible upstreams return `annotations: null` instead of
+        // omitting it; without nullable() the response fails serialization (500).
+        annotations: z.array(z.any()).nullable().optional(),
+        audio: z.any().nullable().optional(),
+        function_call: z
+          .object({
+            arguments: z.string(),
+            name: z.string(),
+          })
+          .nullable()
+          .optional(),
+        // DeepSeek-style reasoning models return thinking in `reasoning_content`
+        // and require it passed back on tool-call turns; response serialization
+        // must preserve it or clients can never satisfy that contract.
+        reasoning_content: z.string().nullable().optional(),
+        tool_calls: z.array(ToolCallSchema).optional(),
+      })
+      .describe("The assistant message in the response"),
+  })
+  .describe("A choice in the chat completion response");
+
+export const ChatCompletionRequestSchema = z
+  .object({
+    model: z.string(),
+    messages: z.array(MessageParamSchema),
+    tools: z.array(ToolSchema).optional(),
+    tool_choice: ToolChoiceOptionSchema.optional(),
+    temperature: z.number().nullable().optional(),
+    max_tokens: z.number().nullable().optional(),
+    stream: z.boolean().nullable().optional(),
+    // Standard OpenAI-compatible parameters
+    top_p: z.number().nullable().optional(),
+    frequency_penalty: z.number().nullable().optional(),
+    presence_penalty: z.number().nullable().optional(),
+    stop: z.union([z.string(), z.array(z.string())]).optional(),
+    seed: z.number().nullable().optional(),
+    n: z.number().nullable().optional(),
+    /**
+     * Reasoning depth, which Ollama's `/v1` maps onto its own `think` field.
+     * Must be declared: inbound validation drops anything this schema does not
+     * name, so an undeclared field never reaches the adapter.
+     */
+    reasoning_effort: z.string().nullable().optional(),
+  })
+  .describe("Ollama chat completion request (OpenAI-compatible)");
+
+export const ChatCompletionResponseSchema = z
+  .object({
+    id: z.string(),
+    choices: z.array(ChoiceSchema),
+    created: z.number(),
+    model: z.string(),
+    object: z.enum(["chat.completion"]),
+    system_fingerprint: z.string().nullable().optional(),
+    usage: ChatCompletionUsageSchema.optional(),
+  })
+  .describe("Ollama chat completion response (OpenAI-compatible)");
+
+export const ChatCompletionsHeadersSchema = z.object({
+  "user-agent": z.string().optional().describe("The user agent of the client"),
+  authorization: z
+    .string()
+    .optional()
+    .describe("Bearer token for Ollama (typically not required)")
+    .transform((authorization) =>
+      authorization ? authorization.replace("Bearer ", "") : undefined,
+    ),
+});

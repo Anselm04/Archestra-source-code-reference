@@ -1,0 +1,2143 @@
+import {
+  ApiError,
+  ArchestraInternalErrorCode,
+  type SupportedProvider,
+} from "@archestra/shared";
+import { get } from "lodash-es";
+import OpenAIProvider from "openai";
+import type {
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
+} from "openai/resources/chat/completions/completions";
+import config from "@/config";
+import logger from "@/logging";
+import { metrics } from "@/observability";
+import {
+  openAIUsageTokens,
+  withReasoningOutsideCompletion,
+} from "@/observability/metrics/llm-usage";
+import { priceOpenAiAudioChat } from "@/services/media-pricing";
+import {
+  decodeOpenAiCodexCredential,
+  isOpenAiCodexCredential,
+} from "@/services/openai-codex-credentials";
+import type {
+  ChunkProcessingResult,
+  CommonMcpToolDefinition,
+  CommonMessage,
+  CommonToolCall,
+  CommonToolResult,
+  CreateClientOptions,
+  LLMProvider,
+  LLMRequestAdapter,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  OpenAi,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { estimateMessagesSize } from "@/utils/message-size";
+import {
+  estimateToolResultContentLength,
+  previewToolResultContent,
+} from "@/utils/tool-result-preview";
+import { isApprovedAsSent } from "../utils/approved-as-sent";
+import { LoggedAudioClip } from "../utils/logged-audio";
+import { LOGGED_MEDIA_MAX_BYTES } from "../utils/logged-media";
+import {
+  doesModelSupportImages,
+  hasImageContent,
+  isImageTooLarge,
+  isMcpImageBlock,
+} from "../utils/mcp-image";
+import { stripBrowserToolsResults } from "../utils/summarize-tool-results";
+import { withOpenAiChatToolCallIds } from "../utils/tool-call-ids";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
+import { createOpenAiCodexClient } from "./openai-codex-client";
+import { toOpenAiStreamUsageWithCache } from "./openai-sse-chunk";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+import { subscriptionAuthRequiredCode } from "./subscription-auth-error";
+
+// =============================================================================
+// TYPE ALIASES
+// =============================================================================
+
+type OpenAiRequest = OpenAi.Types.ChatCompletionsRequest;
+type OpenAiResponse = OpenAi.Types.ChatCompletionsResponse;
+type OpenAiMessages = OpenAi.Types.ChatCompletionsRequest["messages"];
+type OpenAiHeaders = OpenAi.Types.ChatCompletionsHeaders;
+type OpenAiStreamChunk = OpenAi.Types.ChatCompletionChunk;
+type OpenAiEmbeddingRequest = OpenAi.Types.EmbeddingRequest;
+type OpenAiEmbeddingResponse = OpenAi.Types.EmbeddingResponse;
+/**
+ * How an OpenAI-wire provider's adapters read and write its usage.
+ * `reasoningOutsideCompletion` is xAI's dialect (see
+ * `reportsReasoningOutsideCompletion`).
+ */
+type OpenAiAdapterOptions = {
+  provider?: SupportedProvider;
+  reasoningOutsideCompletion?: boolean;
+};
+
+type OpenAiToolResultImageBlock = {
+  type: "image_url";
+  image_url: {
+    url: string;
+    detail?: "auto" | "low" | "high";
+  };
+};
+
+type OpenAiToolResultTextBlock = {
+  type: "text";
+  text: string;
+};
+
+type OpenAiToolResultContentBlock =
+  | OpenAiToolResultImageBlock
+  | OpenAiToolResultTextBlock;
+
+type OpenAiToolResultContent = string | OpenAiToolResultContentBlock[];
+
+// =============================================================================
+// EMBEDDING REQUEST ADAPTER
+// =============================================================================
+
+export class OpenAIEmbeddingRequestAdapter
+  implements LLMRequestAdapter<OpenAiEmbeddingRequest, OpenAiMessages>
+{
+  readonly provider: SupportedProvider;
+  private request: OpenAiEmbeddingRequest;
+  private modifiedModel: string | null = null;
+
+  constructor(
+    request: OpenAiEmbeddingRequest,
+    provider: SupportedProvider = "openai",
+  ) {
+    this.request = request;
+    this.provider = provider;
+  }
+
+  getModel(): string {
+    return this.modifiedModel ?? this.request.model;
+  }
+
+  isStreaming(): boolean {
+    return false;
+  }
+
+  getMessages(): CommonMessage[] {
+    return this.getInputStrings().map((content) => ({
+      role: "user",
+      content,
+    }));
+  }
+
+  getToolResults(): CommonToolResult[] {
+    return [];
+  }
+
+  getTools(): CommonMcpToolDefinition[] {
+    return [];
+  }
+
+  hasTools(): boolean {
+    return false;
+  }
+
+  getProviderMessages(): OpenAiMessages {
+    return this.getInputStrings().map((content) => ({
+      role: "user",
+      content,
+    }));
+  }
+
+  getOriginalRequest(): OpenAiEmbeddingRequest {
+    return this.request;
+  }
+
+  setModel(model: string): void {
+    this.modifiedModel = model;
+  }
+
+  updateToolResult(): void {}
+
+  applyToolResultUpdates(): void {}
+
+  convertToolResultContent(messages: OpenAiMessages): OpenAiMessages {
+    return messages;
+  }
+
+  toProviderRequest(): OpenAiEmbeddingRequest {
+    return {
+      ...this.request,
+      model: this.getModel(),
+    };
+  }
+
+  private getInputStrings(): string[] {
+    return Array.isArray(this.request.input)
+      ? this.request.input
+      : [this.request.input];
+  }
+}
+
+// =============================================================================
+// EMBEDDING RESPONSE ADAPTER
+// =============================================================================
+
+export class OpenAIEmbeddingResponseAdapter
+  implements LLMResponseAdapter<OpenAiEmbeddingResponse>
+{
+  readonly provider: SupportedProvider;
+  private response: OpenAiEmbeddingResponse;
+
+  constructor(
+    response: OpenAiEmbeddingResponse,
+    provider: SupportedProvider = "openai",
+  ) {
+    this.response = response;
+    this.provider = provider;
+  }
+
+  getId(): string {
+    return "";
+  }
+
+  getModel(): string {
+    return this.response.model;
+  }
+
+  getText(): string {
+    return "";
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    return [];
+  }
+
+  hasToolCalls(): boolean {
+    return false;
+  }
+
+  getUsage(): UsageView {
+    return {
+      inputTokens: this.response.usage.prompt_tokens,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    };
+  }
+
+  getOriginalResponse(): OpenAiEmbeddingResponse {
+    return this.response;
+  }
+
+  getFinishReasons(): string[] {
+    return [];
+  }
+
+  toRefusalResponse(): OpenAiEmbeddingResponse {
+    return this.response;
+  }
+}
+
+export class OpenAIEmbeddingStreamAdapter
+  implements LLMStreamAdapter<never, OpenAiEmbeddingResponse>
+{
+  readonly provider: SupportedProvider;
+  readonly state: StreamAccumulatorState = {
+    responseId: "",
+    model: "",
+    text: "",
+    toolCalls: [],
+    rawToolCallEvents: [],
+    usage: null,
+    stopReason: null,
+    timing: {
+      startTime: Date.now(),
+      firstChunkTime: null,
+    },
+  };
+
+  constructor(provider: SupportedProvider = "openai") {
+    this.provider = provider;
+  }
+
+  processChunk(): ChunkProcessingResult {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  formatTextDeltaSSE(): string {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  getRawToolCallEvents(): string[] {
+    return [];
+  }
+
+  formatCompleteTextSSE(): string[] {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  formatEndSSE(): string {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  toProviderResponse(): OpenAiEmbeddingResponse {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+}
+
+// =============================================================================
+// REQUEST ADAPTER
+// =============================================================================
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+export class OpenAIRequestAdapter<
+  TRequest extends Omit<OpenAiRequest, "response_format"> = OpenAiRequest,
+> implements LLMRequestAdapter<TRequest, OpenAiMessages>
+{
+  readonly provider: SupportedProvider;
+  private request: TRequest;
+  private modifiedModel: string | null = null;
+  private toolResultUpdates: Record<string, string> = {};
+
+  // `provider` overrides which provider this adapter attributes to (logs,
+  // metrics, interactions). OpenAI-compatible providers (DeepSeek, GitHub
+  // Copilot, …) reuse this adapter via createOpenAiCompatibleAdapterFactory.
+  constructor(request: TRequest, provider: SupportedProvider = "openai") {
+    this.request = request;
+    this.provider = provider;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Read Access
+  // ---------------------------------------------------------------------------
+
+  getModel(): string {
+    return this.modifiedModel ?? this.request.model;
+  }
+
+  isStreaming(): boolean {
+    return this.request.stream === true;
+  }
+
+  getMessages(): CommonMessage[] {
+    return this.toCommonFormat(this.request.messages);
+  }
+
+  getToolResults(): CommonToolResult[] {
+    const results: CommonToolResult[] = [];
+
+    for (const message of this.request.messages) {
+      if (message.role === "tool") {
+        const toolCall = this.findToolCallInMessages(
+          this.request.messages,
+          message.tool_call_id,
+        );
+
+        let content: unknown;
+        if (typeof message.content === "string") {
+          try {
+            content = JSON.parse(message.content);
+          } catch {
+            content = message.content;
+          }
+        } else {
+          content = message.content;
+        }
+
+        results.push({
+          id: message.tool_call_id,
+          name: toolCall?.name ?? "unknown",
+          arguments: toolCall?.arguments,
+          content,
+          structured: typeof message.content !== "string",
+          isError: false,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  getTools(): CommonMcpToolDefinition[] {
+    if (!this.request.tools) return [];
+
+    const result: CommonMcpToolDefinition[] = [];
+    for (const tool of this.request.tools) {
+      if (tool.type === "function") {
+        result.push({
+          name: tool.function.name,
+          description: tool.function.description,
+          inputSchema: tool.function.parameters as Record<string, unknown>,
+        });
+      }
+    }
+    return result;
+  }
+
+  hasTools(): boolean {
+    return (this.request.tools?.length ?? 0) > 0;
+  }
+
+  getProviderMessages(): OpenAiMessages {
+    return this.request.messages;
+  }
+
+  getOriginalRequest(): TRequest {
+    return this.request;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Modify Access
+  // ---------------------------------------------------------------------------
+
+  setModel(model: string): void {
+    this.modifiedModel = model;
+  }
+
+  updateToolResult(toolCallId: string, newContent: string): void {
+    this.toolResultUpdates[toolCallId] = newContent;
+  }
+
+  applyToolResultUpdates(updates: Record<string, string>): void {
+    Object.assign(this.toolResultUpdates, updates);
+  }
+
+  convertToolResultContent(messages: OpenAiMessages): OpenAiMessages {
+    const model = this.getModel();
+    const modelSupportsImages = doesModelSupportImages(model);
+    let toolMessagesWithImages = 0;
+    let strippedImageCount = 0;
+
+    // First, analyze all tool messages to understand what we're dealing with
+    for (const message of messages) {
+      if (message.role === "tool") {
+        const contentLength = estimateToolResultContentLength(message.content);
+        const contentSizeKB = Math.round(contentLength.length / 1024);
+        const contentPatternSample = previewToolResultContent(
+          message.content,
+          2000,
+        );
+        const contentPreview = contentPatternSample.slice(0, 200);
+
+        // Check for base64 patterns in preview to avoid full serialization.
+        const hasBase64 =
+          contentPatternSample.includes("data:image") ||
+          contentPatternSample.includes('"type":"image"') ||
+          contentPatternSample.includes('"data":"');
+
+        // Find tool name from previous assistant message
+        const toolName = this.findToolCallInMessages(
+          messages,
+          message.tool_call_id,
+        )?.name;
+
+        logger.debug(
+          {
+            toolCallId: message.tool_call_id,
+            toolName,
+            contentSizeKB,
+            hasBase64,
+            contentLengthEstimated: contentLength.isEstimated,
+            isArray: Array.isArray(message.content),
+            contentPreview,
+          },
+          "[OpenAIAdapter] Analyzing tool result content",
+        );
+
+        // If it's an array, analyze each item
+        if (Array.isArray(message.content)) {
+          for (const [idx, item] of message.content.entries()) {
+            if (typeof item === "object" && item !== null) {
+              const itemType = (item as Record<string, unknown>).type;
+              const itemLength = estimateToolResultContentLength(item);
+              logger.info(
+                {
+                  toolCallId: message.tool_call_id,
+                  itemIndex: idx,
+                  itemType,
+                  itemSizeKB: Math.round(itemLength.length / 1024),
+                  itemLengthEstimated: itemLength.isEstimated,
+                  isMcpImage: isMcpImageBlock(item),
+                },
+                "[OpenAIAdapter] Tool result array item",
+              );
+            }
+          }
+        }
+      }
+    }
+
+    const result = messages.map((message) => {
+      if (message.role !== "tool") {
+        return message;
+      }
+
+      // Check if this tool message contains images
+      if (!hasImageContent(message.content)) {
+        return message;
+      }
+
+      // If model doesn't support images, strip image blocks from content
+      if (!modelSupportsImages) {
+        strippedImageCount++;
+        const strippedContent = stripImageBlocksFromContent(message.content);
+        return {
+          ...message,
+          content: strippedContent,
+        };
+      }
+
+      // Model supports images - convert MCP image blocks to OpenAI format
+      const convertedContent = convertMcpImageBlocksToOpenAi(message.content);
+      if (!convertedContent) {
+        return message;
+      }
+
+      toolMessagesWithImages++;
+      return {
+        ...message,
+        content: convertedContent,
+      };
+    });
+
+    if (toolMessagesWithImages > 0 || strippedImageCount > 0) {
+      logger.info(
+        {
+          model,
+          modelSupportsImages,
+          totalMessages: messages.length,
+          toolMessagesWithImages,
+          strippedImageCount,
+        },
+        "[OpenAIAdapter] Processed tool messages with image content",
+      );
+    }
+
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build Modified Request
+  // ---------------------------------------------------------------------------
+
+  toProviderRequest(options?: { preserveToolCallIds?: boolean }): TRequest {
+    let messages = this.request.messages;
+
+    if (Object.keys(this.toolResultUpdates).length > 0) {
+      messages = this.applyUpdates(messages, this.toolResultUpdates);
+    }
+
+    messages = this.convertToolResultContent(messages);
+    const sizeBeforeStrip = estimateMessagesSize(messages);
+    messages = stripBrowserToolsResults(messages);
+    const sizeAfterStrip = estimateMessagesSize(messages);
+
+    if (sizeBeforeStrip.length !== sizeAfterStrip.length) {
+      logger.info(
+        {
+          sizeBeforeKB: Math.round(sizeBeforeStrip.length / 1024),
+          sizeAfterKB: Math.round(sizeAfterStrip.length / 1024),
+          savedKB: Math.round(
+            (sizeBeforeStrip.length - sizeAfterStrip.length) / 1024,
+          ),
+          sizeEstimateReliable:
+            !sizeBeforeStrip.isEstimated && !sizeAfterStrip.isEstimated,
+        },
+        "[OpenAIAdapter] Stripped browser tool results",
+      );
+    }
+
+    // Calculate approximate request size for debugging
+    const requestSize = estimateMessagesSize(messages);
+    const requestSizeKB = Math.round(requestSize.length / 1024);
+    const estimatedTokens = Math.round(requestSize.length / 4);
+    let imageCount = 0;
+    let totalImageBase64Length = 0;
+
+    for (const msg of messages) {
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (
+            typeof part === "object" &&
+            part !== null &&
+            "type" in part &&
+            part.type === "image_url" &&
+            "image_url" in part &&
+            part.image_url &&
+            typeof part.image_url === "object" &&
+            "url" in part.image_url
+          ) {
+            imageCount++;
+            const imageUrl = part.image_url.url;
+            if (typeof imageUrl === "string" && imageUrl.startsWith("data:")) {
+              const base64Part = imageUrl.split(",")[1];
+              if (base64Part) {
+                totalImageBase64Length += base64Part.length;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    logger.debug(
+      {
+        model: this.getModel(),
+        messageCount: messages.length,
+        requestSizeKB,
+        estimatedTokens,
+        sizeEstimateReliable: !requestSize.isEstimated,
+        hasToolResultUpdates: Object.keys(this.toolResultUpdates).length > 0,
+        imageCount,
+        totalImageBase64KB: Math.round((totalImageBase64Length * 3) / 4 / 1024),
+      },
+      "[OpenAIAdapter] Building provider request",
+    );
+
+    return {
+      ...this.request,
+      model: this.getModel(),
+      // After the result updates above, which look up the client's call ids.
+      messages: options?.preserveToolCallIds
+        ? messages
+        : withOpenAiChatToolCallIds(messages),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private Helpers (copied from utils/adapters/openai.ts)
+  // ---------------------------------------------------------------------------
+
+  private findToolCallInMessages(
+    messages: OpenAiMessages,
+    toolCallId: string,
+  ): { name: string; arguments?: Record<string, unknown> } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+
+      if (message.role === "assistant" && message.tool_calls) {
+        for (const toolCall of message.tool_calls) {
+          if (toolCall.id === toolCallId) {
+            if (toolCall.type === "function") {
+              return {
+                name: toolCall.function.name,
+                arguments: extractCommonToolCallArguments(
+                  toolCall.function.arguments,
+                ),
+              };
+            } else {
+              return { name: toolCall.custom.name };
+            }
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private toCommonFormat(messages: OpenAiMessages): CommonMessage[] {
+    logger.debug(
+      { messageCount: messages.length },
+      "[OpenAIAdapter] toCommonFormat: starting conversion",
+    );
+    const commonMessages: CommonMessage[] = [];
+
+    for (const message of messages) {
+      const commonMessage: CommonMessage = {
+        role: message.role as CommonMessage["role"],
+        content: extractCommonMessageText(message),
+      };
+
+      // Handle tool messages (tool results)
+      if (message.role === "tool") {
+        const toolCall = this.findToolCallInMessages(
+          messages,
+          message.tool_call_id,
+        );
+
+        if (toolCall) {
+          logger.debug(
+            { toolCallId: message.tool_call_id, toolName: toolCall.name },
+            "[OpenAIAdapter] toCommonFormat: found tool message",
+          );
+          let toolResult: unknown;
+          if (typeof message.content === "string") {
+            try {
+              toolResult = JSON.parse(message.content);
+            } catch {
+              toolResult = message.content;
+            }
+          } else {
+            toolResult = message.content;
+          }
+
+          commonMessage.toolCalls = [
+            {
+              id: message.tool_call_id,
+              name: toolCall.name,
+              arguments: toolCall.arguments,
+              content: toolResult,
+              isError: false,
+            },
+          ];
+        }
+      }
+
+      commonMessages.push(commonMessage);
+    }
+
+    logger.debug(
+      { inputCount: messages.length, outputCount: commonMessages.length },
+      "[OpenAIAdapter] toCommonFormat: conversion complete",
+    );
+    return commonMessages;
+  }
+
+  private applyUpdates(
+    messages: OpenAiMessages,
+    updates: Record<string, string>,
+  ): OpenAiMessages {
+    const updateCount = Object.keys(updates).length;
+    logger.debug(
+      { messageCount: messages.length, updateCount },
+      "[OpenAIAdapter] applyUpdates: starting",
+    );
+
+    if (updateCount === 0) {
+      logger.debug("[OpenAIAdapter] applyUpdates: no updates to apply");
+      return messages;
+    }
+
+    let appliedCount = 0;
+    const result = messages.map((message) => {
+      if (
+        message.role === "tool" &&
+        Object.hasOwn(updates, message.tool_call_id)
+      ) {
+        // Kept as sent: the parts stay, so an image part reaches the provider
+        // (or the image conversion) as an image, not as its JSON text.
+        if (
+          isApprovedAsSent({
+            sent: message.content,
+            approved: updates[message.tool_call_id],
+          })
+        ) {
+          return message;
+        }
+        appliedCount++;
+        logger.debug(
+          { toolCallId: message.tool_call_id },
+          "[OpenAIAdapter] applyUpdates: applying update to tool message",
+        );
+        return {
+          ...message,
+          content: updates[message.tool_call_id],
+        };
+      }
+      return message;
+    });
+
+    logger.debug(
+      { updateCount, appliedCount },
+      "[OpenAIAdapter] applyUpdates: complete",
+    );
+    return result;
+  }
+}
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+export function convertMcpImageBlocksToOpenAi(
+  content: unknown,
+): OpenAiToolResultContent | null {
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  if (!hasImageContent(content)) {
+    return null;
+  }
+
+  const openAiContent: OpenAiToolResultContentBlock[] = [];
+  const imageTooLargePlaceholder = "[Image omitted due to size]";
+
+  for (const item of content) {
+    if (typeof item !== "object" || item === null) continue;
+    const candidate = item as Record<string, unknown>;
+
+    if (isMcpImageBlock(item)) {
+      const mimeType = item.mimeType ?? "image/png";
+      const base64Length = typeof item.data === "string" ? item.data.length : 0;
+      const estimatedSizeKB = Math.round((base64Length * 3) / 4 / 1024);
+      const shouldStripImage = isImageTooLarge(item);
+
+      if (shouldStripImage) {
+        logger.info(
+          {
+            mimeType,
+            base64Length,
+            estimatedSizeKB,
+          },
+          "[OpenAIAdapter] Stripping MCP image block due to size limit",
+        );
+        openAiContent.push({
+          type: "text",
+          text: imageTooLargePlaceholder,
+        });
+        continue;
+      }
+
+      logger.info(
+        {
+          mimeType,
+          base64Length,
+          estimatedSizeKB,
+          // Estimate tokens: base64 chars / 4 (rough estimate for text tokens)
+          // But for images, OpenAI uses tile-based calculation
+          estimatedBase64Tokens: Math.round(base64Length / 4),
+        },
+        "[OpenAIAdapter] Converting MCP image block to OpenAI format",
+      );
+
+      openAiContent.push({
+        type: "image_url",
+        image_url: {
+          url: `data:${mimeType};base64,${item.data}`,
+        },
+      });
+    } else if (candidate.type === "text" && "text" in candidate) {
+      openAiContent.push({
+        type: "text",
+        text:
+          typeof candidate.text === "string"
+            ? candidate.text
+            : JSON.stringify(candidate),
+      });
+    }
+  }
+
+  logger.info(
+    {
+      totalBlocks: openAiContent.length,
+      imageBlocks: openAiContent.filter((b) => b.type === "image_url").length,
+      textBlocks: openAiContent.filter((b) => b.type === "text").length,
+    },
+    "[OpenAIAdapter] Converted MCP content to OpenAI format",
+  );
+
+  return openAiContent.length > 0 ? openAiContent : null;
+}
+
+/**
+ * Strip image blocks from MCP content when model doesn't support images.
+ * Keeps text blocks and replaces image blocks with a placeholder message.
+ * Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+ */
+export function stripImageBlocksFromContent(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return typeof content === "string" ? content : JSON.stringify(content);
+  }
+
+  const textParts: string[] = [];
+  let imageCount = 0;
+
+  for (const item of content) {
+    if (typeof item !== "object" || item === null) continue;
+    const candidate = item as Record<string, unknown>;
+
+    if (isMcpImageBlock(item)) {
+      imageCount++;
+    } else if (candidate.type === "text" && "text" in candidate) {
+      textParts.push(
+        typeof candidate.text === "string"
+          ? candidate.text
+          : JSON.stringify(candidate.text),
+      );
+    }
+  }
+
+  // Add placeholder for stripped images
+  if (imageCount > 0) {
+    textParts.push(
+      `[${imageCount} image(s) removed - model does not support image inputs]`,
+    );
+    logger.info(
+      { imageCount },
+      "[OpenAIAdapter] Stripped images from tool result (model does not support images)",
+    );
+  }
+
+  return textParts.join("\n");
+}
+
+// =============================================================================
+// RESPONSE ADAPTER
+// =============================================================================
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+export class OpenAIResponseAdapter
+  implements LLMResponseAdapter<OpenAiResponse>
+{
+  readonly provider: SupportedProvider;
+  private response: OpenAiResponse;
+  private readonly reasoningOutsideCompletion: boolean;
+
+  constructor(
+    response: OpenAiResponse,
+    {
+      provider = "openai",
+      reasoningOutsideCompletion = false,
+    }: OpenAiAdapterOptions = {},
+  ) {
+    assertResponseHasChoices(response, provider);
+    this.response = response;
+    this.provider = provider;
+    this.reasoningOutsideCompletion = reasoningOutsideCompletion;
+  }
+
+  getId(): string {
+    return this.response.id;
+  }
+
+  getModel(): string {
+    return this.response.model;
+  }
+
+  getText(): string {
+    const choice = this.response.choices[0];
+    if (!choice) return "";
+    return choice.message.content ?? "";
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    const choice = this.response.choices[0];
+    if (!choice?.message.tool_calls) return [];
+
+    return choice.message.tool_calls.map((toolCall) => {
+      let name: string;
+      let args: Record<string, unknown>;
+
+      if (toolCall.type === "function" && toolCall.function) {
+        name = toolCall.function.name;
+        try {
+          args = JSON.parse(toolCall.function.arguments);
+        } catch {
+          args = {};
+        }
+      } else if (toolCall.type === "custom" && toolCall.custom) {
+        name = toolCall.custom.name;
+        try {
+          args = JSON.parse(toolCall.custom.input);
+        } catch {
+          args = {};
+        }
+      } else {
+        name = "unknown";
+        args = {};
+      }
+
+      return {
+        id: toolCall.id,
+        name,
+        arguments: args,
+      };
+    });
+  }
+
+  hasToolCalls(): boolean {
+    const choice = this.response.choices[0];
+    return (choice?.message.tool_calls?.length ?? 0) > 0;
+  }
+
+  getUsage(): UsageView {
+    if (!this.response.usage) {
+      return {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      };
+    }
+    const { input, output, cacheRead, cacheWrite, cacheWrite1h, reasoning } =
+      openAIUsageTokens(this.response.usage, {
+        reasoningOutsideCompletion: this.reasoningOutsideCompletion,
+      });
+    return withAudioTokenCost(
+      {
+        inputTokens: input,
+        outputTokens: output,
+        cacheReadTokens: cacheRead,
+        cacheWriteTokens: cacheWrite,
+        cacheWrite1hTokens: cacheWrite1h,
+        reasoningTokens: reasoning,
+      },
+      this.response.model,
+      this.response.usage,
+    );
+  }
+
+  getOriginalResponse(): OpenAiResponse {
+    return this.response;
+  }
+
+  getFinishReasons(): string[] {
+    const reason = this.response.choices?.[0]?.finish_reason;
+    return reason ? [reason] : [];
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{
+      id: string;
+      name: string;
+      arguments: string;
+      wireId?: string;
+    }>,
+  ): OpenAiResponse {
+    const choice = this.response.choices[0];
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...choice,
+          message: {
+            ...choice.message,
+            tool_calls: toolCalls.map((toolCall) => ({
+              id: toolCall.wireId ?? toolCall.id,
+              type: "function" as const,
+              function: {
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            })),
+          },
+        },
+      ],
+    };
+  }
+
+  toRefusalResponse(
+    _refusalMessage: string,
+    contentMessage: string,
+  ): OpenAiResponse {
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...this.response.choices[0],
+          message: {
+            role: "assistant",
+            content: contentMessage,
+            refusal: null,
+          },
+          // Clears logprobs so token representations do not leak withheld text.
+          logprobs: null,
+          finish_reason: "stop",
+        },
+      ],
+    };
+  }
+
+  withReplacedText(text: string): OpenAiResponse {
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...this.response.choices[0],
+          message: { role: "assistant", content: text, refusal: null },
+          // Clears logprobs so token representations do not leak withheld text.
+          logprobs: null,
+          finish_reason: "stop",
+        },
+      ],
+    };
+  }
+}
+
+// =============================================================================
+// STREAM ADAPTER
+// =============================================================================
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+/** The part of a chat-completions request the stream adapter answers to. */
+type OpenAiStreamUsageRequest = {
+  stream_options?: { include_usage?: boolean | null } | null;
+};
+
+export class OpenAIStreamAdapter
+  implements LLMStreamAdapter<OpenAiStreamChunk, OpenAiResponse>
+{
+  readonly provider: SupportedProvider;
+  readonly state: StreamAccumulatorState;
+  private currentToolCallIndices = new Map<number, number>();
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal. formatEndSSE then finishes the turn as "stop" instead of replaying
+  // the upstream "tool_calls" finish reason (a text-only turn ending in
+  // "tool_calls" with no tool_calls makes agent harnesses retry), and
+  // toProviderResponse persists the refusal rather than the blocked tool calls.
+  /**
+   * The assistant text as the CLIENT received it.
+   *
+   * A refusal does not erase what the model already said: its text was streamed
+   * as it arrived, and the refusal is appended afterwards as one more delta,
+   * which clients concatenate onto the content they are accumulating. So the
+   * reconstructed turn has to carry both, in that order — reporting the refusal
+   * alone loses the model's own answer from the record, and anything that later
+   * reads the turn back (conversation history, a summarizer, a human debugging
+   * it) sees a turn in which the model never spoke.
+   */
+  private contentWithAnyReplacement(): string | null {
+    if (this.replacedText === null) {
+      return this.state.text || null;
+    }
+    return `${this.state.text}${this.replacedText}`;
+  }
+
+  /**
+   * The reasoning the model streamed, accumulated.
+   *
+   * OpenAI-compatible reasoning models (qwen3, DeepSeek-R1, GLM, …) stream
+   * their thinking in `reasoning_content` (or `reasoning`). It was forwarded to
+   * the client but never accumulated, so the reconstructed turn — the one
+   * persisted as the interaction — recorded a reasoning turn as though the
+   * model had gone straight to its answer, which is what makes such a turn
+   * impossible to review afterwards.
+   */
+  private reasoningText = "";
+
+  /**
+   * A spoken reply (`gpt-audio`) streams in `delta.audio`: base64 audio and
+   * transcript pieces, with no text content. The transcript is what the
+   * recorded turn says; the audio goes only to the log row, up to the clip
+   * limit, so the Logs page can play it.
+   */
+  private audioReply: {
+    id?: string;
+    transcript: string;
+    expires_at?: number;
+  } | null = null;
+  private readonly replyAudio = new LoggedAudioClip();
+
+  /** The usage exactly as the provider reported it, details included. */
+  private upstreamUsage: OpenAi.Types.Usage | null = null;
+
+  private replacedText: string | null = null;
+  private getTextSuffix: ((completedText: string) => string) | null = null;
+  private textPrefixIssued = false;
+  private get responseReplacedWithText(): boolean {
+    return this.replacedText !== null;
+  }
+
+  // The proxy always asks the provider for usage (see executeStream). A client
+  // that asked for it as well reads it where OpenAI puts it: a trailing chunk
+  // with empty `choices`, after the finish chunk.
+  private readonly clientRequestedUsage: boolean;
+
+  private readonly reasoningOutsideCompletion: boolean;
+  private readonly clientReasoningOutsideCompletion: boolean;
+
+  constructor({
+    provider = "openai",
+    clientRequest,
+    reasoningOutsideCompletion = false,
+    clientReasoningOutsideCompletion = reasoningOutsideCompletion,
+  }: OpenAiAdapterOptions & {
+    clientRequest?: OpenAiStreamUsageRequest;
+    /**
+     * The dialect the client reads, when it is not the provider's own: the
+     * model router and the Responses surface give OpenAI's to an xAI turn.
+     */
+    clientReasoningOutsideCompletion?: boolean;
+  } = {}) {
+    this.provider = provider;
+    this.reasoningOutsideCompletion = reasoningOutsideCompletion;
+    this.clientReasoningOutsideCompletion = clientReasoningOutsideCompletion;
+    this.clientRequestedUsage =
+      clientRequest?.stream_options?.include_usage === true;
+    this.state = {
+      responseId: "",
+      model: "",
+      text: "",
+      toolCalls: [],
+      rawToolCallEvents: [],
+      usage: null,
+      stopReason: null,
+      timing: {
+        startTime: Date.now(),
+        firstChunkTime: null,
+      },
+    };
+  }
+
+  setTextSuffix(getSuffix: (completedText: string) => string): void {
+    this.getTextSuffix = getSuffix;
+  }
+
+  processChunk(chunk: OpenAiStreamChunk): ChunkProcessingResult {
+    if (this.state.timing.firstChunkTime === null) {
+      this.state.timing.firstChunkTime = Date.now();
+    }
+
+    let sseData: string | null = null;
+    let isToolCallChunk = false;
+
+    this.state.responseId = chunk.id;
+    this.state.model = chunk.model;
+
+    // Usage is cumulative metadata, not a terminal signal: some compatible
+    // providers include it on every chunk, including the initial zero counts.
+    if (chunk.usage) {
+      this.upstreamUsage = chunk.usage;
+      const tokens = openAIUsageTokens(chunk.usage, {
+        reasoningOutsideCompletion: this.reasoningOutsideCompletion,
+      });
+      this.state.usage = withAudioTokenCost(
+        {
+          inputTokens: tokens.input,
+          outputTokens: tokens.output,
+          cacheReadTokens: tokens.cacheRead,
+          cacheWriteTokens: tokens.cacheWrite,
+          cacheWrite1hTokens: tokens.cacheWrite1h,
+          reasoningTokens: tokens.reasoning,
+        },
+        chunk.model,
+        chunk.usage,
+      );
+    }
+
+    // `choices` can be entirely absent (not just empty) on some
+    // OpenAI-compatible upstreams' usage-only or error-shaped chunks —
+    // reading [0] off it unguarded is a crash.
+    const choice = chunk.choices?.[0];
+    if (!choice) {
+      // OpenAI sends terminal usage after finish_reason. An early usage-only
+      // chunk or a heartbeat after earlier usage must not end the stream.
+      return {
+        sseData: null,
+        isToolCallChunk: false,
+        isFinal: !!chunk.usage && this.state.stopReason !== null,
+      };
+    }
+
+    const delta = choice.delta;
+
+    // Preserves non-standard reasoning fields (`reasoning_content` or `reasoning`)
+    // from OpenAI-compatible models in client output and accumulated responses.
+    const reasoning = (delta as { reasoning_content?: unknown })
+      .reasoning_content;
+    const reasoningAlt = (delta as { reasoning?: unknown }).reasoning;
+    const hasReasoning =
+      (typeof reasoning === "string" && reasoning.length > 0) ||
+      (typeof reasoningAlt === "string" && reasoningAlt.length > 0);
+    if (hasReasoning) {
+      this.reasoningText +=
+        typeof reasoning === "string" ? reasoning : (reasoningAlt as string);
+    }
+
+    const audio = audioDeltaOf(delta);
+    if (audio) {
+      this.audioReply ??= { transcript: "" };
+      if (audio.id) this.audioReply.id = audio.id;
+      if (audio.expires_at !== undefined)
+        this.audioReply.expires_at = audio.expires_at;
+      if (audio.transcript) this.audioReply.transcript += audio.transcript;
+      if (audio.data) this.replyAudio.addBase64(audio.data);
+    }
+
+    // Splits streamable content from tool calls in the same chunk.
+    // Content streams immediately. The tool call is buffered for policy evaluation
+    // and re-emitted upon approval.
+    if (delta.content) {
+      this.state.text += delta.content;
+    }
+    if (delta.content || hasReasoning) {
+      const outbound = delta.tool_calls ? withoutToolCallDeltas(chunk) : chunk;
+      let prefixSse = "";
+      if (delta.content && !this.textPrefixIssued && this.getTextSuffix) {
+        const prefix = this.resolveTextPrefix(delta.content);
+        this.textPrefixIssued = true;
+        if (prefix) {
+          prefixSse = this.formatTextDeltaSSE(prefix);
+          sseData = `${prefixSse}data: ${JSON.stringify(
+            withContentPrefix(outbound, "\n\n"),
+          )}\n\n`;
+        }
+      }
+      sseData ??= `data: ${JSON.stringify(outbound)}\n\n`;
+    }
+
+    let isResponsePreamble = false;
+    if (
+      delta.role &&
+      !delta.content &&
+      !hasReasoning &&
+      !delta.tool_calls &&
+      !audio
+    ) {
+      sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+      isResponsePreamble = true;
+    }
+
+    // Audio and transcript deltas are the reply itself: relay each as it
+    // arrives, like text. Tool calls riding the same chunk wait for policy
+    // evaluation, as they do beside text.
+    if (audio && sseData === null) {
+      const outbound = delta.tool_calls ? withoutToolCallDeltas(chunk) : chunk;
+      sseData = `data: ${JSON.stringify(outbound)}\n\n`;
+    }
+
+    // Handle tool calls
+    if (delta.tool_calls) {
+      if (!this.textPrefixIssued && this.getTextSuffix) {
+        const prefix = this.resolveTextPrefix("");
+        if (prefix) {
+          this.textPrefixIssued = true;
+          this.state.text = prefix;
+          const prefixSse = this.formatTextDeltaSSE(prefix);
+          sseData = sseData ? `${prefixSse}${sseData}` : prefixSse;
+        }
+      }
+      for (const toolCallDelta of delta.tool_calls) {
+        const index = toolCallDelta.index;
+
+        if (!this.currentToolCallIndices.has(index)) {
+          this.currentToolCallIndices.set(index, this.state.toolCalls.length);
+          this.state.toolCalls.push({
+            id: toolCallDelta.id ?? "",
+            name: toolCallDelta.function?.name ?? "",
+            arguments: "",
+          });
+        }
+
+        const toolCallIndex = this.currentToolCallIndices.get(index);
+        if (toolCallIndex === undefined) continue;
+        const toolCall = this.state.toolCalls[toolCallIndex];
+
+        if (toolCallDelta.id) {
+          toolCall.id = toolCallDelta.id;
+        }
+        if (toolCallDelta.function?.name) {
+          toolCall.name = toolCallDelta.function.name;
+        }
+        if (toolCallDelta.function?.arguments) {
+          toolCall.arguments += toolCallDelta.function.arguments;
+        }
+      }
+
+      this.state.rawToolCallEvents.push(
+        delta.content || hasReasoning || audio
+          ? onlyToolCallDeltas(chunk)
+          : chunk,
+      );
+      isToolCallChunk = true;
+    }
+
+    // A finish chunk can carry cumulative usage that a trailing usage-only
+    // chunk corrects. Keep reading even when both are present; providers that
+    // omit trailing usage complete when the iterator ends normally.
+    if (choice.finish_reason) {
+      this.state.stopReason = choice.finish_reason;
+    }
+
+    return { sseData, isToolCallChunk, isFinal: false, isResponsePreamble };
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    };
+  }
+
+  formatTextDeltaSSE(text: string): string {
+    const chunk: OpenAiStreamChunk = {
+      id: this.state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            content: text,
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return `data: ${JSON.stringify(chunk)}\n\n`;
+  }
+
+  getRawToolCallEvents(): string[] {
+    return this.state.rawToolCallEvents.map(
+      (event) => `data: ${JSON.stringify(event)}\n\n`,
+    );
+  }
+
+  prepareResponseReplacement(): void {
+    // Clears raw output state so the persisted turn contains only the approved replacement.
+    this.state.text = "";
+    this.state.toolCalls = [];
+    this.state.rawToolCallEvents = [];
+    this.state.stopReason = "stop";
+    this.reasoningText = "";
+    this.currentToolCallIndices.clear();
+  }
+
+  formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
+    const chunk: OpenAiStreamChunk = {
+      id: this.state.responseId || `chatcmpl-${Date.now()}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            content: text,
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return [`data: ${JSON.stringify(chunk)}\n\n`];
+  }
+
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // One chunk carrying every call, complete: name and the whole argument
+    // string in a single delta. The wire format allows it (arguments are
+    // concatenated across deltas, and one delta is a valid degenerate case),
+    // and it keeps the rewrite from having to reproduce the upstream's
+    // fragmentation. `index` is the call's position, which is what clients
+    // accumulate by.
+    const chunk: OpenAiStreamChunk = {
+      id: this.state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: toolCalls.map((toolCall, index) => ({
+              index,
+              id: toolCall.wireId ?? toolCall.id,
+              type: "function" as const,
+              function: {
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            })),
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return [`data: ${JSON.stringify(chunk)}\n\n`];
+  }
+
+  formatEndSSE(): string {
+    const finalChunk: OpenAiStreamChunk = {
+      id: this.state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: this.responseReplacedWithText
+            ? "stop"
+            : ((this.state.stopReason as "stop" | "tool_calls") ?? "stop"),
+        },
+      ],
+    };
+    // Carry the usage the provider sent in its trailing chunk into the synthesized final chunk;
+    // without it, streaming clients (e.g. the chat route's AI SDK, for OpenRouter and other
+    // OpenAI-compatible models) never see token counts. `state.usage.inputTokens` is net of
+    // cache reads (see processChunk above), so this must recombine them into a gross
+    // `prompt_tokens` with `prompt_tokens_details` — mirrors `toProviderResponse()` below.
+    const usage = this.rebuiltUsage();
+    if (usage && this.clientRequestedUsage) {
+      const usageChunk: OpenAiStreamChunk = {
+        id: finalChunk.id,
+        object: "chat.completion.chunk",
+        created: finalChunk.created,
+        model: finalChunk.model,
+        choices: [],
+        usage,
+      };
+      return `data: ${JSON.stringify(finalChunk)}\n\ndata: ${JSON.stringify(usageChunk)}\n\ndata: [DONE]\n\n`;
+    }
+    if (usage) {
+      finalChunk.usage = usage;
+    }
+    return `data: ${JSON.stringify(finalChunk)}\n\ndata: [DONE]\n\n`;
+  }
+
+  toProviderResponse(): OpenAiResponse {
+    const toolCalls =
+      this.responseReplacedWithText || this.state.toolCalls.length === 0
+        ? undefined
+        : this.state.toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function" as const,
+            function: {
+              name: tc.name,
+              arguments: tc.arguments,
+            },
+          }));
+
+    return {
+      id: this.state.responseId,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: this.contentWithAnyReplacement(),
+            // Non-standard, and the same field these models emit on the wire —
+            // clients that render reasoning read it back from here.
+            ...(this.reasoningText
+              ? { reasoning_content: this.reasoningText }
+              : {}),
+            refusal: null,
+            tool_calls: toolCalls,
+            ...(this.audioReply && !this.responseReplacedWithText
+              ? { audio: this.audioReply }
+              : {}),
+          },
+          logprobs: null,
+          finish_reason: this.responseReplacedWithText
+            ? "stop"
+            : ((this.state.stopReason as OpenAi.Types.FinishReason) ?? "stop"),
+        },
+      ],
+      usage: this.rebuiltUsage() ?? {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+    };
+  }
+
+  /** The recorded turn, with a spoken reply's audio for the log row. */
+  toLoggedResponse(): OpenAiResponse {
+    const response = this.toProviderResponse();
+    const message = response.choices[0]?.message as
+      | { audio?: Record<string, unknown> }
+      | undefined;
+    if (!message?.audio) return response;
+    const data = this.replyAudio.base64();
+    const omitted = this.replyAudio.omitted();
+    message.audio = {
+      ...message.audio,
+      ...(data ? { data } : {}),
+      ...(omitted ? { data_omitted: omitted } : {}),
+    };
+    return response;
+  }
+
+  private resolveTextPrefix(firstText: string): string {
+    if (!this.getTextSuffix || this.responseReplacedWithText) {
+      return "";
+    }
+    return this.getTextSuffix(firstText);
+  }
+
+  /**
+   * The wire usage rebuilt from the proxy's counts, in the client's dialect:
+   * `state.usage.outputTokens` includes reasoning, so a client that reads it
+   * outside `completion_tokens` gets it taken back out, and a streamed turn
+   * reports what the same turn would report unstreamed.
+   */
+  private rebuiltUsage() {
+    const usage = withUpstreamUsageDetails(
+      toOpenAiStreamUsageWithCache(this.state.usage),
+      this.upstreamUsage,
+    );
+    return usage && this.clientReasoningOutsideCompletion
+      ? withReasoningOutsideCompletion(usage, true)
+      : usage;
+  }
+}
+
+/**
+ * A spoken reply as its log row keeps it: the audio up to the clip limit, so
+ * the Logs page can play it; past the limit, the id and transcript with the
+ * audio marked as omitted. Any other response passes unchanged.
+ */
+export function withReplyAudioWithinLimit<T>(response: T): T {
+  const choices = (response as { choices?: unknown } | null)?.choices;
+  if (!Array.isArray(choices)) return response;
+  let changed = false;
+  const kept = choices.map((choice) => {
+    const message = (choice as { message?: { audio?: unknown } } | null)
+      ?.message;
+    const audio = message?.audio;
+    const data = (audio as { data?: unknown } | null)?.data;
+    if (typeof audio !== "object" || audio === null || typeof data !== "string")
+      return choice;
+    if (base64Bytes(data) <= LOGGED_MEDIA_MAX_BYTES) return choice;
+    changed = true;
+    const { data: _data, ...rest } = audio as Record<string, unknown>;
+    return {
+      ...choice,
+      message: { ...message, audio: { ...rest, data_omitted: "too_large" } },
+    };
+  });
+  return changed ? ({ ...response, choices: kept } as T) : response;
+}
+
+/** Decoded size of a base64 string, without decoding it. */
+function base64Bytes(data: string): number {
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  return Math.floor((data.length * 3) / 4) - padding;
+}
+
+function audioDeltaOf(delta: unknown):
+  | {
+      id?: string;
+      transcript?: string;
+      expires_at?: number;
+      data?: string;
+    }
+  | undefined {
+  const audio = (delta as { audio?: unknown } | null)?.audio;
+  if (typeof audio !== "object" || audio === null) return undefined;
+  const { id, transcript, expires_at, data } = audio as Record<string, unknown>;
+  return {
+    ...(typeof id === "string" ? { id } : {}),
+    ...(typeof transcript === "string" ? { transcript } : {}),
+    ...(typeof expires_at === "number" ? { expires_at } : {}),
+    ...(typeof data === "string" ? { data } : {}),
+  };
+}
+
+/**
+ * The usage the proxy rebuilds from its own counts, with the details the
+ * provider reported beside it (audio, text and reasoning token splits), so a
+ * streaming client reads the same usage it would read from OpenAI.
+ */
+function withUpstreamUsageDetails<T extends object>(
+  usage: T | undefined,
+  upstream: OpenAi.Types.Usage | null,
+): T | undefined {
+  if (!usage || !upstream) return usage;
+  const prompt = upstream.prompt_tokens_details;
+  const completion = upstream.completion_tokens_details;
+  const rebuilt = (usage as { prompt_tokens_details?: object })
+    .prompt_tokens_details;
+  return {
+    ...usage,
+    ...(prompt || rebuilt
+      ? { prompt_tokens_details: { ...prompt, ...rebuilt } }
+      : {}),
+    ...(completion ? { completion_tokens_details: completion } : {}),
+  };
+}
+
+function withContentPrefix(
+  chunk: OpenAiStreamChunk,
+  prefix: string,
+): OpenAiStreamChunk {
+  const choice = chunk.choices?.[0];
+  const content = choice?.delta?.content;
+  if (!choice || typeof content !== "string") return chunk;
+  return {
+    ...chunk,
+    choices: [
+      {
+        ...choice,
+        delta: { ...choice.delta, content: `${prefix}${content}` },
+      },
+      ...(chunk.choices?.slice(1) ?? []),
+    ],
+  };
+}
+
+// =============================================================================
+// ADAPTER FACTORY
+// =============================================================================
+
+// =============================================================================
+// USAGE TOKEN HELPERS
+// =============================================================================
+
+/**
+ * An audio chat response (`gpt-audio`) counts its audio tokens inside the
+ * prompt and completion totals, which the per-token chat price would bill as
+ * text. When the audio tariff covers the model, its cost is recorded instead;
+ * the token counts stay as reported.
+ */
+function withAudioTokenCost(
+  usage: UsageView,
+  model: string,
+  reported: OpenAi.Types.Usage,
+): UsageView {
+  const cost = priceOpenAiAudioChat({ model, usage: reported });
+  return cost === undefined
+    ? usage
+    : { ...usage, providerReportedCost: cost, mediaTariff: true };
+}
+
+export const openaiAdapterFactory: LLMProvider<
+  OpenAiRequest,
+  OpenAiResponse,
+  OpenAiMessages,
+  OpenAiStreamChunk,
+  OpenAiHeaders
+> = {
+  provider: "openai",
+  interactionType: "openai:chatCompletions",
+
+  createRequestAdapter(
+    request: OpenAiRequest,
+  ): LLMRequestAdapter<OpenAiRequest, OpenAiMessages> {
+    return new OpenAIRequestAdapter(request);
+  },
+
+  createResponseAdapter(
+    response: OpenAiResponse,
+  ): LLMResponseAdapter<OpenAiResponse> {
+    return new OpenAIResponseAdapter(response);
+  },
+
+  createStreamAdapter(
+    request?: OpenAiRequest,
+  ): LLMStreamAdapter<OpenAiStreamChunk, OpenAiResponse> {
+    return new OpenAIStreamAdapter({ clientRequest: request });
+  },
+
+  extractApiKey(headers: OpenAiHeaders): string | undefined {
+    // Return the authorization header as-is (legacy behavior)
+    // OpenAI SDK handles both "Bearer sk-xxx" and "sk-xxx" formats
+    return headers.authorization;
+  },
+
+  isSubscriptionCredential(apiKey: string | undefined): boolean {
+    // ChatGPT-subscription (Codex) credentials travel through the proxy as
+    // marker-prefixed encoded strings (`chatgpt-oauth:…`). They are covered by
+    // a flat-rate plan, so they must classify as subscription — the same rule
+    // as Anthropic `sk-ant-oat…` OAuth tokens. `extractApiKey` returns the
+    // authorization header as-is, so strip an optional `Bearer ` prefix before
+    // the format check; plain `sk-…` API keys stay metered.
+    const token = apiKey?.startsWith("Bearer ") ? apiKey.slice(7) : apiKey;
+    return isOpenAiCodexCredential(token);
+  },
+
+  getBaseUrl(): string | undefined {
+    return config.llm.openai.baseUrl;
+  },
+
+  spanName: "chat",
+
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): OpenAIProvider {
+    // Use observable fetch for request duration metrics if agent is provided
+    const baseFetch = fetchWithAbortSignal(
+      options.agent
+        ? metrics.llm.getObservableFetch(
+            "openai",
+            options.agent,
+            options.source,
+          )
+        : undefined,
+      options.abortSignal,
+    );
+
+    // "ChatGPT subscription" (Codex) auth mode: the resolved credential is an
+    // encoded ChatGPT OAuth credential, not an `sk-…` key. Route through the
+    // Codex Responses backend instead of api.openai.com.
+    const codexCredential = decodeOpenAiCodexCredential(apiKey);
+    if (codexCredential) {
+      return createOpenAiCodexClient({
+        credential: codexCredential,
+        options,
+        innerFetch: baseFetch,
+      });
+    }
+
+    // Wrap fetch to normalize non-OpenAI error responses (e.g. LiteLLM/vLLM)
+    // into OpenAI-compatible format so the SDK surfaces the real error message
+    // instead of "500 status code (no body)".
+    const customFetch = async (
+      url: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const response = await (baseFetch ?? fetch)(url, init);
+
+      if (!response.ok) {
+        const contentType = response.headers.get("content-type") || "";
+        // Only intercept JSON responses — SSE streams are handled differently
+        if (contentType.includes("application/json")) {
+          try {
+            const cloned = response.clone();
+            const rawBody = await cloned.text();
+            if (rawBody) {
+              const parsed = JSON.parse(rawBody);
+              // If the body already has an OpenAI-compatible error.message, leave it
+              if (parsed?.error?.message) {
+                return response;
+              }
+              // Re-wrap non-standard error body into OpenAI format
+              const errorMessage = parsed?.message || rawBody;
+              const formattedBody = JSON.stringify({
+                error: {
+                  message:
+                    typeof errorMessage === "string"
+                      ? errorMessage
+                      : JSON.stringify(errorMessage),
+                  type: "upstream_error",
+                  code: response.status,
+                },
+              });
+              return new Response(formattedBody, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: new Headers({
+                  "content-type": "application/json",
+                }),
+              });
+            }
+          } catch {
+            // Can't parse body — return original response
+          }
+        }
+      }
+
+      return response;
+    };
+
+    return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      apiKey,
+      baseURL: options.baseUrl,
+      fetch: customFetch,
+      defaultHeaders: options.defaultHeaders,
+    });
+  },
+
+  async execute(
+    client: unknown,
+    request: OpenAiRequest,
+  ): Promise<OpenAiResponse> {
+    const openaiClient = client as OpenAIProvider;
+    const openaiRequest = {
+      ...normalizeChatCompletionsQuirks(request),
+      stream: false,
+    } as unknown as ChatCompletionCreateParamsNonStreaming;
+    return openaiClient.chat.completions.create(
+      openaiRequest,
+    ) as Promise<OpenAiResponse>;
+  },
+
+  async executeStream(
+    client: unknown,
+    request: OpenAiRequest,
+    onAccepted?: () => void,
+  ): Promise<AsyncIterable<OpenAiStreamChunk>> {
+    const openaiClient = client as OpenAIProvider;
+    const openaiRequest = {
+      ...normalizeChatCompletionsQuirks(request),
+      stream: true,
+      stream_options: { include_usage: true },
+    } as unknown as ChatCompletionCreateParamsStreaming;
+    return streamChatCompletionChunks<OpenAiStreamChunk>(
+      openaiClient.chat.completions.create(openaiRequest),
+      onAccepted,
+    );
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    if (get(error, "error.code") === "context_length_exceeded") {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return subscriptionAuthRequiredCode(error);
+  },
+
+  extractErrorMessage(error: unknown): string {
+    // OpenAI SDK APIError — has .error.message with the upstream error
+    const openaiMessage = get(error, "error.message");
+    if (typeof openaiMessage === "string") {
+      return openaiMessage;
+    }
+
+    if (error instanceof Error) {
+      // Node.js stream termination produces a bare "terminated" message.
+      // Make it actionable for users (common with LiteLLM/vLLM proxies).
+      if (error.message === "terminated") {
+        const status = get(error, "status");
+        if (typeof status === "number") {
+          return `Upstream provider returned HTTP ${status} and closed the connection`;
+        }
+        return "Upstream provider closed the connection unexpectedly";
+      }
+
+      return error.message;
+    }
+
+    return "Internal server error";
+  },
+};
+
+type OpenAiEmbeddingsProvider = LLMProvider<
+  OpenAiEmbeddingRequest,
+  OpenAiEmbeddingResponse,
+  OpenAiMessages,
+  never,
+  OpenAiHeaders
+>;
+
+/**
+ * Build an embeddings adapter for any provider that exposes an OpenAI-compatible
+ * `/embeddings` endpoint (OpenAI itself, Mistral, Azure, Ollama, vLLM, Zhipu AI, …).
+ *
+ * The wire format is identical to OpenAI's, so all request/response handling is
+ * shared; only the provider name (used for observability, metrics, and cost
+ * attribution) and the default base URL differ per provider. The effective base
+ * URL is still overridable per request via the mapped provider key / auth
+ * override in the LLM proxy handler.
+ */
+export function makeOpenAiCompatibleEmbeddingsAdapterFactory(
+  provider: SupportedProvider,
+  getBaseUrl: () => string | undefined,
+): OpenAiEmbeddingsProvider {
+  return {
+    provider,
+    // OpenAI-compatible embeddings share the OpenAI interaction discriminator,
+    // matching the knowledge-base embedding pipeline (getEmbeddingDiscriminator).
+    interactionType: "openai:embeddings",
+
+    createRequestAdapter(
+      request: OpenAiEmbeddingRequest,
+    ): LLMRequestAdapter<OpenAiEmbeddingRequest, OpenAiMessages> {
+      return new OpenAIEmbeddingRequestAdapter(request, provider);
+    },
+
+    createResponseAdapter(
+      response: OpenAiEmbeddingResponse,
+    ): LLMResponseAdapter<OpenAiEmbeddingResponse> {
+      return new OpenAIEmbeddingResponseAdapter(response, provider);
+    },
+
+    createStreamAdapter(): LLMStreamAdapter<never, OpenAiEmbeddingResponse> {
+      return new OpenAIEmbeddingStreamAdapter(provider);
+    },
+
+    extractApiKey(headers: OpenAiHeaders): string | undefined {
+      return headers.authorization;
+    },
+
+    getBaseUrl(): string | undefined {
+      return getBaseUrl();
+    },
+
+    spanName: "embedding",
+
+    createClient(
+      apiKey: string | undefined,
+      options: CreateClientOptions,
+    ): OpenAIProvider {
+      // A ChatGPT-subscription (Codex) credential has no embeddings support: the
+      // duck-typed Codex client only implements chat.completions.create, so
+      // guard here for a clean 400 instead of an opaque TypeError -> 500 later.
+      if (isOpenAiCodexCredential(apiKey)) {
+        throw new ApiError(
+          400,
+          "ChatGPT subscription (Codex) credentials do not support embeddings — use a standard OpenAI API key.",
+        );
+      }
+      return openaiAdapterFactory.createClient(
+        apiKey,
+        options,
+      ) as OpenAIProvider;
+    },
+
+    async execute(
+      client: unknown,
+      request: OpenAiEmbeddingRequest,
+    ): Promise<OpenAiEmbeddingResponse> {
+      const openaiClient = client as OpenAIProvider;
+      return openaiClient.embeddings.create(
+        request as Parameters<typeof openaiClient.embeddings.create>[0],
+      ) as Promise<OpenAiEmbeddingResponse>;
+    },
+
+    async executeStream(): Promise<AsyncIterable<never>> {
+      throw new Error("OpenAI embeddings do not support streaming.");
+    },
+
+    extractInternalCode(
+      error: unknown,
+    ): ArchestraInternalErrorCode | undefined {
+      return openaiAdapterFactory.extractInternalCode(error);
+    },
+
+    extractErrorMessage(error: unknown): string {
+      return openaiAdapterFactory.extractErrorMessage(error);
+    },
+  };
+}
+
+export const openAiEmbeddingsAdapterFactory: OpenAiEmbeddingsProvider =
+  makeOpenAiCompatibleEmbeddingsAdapterFactory(
+    "openai",
+    () => config.llm.openai.baseUrl,
+  );
+
+// =============================================================================
+// INTERNAL HELPERS
+// =============================================================================
+
+/** The text portion of a combined chunk with text and tool calls. */
+function withoutToolCallDeltas(chunk: OpenAiStreamChunk): OpenAiStreamChunk {
+  const [choice] = chunk.choices;
+  const { tool_calls: _toolCalls, ...delta } = choice.delta;
+  // The turn is not over while its calls are held: formatEndSSE finishes it.
+  return { ...chunk, choices: [{ ...choice, delta, finish_reason: null }] };
+}
+
+/** The tool call portion of a combined chunk waiting for policy evaluation. */
+function onlyToolCallDeltas(chunk: OpenAiStreamChunk): OpenAiStreamChunk {
+  const [choice] = chunk.choices;
+  const { role, tool_calls } = choice.delta;
+  return {
+    ...chunk,
+    choices: [{ ...choice, delta: { ...(role ? { role } : {}), tool_calls } }],
+  };
+}
+
+/**
+ * Client request shapes OpenAI's /chat/completions rejects but that known
+ * clients send anyway (their own backends normalize before forwarding, so the
+ * shapes never reach OpenAI on the clients' native paths — the proxy has to do
+ * the same). Both fixes are no-ops for requests that don't carry the quirk.
+ */
+function normalizeChatCompletionsQuirks(request: OpenAiRequest): OpenAiRequest {
+  return normalizeEmptyAssistantContent(
+    normalizeResponsesStyleCustomTools(request),
+  );
+}
+
+/**
+ * Cursor sends assistant tool-call turns with `content: []`; OpenAI rejects
+ * that with "Invalid 'messages[N].content': empty array. Expected an array
+ * with minimum length 1". `null` is the accepted spelling of "no content" on
+ * an assistant message.
+ */
+function normalizeEmptyAssistantContent(request: OpenAiRequest): OpenAiRequest {
+  const needsFix = request.messages.some(
+    (m) =>
+      m.role === "assistant" &&
+      Array.isArray(m.content) &&
+      m.content.length === 0,
+  );
+  if (!needsFix) return request;
+  return {
+    ...request,
+    messages: request.messages.map((m) =>
+      m.role === "assistant" &&
+      Array.isArray(m.content) &&
+      m.content.length === 0
+        ? { ...m, content: null }
+        : m,
+    ),
+  };
+}
+
+/**
+ * Some Responses-API-first clients (Cursor's ApplyPatch tool is the known
+ * case) attach custom tools to /chat/completions requests in the flat
+ * Responses shape — `name`/`format` at the top level with grammar fields
+ * inlined. OpenAI rejects that shape on Chat Completions with
+ * "Missing required parameter: 'tools[N].custom'", so normalize it to the
+ * nested Chat Completions shape before forwarding. Requests without a flat
+ * custom tool pass through untouched.
+ */
+function normalizeResponsesStyleCustomTools(
+  request: OpenAiRequest,
+): OpenAiRequest {
+  const tools = request.tools;
+  if (!tools?.some((t) => t.type === "custom" && !("custom" in t))) {
+    return request;
+  }
+  return {
+    ...request,
+    tools: tools.map((t) => {
+      if (t.type !== "custom" || "custom" in t) return t;
+      return {
+        type: "custom" as const,
+        custom: {
+          name: t.name,
+          ...(t.description !== undefined && { description: t.description }),
+          ...(t.format !== undefined && {
+            format:
+              t.format.type === "grammar"
+                ? {
+                    type: "grammar" as const,
+                    grammar: {
+                      definition: t.format.definition,
+                      syntax: t.format.syntax,
+                    },
+                  }
+                : { type: "text" as const },
+          }),
+        },
+      };
+    }),
+  };
+}
+
+/**
+ * Some OpenAI-compatible upstreams (LiteLLM, OpenRouter, misconfigured
+ * gateways) return HTTP 200 with an error-shaped body — no `choices` array,
+ * usually an `error` object instead. Downstream code (getText, tool-call
+ * policy evaluation, response serialization) assumes `choices` exists, so
+ * surface the upstream failure as a typed error here instead of crashing with
+ * an opaque TypeError.
+ */
+function assertResponseHasChoices(
+  response: OpenAiResponse,
+  provider: SupportedProvider,
+): void {
+  if (Array.isArray(response?.choices)) return;
+
+  const embeddedError = (
+    response as unknown as {
+      error?: { message?: unknown; code?: unknown; status?: unknown };
+    }
+  )?.error;
+
+  const rawStatus = embeddedError?.status ?? embeddedError?.code;
+  const statusCode =
+    typeof rawStatus === "number" && rawStatus >= 400 && rawStatus <= 599
+      ? rawStatus
+      : 502;
+
+  const upstreamMessage =
+    typeof embeddedError?.message === "string" && embeddedError.message
+      ? embeddedError.message
+      : `Upstream ${provider} provider returned a response without choices`;
+
+  throw new ApiError(statusCode, upstreamMessage);
+}

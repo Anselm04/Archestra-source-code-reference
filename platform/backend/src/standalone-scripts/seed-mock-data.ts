@@ -1,0 +1,395 @@
+// Binds the ports of the layers below before any other module loads.
+import "@/server/composition";
+import { pathToFileURL } from "node:url";
+import {
+  ADMIN_ROLE_NAME,
+  EDITOR_ROLE_NAME,
+  MEMBER_ROLE_NAME,
+} from "@archestra/shared";
+import { getTableName, sql } from "drizzle-orm";
+import type { PgTable } from "drizzle-orm/pg-core";
+import db, { initializeDatabase, schema } from "@/database";
+import logger from "@/logging";
+import {
+  AgentLabelModel,
+  AgentModel,
+  AgentTeamModel,
+  OrganizationModel,
+  TeamModel,
+} from "@/models";
+import AgentUsageModel from "@/models/agent-usage";
+import { assertPortsBound } from "@/models/ports";
+import {
+  seedArchestraCatalogAndTools,
+  seedDefaultUserAndOrg,
+  syncBuiltInAgents,
+} from "@/services/seed";
+import type { TeamMemberRole } from "@/types/team-role";
+import { isUniqueConstraintError } from "@/utils/db";
+import {
+  generateMockAgents,
+  generateMockInteractions,
+  generateMockTools,
+  type MockAgentWithTeams,
+} from "./mocks";
+
+// The composition module, imported first, bound the ports of the layers
+// below; stop here if one is unbound.
+assertPortsBound();
+
+// Set to true to create tools and interactions
+// Don't delete this const for development convenience
+const CREATE_TOOLS_AND_INTERACTIONS = false;
+
+async function seedMockData() {
+  logger.info("\n🌱 Starting mock data seed...\n");
+
+  await initializeDatabase();
+
+  // Step 0: Clean existing data.
+  //
+  // One TRUNCATE ... CASCADE rather than a DELETE per table: the per-table loop
+  // ran in schema-export order, which is not a valid FK order, so it failed as
+  // soon as the database held rows the backend creates on boot (deleting
+  // internal_mcp_catalog while an mcp_server still referenced it violates that
+  // table's NOT NULL). CASCADE makes the order irrelevant.
+  logger.info("Cleaning existing data...");
+  const tableNames = Object.values(schema)
+    .map((table) => `"${getTableName(table as PgTable)}"`)
+    .join(", ");
+  await db.execute(
+    sql.raw(`TRUNCATE TABLE ${tableNames} RESTART IDENTITY CASCADE;`),
+  );
+  logger.info("✅ Cleaned existing data");
+
+  // Step 1: Create users
+  const defaultAdmin = await seedDefaultUserAndOrg();
+  const admin2User = await seedDefaultUserAndOrg({
+    email: "admin-2@example.com",
+    password: "password",
+    role: ADMIN_ROLE_NAME,
+    name: "Admin-2",
+  });
+  const editorUser = await seedDefaultUserAndOrg({
+    email: "editor@gmail.com",
+    password: "password",
+    role: EDITOR_ROLE_NAME,
+    name: "Editor",
+  });
+  const member1User = await seedDefaultUserAndOrg({
+    email: "member-1@example.com",
+    password: "password",
+    role: MEMBER_ROLE_NAME,
+    name: "Member-1",
+  });
+  const member2User = await seedDefaultUserAndOrg({
+    email: "member-2@example.com",
+    password: "password",
+    role: MEMBER_ROLE_NAME,
+    name: "Member-2",
+  });
+
+  // Step 2: Create teams and add members
+  const org = await OrganizationModel.getOrCreateDefaultOrganization();
+
+  const teamA = await TeamModel.create({
+    name: "TeamA",
+    description: "Team A for testing",
+    organizationId: org.id,
+    createdBy: defaultAdmin.id,
+  });
+  const teamB = await TeamModel.create({
+    name: "TeamB",
+    description: "Team B for testing",
+    organizationId: org.id,
+    createdBy: defaultAdmin.id,
+  });
+  const managementTeam = await TeamModel.create({
+    name: "Management Team",
+    description:
+      "Management department responsible for overseeing the platform",
+    organizationId: org.id,
+    createdBy: admin2User.id,
+  });
+  const marketingTeam = await TeamModel.create({
+    name: "Marketing Team",
+    description: "Marketing department responsible for promoting the platform",
+    organizationId: org.id,
+    createdBy: admin2User.id,
+  });
+  const engineeringTeam = await TeamModel.create({
+    name: "Engineering Team",
+    description: "Engineering department",
+    organizationId: org.id,
+    createdBy: defaultAdmin.id,
+  });
+
+  /**
+   * Add members to teams.
+   *
+   * Creating a team now adds its creator as an admin automatically, so every
+   * explicit add for `defaultAdmin` below is a duplicate and trips the
+   * (team, user) unique index. Seeding must stay re-runnable, so an existing
+   * membership is not an error.
+   */
+  const addMember = async (
+    teamId: string,
+    userId: string,
+    role: TeamMemberRole,
+  ) => {
+    try {
+      await TeamModel.addMember(teamId, userId, role);
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) throw error;
+    }
+  };
+
+  await addMember(teamA.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(teamA.id, editorUser.id, MEMBER_ROLE_NAME);
+  await addMember(teamB.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(teamB.id, member1User.id, MEMBER_ROLE_NAME);
+  await addMember(managementTeam.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(managementTeam.id, admin2User.id, ADMIN_ROLE_NAME);
+  await addMember(marketingTeam.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(marketingTeam.id, member1User.id, MEMBER_ROLE_NAME);
+  await addMember(marketingTeam.id, member2User.id, MEMBER_ROLE_NAME);
+  await addMember(engineeringTeam.id, defaultAdmin.id, ADMIN_ROLE_NAME);
+  await addMember(engineeringTeam.id, editorUser.id, MEMBER_ROLE_NAME);
+
+  logger.info("✅ Created 5 teams with members");
+
+  // Step 3: Create agents, MCP gateways, and LLM proxies with ownership patterns
+  logger.info("\nCreating agents, gateways, and proxies...");
+
+  // Always ensure the LLM Proxy exists
+  await AgentModel.ensureLlmProxiesForAllOrganizations();
+  await syncBuiltInAgents();
+  // The TRUNCATE above dropped the built-in catalog; without it every
+  // starter policy is refused until the backend restarts.
+  await seedArchestraCatalogAndTools();
+
+  const sharedUsers = [
+    { id: editorUser.id, name: "editor" },
+    { id: defaultAdmin.id, name: "admin" },
+  ];
+  const sharedTeamConfig = [
+    { teamId: teamA.id, teamName: "TeamA" },
+    { teamId: teamB.id, teamName: "TeamB" },
+  ];
+
+  // Agents: 30 editor-personal, 40 admin-personal, 50 TeamA, 60 TeamB, 70 org
+  const mockAgents = generateMockAgents({
+    organizationId: org.id,
+    agentType: "agent",
+    namePrefix: "agent",
+    users: sharedUsers.map((u) => ({
+      ...u,
+      personalCount: u.name === "editor" ? 30 : 40,
+    })),
+    teamConfig: [
+      { ...sharedTeamConfig[0], count: 50 },
+      { ...sharedTeamConfig[1], count: 60 },
+    ],
+    orgCount: 70,
+  });
+
+  // MCP Gateways: 15 editor-personal, 20 admin-personal, 25 TeamA, 30 TeamB, 35 org
+  const mockGateways = generateMockAgents({
+    organizationId: org.id,
+    agentType: "mcp_gateway",
+    namePrefix: "gw",
+    users: sharedUsers.map((u) => ({
+      ...u,
+      personalCount: u.name === "editor" ? 15 : 20,
+    })),
+    teamConfig: [
+      { ...sharedTeamConfig[0], count: 25 },
+      { ...sharedTeamConfig[1], count: 30 },
+    ],
+    orgCount: 35,
+  });
+
+  const allMockEntities: MockAgentWithTeams[] = [
+    ...mockAgents,
+    ...mockGateways,
+  ];
+
+  // Insert all (without teamIds field which isn't a DB column)
+  const allRows = allMockEntities.map(({ teamIds: _, ...row }) => row);
+  await db.insert(schema.agentsTable).values(allRows);
+  logger.info(
+    `✅ Created ${mockAgents.length} agents and ${mockGateways.length} gateways`,
+  );
+
+  // Assign teams to team-scoped entries
+  for (const entity of allMockEntities) {
+    if (entity.teamIds.length > 0) {
+      await AgentTeamModel.assignTeamsToAgent(entity.id, entity.teamIds);
+    }
+  }
+  logger.info("✅ Assigned teams to team-scoped entities");
+
+  // Step: Assign labels to agents for testing label-based filtering
+  const labelDefs: {
+    key: string;
+    values: string[];
+    frequency: number; // 1 = every entity, 2 = every 2nd, etc.
+  }[] = [
+    {
+      key: "region",
+      values: [
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-central-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-northeast-1",
+        "sa-east-1",
+        "ca-central-1",
+      ],
+      frequency: 1,
+    },
+    {
+      key: "environment",
+      values: ["production", "staging", "development", "qa", "sandbox"],
+      frequency: 1,
+    },
+    {
+      key: "team",
+      values: ["frontend", "backend", "platform", "ml", "infra", "data", "sre"],
+      frequency: 2,
+    },
+    {
+      key: "tier",
+      values: ["free", "starter", "pro", "enterprise"],
+      frequency: 3,
+    },
+    {
+      key: "compliance",
+      values: ["soc2", "hipaa", "gdpr", "pci-dss", "iso27001"],
+      frequency: 4,
+    },
+    {
+      key: "cost-center",
+      values: ["engineering", "product", "sales", "marketing", "support"],
+      frequency: 3,
+    },
+    {
+      key: "priority",
+      values: ["critical", "high", "medium", "low"],
+      frequency: 2,
+    },
+    {
+      key: "owner",
+      values: ["alice", "bob", "charlie", "diana", "eve", "frank"],
+      frequency: 5,
+    },
+  ];
+
+  for (let i = 0; i < allMockEntities.length; i++) {
+    const entity = allMockEntities[i];
+    const labels: {
+      key: string;
+      value: string;
+      keyId: string;
+      valueId: string;
+    }[] = [];
+
+    for (const def of labelDefs) {
+      if (i % def.frequency === 0) {
+        labels.push({
+          key: def.key,
+          value: def.values[i % def.values.length],
+          keyId: "",
+          valueId: "",
+        });
+      }
+    }
+
+    await AgentLabelModel.syncAgentLabels(entity.id, labels);
+  }
+  logger.info(
+    `✅ Assigned labels to ${allMockEntities.length} entities (${labelDefs.map((d) => d.key).join(", ")})`,
+  );
+
+  // Note: Archestra tools are no longer auto-assigned to agents.
+  // They are now managed like any other MCP server tools and must be explicitly assigned.
+
+  if (CREATE_TOOLS_AND_INTERACTIONS === false) return;
+
+  // Step 4: Create tools linked to agents
+  logger.info("\nCreating tools...");
+  const agentIds = allRows
+    .map((row) => row.id)
+    .filter((id): id is string => !!id);
+  const toolData = generateMockTools(agentIds);
+
+  await db.insert(schema.toolsTable).values(toolData);
+  logger.info(`✅ Created ${toolData.length} tools`);
+
+  // Step 5: Create agent-tool relationships
+  logger.info("\nCreating agent-tool relationships...");
+  const agentToolData = toolData.map((tool) => ({
+    agentId: tool.agentId,
+    toolId: tool.id,
+  }));
+
+  await db.insert(schema.agentToolsTable).values(agentToolData);
+  logger.info(`✅ Created ${agentToolData.length} agent-tool relationships`);
+
+  // Step 6: Create 200 mock interactions
+  logger.info("\nCreating interactions...");
+
+  // Group tools by agent for efficient lookup
+  const toolsByAgent = new Map<string, typeof toolData>();
+  for (const tool of toolData) {
+    const existing = toolsByAgent.get(tool.agentId) || [];
+    toolsByAgent.set(tool.agentId, [...existing, tool]);
+  }
+
+  const interactionData = generateMockInteractions(
+    agentIds,
+    toolsByAgent,
+    200, // number of interactions
+  );
+
+  const insertedInteractions = await db
+    .insert(schema.interactionsTable)
+    // biome-ignore lint/suspicious/noExplicitAny: Mock data generation requires flexible interaction structure
+    .values(interactionData as any)
+    .returning({
+      profileId: schema.interactionsTable.profileId,
+      createdAt: schema.interactionsTable.createdAt,
+    });
+  logger.info(`✅ Created ${interactionData.length} interactions`);
+
+  // Inserted directly, so stamp each agent as InteractionModel.create would.
+  const newestByAgent = new Map<string, Date>();
+  for (const { profileId, createdAt } of insertedInteractions) {
+    if (!profileId) continue;
+    const newest = newestByAgent.get(profileId);
+    if (!newest || createdAt > newest) newestByAgent.set(profileId, createdAt);
+  }
+  for (const [agentId, usedAt] of newestByAgent) {
+    await AgentUsageModel.recordUse({ agentId, usedAt });
+  }
+}
+
+/**
+ * CLI entry point for seeding the database
+ */
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  seedMockData()
+    .then(() => {
+      logger.info("\n✅ Mock data seeded successfully!\n");
+      process.exit(0);
+    })
+    .catch((error) => {
+      logger.error({ err: error }, "\n❌ Error seeding database:");
+      process.exit(1);
+    });
+}

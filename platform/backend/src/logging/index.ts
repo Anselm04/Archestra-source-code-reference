@@ -1,0 +1,173 @@
+import {
+  isSpanContextValid,
+  context as otelContext,
+  trace,
+} from "@opentelemetry/api";
+import { logs } from "@opentelemetry/api-logs";
+import pino from "pino";
+import pretty from "pino-pretty";
+import { createLogger } from "@/logging/create-logger";
+import { LOG_FORMAT } from "@/logging/log-format";
+import { logRingBuffer } from "@/logging/log-ring-buffer";
+import { createLogObserverStream } from "@/logging/observer-stream";
+import { getActiveSessionId } from "@/observability/request-context";
+
+/**
+ * Lazy-initialized pino logger using a Proxy.
+ *
+ * Why lazy: ensures the OpenTelemetry SDK has started and registered a real
+ * global `LoggerProvider` before we create the pino instance and its OTEL
+ * log-forwarding stream.
+ *
+ * Why manual OTEL integration (mixin + custom stream) instead of relying on
+ * `@opentelemetry/instrumentation-pino`:
+ *
+ * The backend is bundled by tsdown to ESM (`server.mjs`). Static ESM imports
+ * are hoisted and resolved before any module code runs — including `sdk.start()`.
+ * The OTEL pino instrumentation patches the `pino()` constructor at
+ * `sdk.start()` time, but it can't retroactively patch ESM modules that are
+ * already loaded (that requires the `--import` flag). So we manually:
+ *
+ *   1. Inject trace context (`trace_id`, `span_id`, `trace_flags`) into every
+ *      log record via pino's `mixin` option — visible in console output.
+ *   2. Forward log records to the OTEL Logs API via a shared structured stream
+ *      combined with `pino.multistream` — sends logs to the OTLP collector.
+ *
+ * The OTEL Logs SDK automatically captures the active span context when
+ * `otelLogger.emit()` is called, so logs are linked to traces without needing
+ * to pass context explicitly.
+ */
+
+let _instance: pino.Logger | null = null;
+
+function getInstance(): pino.Logger {
+  if (!_instance) _instance = createDefaultLogger();
+  return _instance;
+}
+
+function createDefaultLogger(): pino.Logger {
+  // Write raw JSON to stdout via an async, buffered destination so log writes
+  // don't block the event loop when the container log pipe is backpressured.
+  return createLogger({
+    // Keep `time` as epoch ms (pino default) so OTEL and log shippers can
+    // read it without parsing. Add a sibling `timeIso` for human readers
+    // looking at raw stdout.
+    mixin: () => ({
+      ...injectTraceContext(),
+      timeIso: new Date().toISOString(),
+    }),
+    streams: [
+      { level: "trace", stream: createStdoutStream() },
+      {
+        level: "trace",
+        stream: createLogObserverStream({
+          logger: logs.getLogger("pino"),
+          retain: (record) => logRingBuffer.ingest(record),
+        }),
+      },
+    ],
+  });
+}
+
+/**
+ * A property defined on the proxy itself wins over the instance's. That is
+ * what `vi.spyOn(logger, "warn")` creates, so tests can spy on the real
+ * logger (see `spyOnLogger` in `@/test/logging`) instead of mocking the
+ * module, which would make their files run isolated.
+ */
+const logger: pino.Logger = new Proxy({} as pino.Logger, {
+  get(target, prop) {
+    if (Object.hasOwn(target, prop)) {
+      return (target as unknown as Record<string | symbol, unknown>)[prop];
+    }
+    const value = (
+      getInstance() as unknown as Record<string | symbol, unknown>
+    )[prop];
+    return typeof value === "function" ? value.bind(_instance) : value;
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const own = Reflect.getOwnPropertyDescriptor(target, prop);
+    if (own) return own;
+    const value = (
+      getInstance() as unknown as Record<string | symbol, unknown>
+    )[prop];
+    if (typeof value !== "function") return undefined;
+    return {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: value.bind(_instance),
+    };
+  },
+});
+
+export default logger;
+
+// --- Internal helpers (stdout stream) ---
+
+/**
+ * Create the stdout half of the pino multistream. Format is selected by
+ * `ARCHESTRA_LOGGING_FORMAT` (see `log-format.ts`).
+ *
+ * - `json` (default): raw JSON to fd:1 via an async, buffered destination so
+ *   log writes don't block the event loop when the stdout pipe is
+ *   backpressured. The machine-readable format consumed by log shippers.
+ * - `pretty`: human-readable single-line colorized output.
+ *
+ * The OTEL multistream branch always receives the same JSON record from pino
+ * before any stream-level transform, so swapping this branch never changes
+ * what the OTLP exporter sees.
+ */
+function createStdoutStream() {
+  if (LOG_FORMAT === "pretty") {
+    return pretty({
+      colorize: true,
+      translateTime: "HH:MM:ss Z",
+      singleLine: true,
+      // Mixin-added fields are valuable in JSON for OTEL/log shippers but
+      // pure noise in a pretty console line.
+      ignore: "pid,hostname,timeIso,trace_id,span_id,trace_flags,session_id",
+    });
+  }
+  const destination = pino.destination({ fd: 1, sync: false, minLength: 4096 });
+  // The buffer trades write latency for never blocking the event loop, and a
+  // chatty process crosses the threshold many times a second anyway. A
+  // near-silent process is the trap: a record under the threshold sits
+  // buffered INDEFINITELY — the dedicated renderer would boot, run a job,
+  // fail it, and show an empty log the whole time, its report surfacing only
+  // at process exit (if the exit is clean enough to flush at all). The
+  // interval bounds that wait; unref'd, it never holds the process open.
+  setInterval(() => destination.flush(), STDOUT_FLUSH_INTERVAL_MS).unref();
+  return destination;
+}
+
+/** Longest a buffered record may wait for the size threshold before being
+ * flushed anyway — the ceiling on "the log looks empty" during quiet spells. */
+const STDOUT_FLUSH_INTERVAL_MS = 2_000;
+
+// --- Internal helpers (trace context injection) ---
+
+/**
+ * Pino mixin that injects OpenTelemetry trace context into every log record.
+ * Shows `trace_id`, `span_id`, and `trace_flags` in console/pretty output.
+ */
+function injectTraceContext(): Record<string, string> {
+  const span = trace.getSpan(otelContext.active());
+  const sessionId = getActiveSessionId();
+  const sessionFields: Record<string, string> = sessionId
+    ? { session_id: sessionId }
+    : {};
+  if (!span) return sessionFields;
+
+  const spanContext = span.spanContext();
+  if (!isSpanContextValid(spanContext)) return sessionFields;
+
+  const result: Record<string, string> = {
+    ...sessionFields,
+    trace_id: spanContext.traceId,
+    span_id: spanContext.spanId,
+    trace_flags: `0${spanContext.traceFlags.toString(16)}`,
+  };
+
+  return result;
+}

@@ -1,0 +1,93 @@
+// @vitest-environment node
+import { addDays } from "date-fns/addDays";
+import { subDays } from "date-fns/subDays";
+import { subHours } from "date-fns/subHours";
+import { subMinutes } from "date-fns/subMinutes";
+import { subMonths } from "date-fns/subMonths";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  formatCompactRelativeTime,
+  formatDate,
+  formatRelativeTime,
+  formatRelativeTimeFromNow,
+} from "./date-time";
+
+describe("format-relative-time", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-15T12:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe("formatRelativeTime", () => {
+    it("returns the default never label for null values", () => {
+      expect(formatRelativeTime(null)).toBe("Never");
+    });
+
+    it("returns the invalid label for invalid dates", () => {
+      expect(
+        formatRelativeTime("not-a-date", { invalidLabel: "Invalid date" }),
+      ).toBe("Invalid date");
+    });
+
+    it("returns the past label for past dates", () => {
+      expect(formatRelativeTime(subDays(new Date(), 1))).toBe("Expired");
+    });
+
+    it("returns a future relative time for future dates", () => {
+      expect(formatRelativeTime(addDays(new Date(), 2))).toBe("in 2 days");
+    });
+  });
+
+  describe("formatRelativeTimeFromNow", () => {
+    it("returns the default never label for null values", () => {
+      expect(formatRelativeTimeFromNow(null)).toBe("Never");
+    });
+
+    it("returns the invalid label for invalid dates", () => {
+      expect(
+        formatRelativeTimeFromNow("not-a-date", {
+          invalidLabel: "Invalid date",
+        }),
+      ).toBe("Invalid date");
+    });
+
+    it("returns past relative time for past dates", () => {
+      expect(formatRelativeTimeFromNow(subDays(new Date(), 5))).toBe(
+        "5 days ago",
+      );
+    });
+
+    it("returns future relative time for future dates", () => {
+      expect(formatRelativeTimeFromNow(addDays(new Date(), 3))).toBe(
+        "in 3 days",
+      );
+    });
+  });
+
+  describe("formatCompactRelativeTime", () => {
+    // Dates are built inside the test, after the fake clock is installed.
+    it.each([
+      { ago: (now: Date) => subMinutes(now, 5), expected: "5m ago" },
+      { ago: (now: Date) => subHours(now, 2), expected: "2h ago" },
+      { ago: (now: Date) => subDays(now, 1), expected: "1d ago" },
+      { ago: (now: Date) => subMonths(now, 3), expected: "3mo ago" },
+    ])("abbreviates units to fit a table cell ($expected)", ({
+      ago,
+      expected,
+    }) => {
+      expect(formatCompactRelativeTime(ago(new Date()))).toBe(expected);
+    });
+  });
+
+  describe("formatDate", () => {
+    it("formats ISO timestamps with the default format", () => {
+      expect(formatDate({ date: "2026-03-15T12:34:56" })).toBe(
+        "03/15/2026 12:34:56",
+      );
+    });
+  });
+});

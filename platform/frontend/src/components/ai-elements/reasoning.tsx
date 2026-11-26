@@ -1,0 +1,217 @@
+"use client";
+
+import { useControllableState } from "@radix-ui/react-use-controllable-state";
+import { BrainIcon, ChevronDownIcon } from "lucide-react";
+import type { ComponentProps } from "react";
+import {
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { cn } from "@/lib/utils/tailwind";
+import { Response } from "./response";
+
+type ReasoningContextValue = {
+  isStreaming: boolean;
+  isOpen: boolean;
+  setIsOpen: (open: boolean) => void;
+  // Undefined until a live block measures its own duration (or a caller passes
+  // one); a persisted block never has it. `getThinkingMessage` distinguishes the
+  // two, so the type must admit undefined.
+  duration: number | undefined;
+  // True while more thinking may still join a merged run. Any duration measured
+  // so far is a partial sum, so the trigger keeps reading "Thinking…" rather
+  // than announcing a total it is about to revise upward.
+  keepOpen: boolean;
+};
+
+const ReasoningContext = createContext<ReasoningContextValue | null>(null);
+
+const useReasoning = () => {
+  const context = useContext(ReasoningContext);
+  if (!context) {
+    throw new Error("Reasoning components must be used within Reasoning");
+  }
+  return context;
+};
+
+export type ReasoningProps = ComponentProps<typeof Collapsible> & {
+  isStreaming?: boolean;
+  open?: boolean;
+  defaultOpen?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  duration?: number;
+  /**
+   * More content may still arrive — hold the auto-close. A merged run of
+   * thinking blocks streams in bursts with tool calls in between; without this
+   * it would collapse and re-expand once per burst.
+   */
+  keepOpen?: boolean;
+};
+
+const MS_IN_S = 1000;
+
+export const Reasoning = memo(
+  ({
+    className,
+    isStreaming = false,
+    open,
+    // Collapsed even while streaming: the header already reads "Thinking…",
+    // and opening then auto-closing every block reads as flicker.
+    defaultOpen = false,
+    onOpenChange,
+    duration: durationProp,
+    keepOpen = false,
+    children,
+    ...props
+  }: ReasoningProps) => {
+    const [isOpen, setIsOpen] = useControllableState({
+      prop: open,
+      defaultProp: defaultOpen,
+      onChange: onOpenChange,
+    });
+    const [duration, setDuration] = useControllableState({
+      prop: durationProp,
+      // Undefined, not 0: a reasoning block that never streamed (a persisted
+      // conversation reopened, or a surface that passes no `isStreaming`) has no
+      // measured duration and must read "Thought for a few seconds", not stay
+      // pinned on "Thinking…". A live block still gets a real duration from the
+      // streaming-end effect below.
+      defaultProp: undefined,
+    });
+
+    const [startTime, setStartTime] = useState<number | null>(null);
+    // A merged run of thinking blocks streams in several bursts, one per block,
+    // with the tool calls it swallowed in between. Accumulate the streaming
+    // intervals so the label reports total thinking time: overwriting would
+    // report only the final block, and wall-clock would fold in the tool runs.
+    // A single-burst block accumulates exactly its own interval, as before.
+    const streamedMsRef = useRef(0);
+
+    // Track duration when streaming starts and ends
+    useEffect(() => {
+      if (isStreaming) {
+        if (startTime === null) {
+          setStartTime(Date.now());
+        }
+      } else if (startTime !== null) {
+        streamedMsRef.current += Date.now() - startTime;
+        setDuration(Math.ceil(streamedMsRef.current / MS_IN_S));
+        setStartTime(null);
+      }
+    }, [isStreaming, startTime, setDuration]);
+
+    const handleOpenChange = (newOpen: boolean) => {
+      setIsOpen(newOpen);
+    };
+
+    return (
+      <ReasoningContext.Provider
+        value={{ isStreaming, isOpen, setIsOpen, duration, keepOpen }}
+      >
+        <Collapsible
+          className={cn("not-prose mb-4 pl-2", className)}
+          onOpenChange={handleOpenChange}
+          open={isOpen}
+          {...props}
+        >
+          {children}
+        </Collapsible>
+      </ReasoningContext.Provider>
+    );
+  },
+);
+
+export type ReasoningTriggerProps = ComponentProps<typeof CollapsibleTrigger>;
+
+const getThinkingMessage = (isStreaming: boolean, duration?: number) => {
+  if (isStreaming || duration === 0) {
+    return <p>Thinking...</p>;
+  }
+  if (duration === undefined) {
+    return <p>Thought for a few seconds</p>;
+  }
+  return (
+    <p>{`Thought for ${duration} ${duration === 1 ? "second" : "seconds"}`}</p>
+  );
+};
+
+export const ReasoningTrigger = memo(
+  ({ className, children, ...props }: ReasoningTriggerProps) => {
+    const { isStreaming, isOpen, duration, keepOpen } = useReasoning();
+
+    return (
+      <CollapsibleTrigger
+        className={cn(
+          "flex w-full items-center gap-2 text-muted-foreground text-sm transition-colors hover:text-foreground",
+          className,
+        )}
+        {...props}
+      >
+        {children ?? (
+          <>
+            <BrainIcon className="size-4" />
+            {getThinkingMessage(isStreaming || keepOpen, duration)}
+            <ChevronDownIcon
+              className={cn(
+                "size-4 transition-transform",
+                isOpen ? "rotate-180" : "rotate-0",
+              )}
+            />
+          </>
+        )}
+      </CollapsibleTrigger>
+    );
+  },
+);
+
+export type ReasoningContentProps = ComponentProps<
+  typeof CollapsibleContent
+> & {
+  children: string;
+};
+
+export const ReasoningContent = memo(
+  ({ className, children, ...props }: ReasoningContentProps) => (
+    <CollapsibleContent
+      className={cn(
+        "mt-4 text-sm",
+        "data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 text-muted-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
+        className,
+      )}
+      {...props}
+    >
+      {/* Thinking is markdown like any other turn, so it can carry code
+          blocks, long identifiers or URLs that have no break opportunity to
+          shrink at. `grid` sized its single `auto` track from the widest of
+          those, which stretched the whole column — prose included — past the
+          chat and put a horizontal scrollbar on the conversation.
+          `flex-col` keeps the same gap rhythm while leaving every child at the
+          container's width, and `break-words` lets a long token wrap onto the
+          next line so the block reads at the chat's width instead of trading
+          the page's scrollbar for one of its own. Fenced code keeps its own
+          body scroller (`white-space: pre` ignores the wrapping), as it does
+          in a message. `overflow-x-auto` is the backstop for the rest: a wide
+          table scrolls inside the block rather than widening the page. */}
+      {/* Same measure as an assistant turn: MessageContent caps its text at
+          max-w-[80%] of the transcript column, and both sit behind the same
+          pl-2, so thinking wraps on the same line length as the answer under
+          it rather than running ~25% wider. */}
+      <Response className="flex max-w-[80%] flex-col gap-2 overflow-x-auto break-words">
+        {children}
+      </Response>
+    </CollapsibleContent>
+  ),
+);
+
+Reasoning.displayName = "Reasoning";
+ReasoningTrigger.displayName = "ReasoningTrigger";
+ReasoningContent.displayName = "ReasoningContent";

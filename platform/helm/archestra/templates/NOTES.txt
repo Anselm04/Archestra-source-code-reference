@@ -1,0 +1,107 @@
+Archestra Platform has been installed!
+
+{{- /*
+  On the first upgrade into a new stable line (for example 1.4.x to 1.5.0), link
+  that line's upgrade guide. The running platform Deployment's version label is
+  the version being replaced. `lookup` returns nothing under `helm template` and
+  dry runs, so Argo CD, Flux and CI renders print nothing extra, and nothing here
+  waits for input.
+*/}}
+{{- $current := .Chart.AppVersion }}
+{{- if and .Release.IsUpgrade (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+$" $current) }}
+{{- $deployment := lookup "apps/v1" "Deployment" .Release.Namespace (include "archestra-platform.fullname" .) }}
+{{- $previous := "" }}
+{{- if $deployment }}
+{{- $previous = index ($deployment.metadata.labels | default dict) "app.kubernetes.io/version" | default "" }}
+{{- end }}
+{{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$" $previous }}
+{{- $to := semver $current }}
+{{- $from := semver $previous }}
+{{- if semverCompare (printf "<%d.%d.0-0" $to.Major $to.Minor) $previous }}
+{{- $docs := printf "https://archestra.ai/docs/v%d.%d" $to.Major $to.Minor }}
+
+Upgrading from v{{ $from.Major }}.{{ $from.Minor }} to v{{ $to.Major }}.{{ $to.Minor }}:
+{{- if and (eq $from.Major $to.Major) (eq (add1 $from.Minor) $to.Minor) }}
+  Read the upgrade guide before using this release:
+  {{ $docs }}/admin/upgrade-v{{ $from.Major }}-{{ $from.Minor }}-to-v{{ $to.Major }}-{{ $to.Minor }}
+{{- else }}
+  This upgrade skips at least one stable line. Read the upgrade guide of each
+  line in between, starting from the v{{ $to.Major }}.{{ $to.Minor }} docs:
+  {{ $docs }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- $frontendUrl := index .Values.archestra.env "ARCHESTRA_FRONTEND_URL" | default "" }}
+
+{{- if not $frontendUrl }}
+To access the platform, run the following commands:
+
+  # Forward the backend API (port 9000) and frontend (port 3000)
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "archestra-platform.fullname" . }} 9000:9000 3000:3000
+{{- end }}
+
+Then visit:
+  - Backend API: http://localhost:9000
+  - Frontend: {{ $frontendUrl | default "http://localhost:3000" }}
+
+{{- if .Values.archestra.worker.enabled }}
+
+Background worker:
+  Replicas: {{ .Values.archestra.worker.replicaCount }}
+  Process type: worker-only (separate Deployment)
+{{- else }}
+
+Background worker: running in-process (worker Deployment disabled)
+{{- end }}
+
+{{- $iamAuth := (.Values.archestra.database).iamAuth | default dict }}
+{{- $entraAuth := (.Values.archestra.database).entraAuth | default dict }}
+{{- if or .Values.postgresql.external_database_url (not .Values.postgresql.enabled) }}
+
+Using external PostgreSQL database{{- if $iamAuth.enabled }} (RDS IAM authentication enabled){{- else if $entraAuth.enabled }} (Microsoft Entra ID authentication enabled){{- end }}
+{{- else }}
+
+Using internal PostgreSQL database:
+  Database: {{ .Values.postgresql.auth.database }}
+  Username: {{ .Values.postgresql.auth.username }}
+{{- end }}
+
+{{- if not .Values.archestra.authSecret.existingSecretName }}
+
+Authentication and encryption keys:
+  The chart generated them in Secret {{ include "archestra-platform.authSecretName" . }}. Back it up with your database.
+  Tools that render this chart with `helm template`, such as Argo CD, cannot read that
+  Secret and would replace the keys on every sync, leaving stored credentials unreadable.
+  With such a tool, create the Secret yourself and set archestra.authSecret.existingSecretName.
+{{- end }}
+
+{{- $legacyOverrides := list }}
+{{- range $name := list "ARCHESTRA_AGENT_RUNTIME_IMAGE_REGISTRY" "ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE" "ARCHESTRA_KNOWLEDGE_BASE_PERFORCE_SHIM_IMAGE" }}
+{{- $value := index $.Values.archestra.env $name | default "" }}
+{{- if and (kindIs "string" $value) (or (eq $value "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public") (hasPrefix "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/" $value)) }}
+{{- $legacyOverrides = append $legacyOverrides (printf "archestra.env.%s" $name) }}
+{{- end }}
+{{- end }}
+{{- if $legacyOverrides }}
+
+Registry migration notice:
+  These overrides still point to Archestra's previous companion image registry:
+{{- range $legacyOverrides }}
+  - {{ . }}
+{{- end }}
+  New companion images are published at ghcr.io/archestra-ai.
+  Update these overrides to use this release's images, or your internal mirror.
+  Existing versions remain available at their original addresses.
+{{- end }}
+
+{{- /* Remove after 1.5.0, when the Artifact Registry chart stops getting versions. */}}
+{{- if semverCompare "<1.5.1-0" .Chart.Version }}
+
+Chart registry notice:
+  This chart is published at oci://ghcr.io/archestra-ai/helm-charts/archestra-platform.
+  oci://europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/helm-charts/archestra-platform
+  gets no versions after 1.5.0. If you install, upgrade, or sync (Argo CD, Flux, Terraform)
+  from that address, switch to the GHCR address. Versions already there stay available.
+{{- end }}

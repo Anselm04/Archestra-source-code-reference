@@ -1,0 +1,486 @@
+import { createHash } from "node:crypto";
+import type { ModelInputModality } from "@archestra/shared";
+import type pino from "pino";
+import type { OcrRunContext } from "@/knowledge-base/pdf-ocr";
+import defaultLogger from "@/logging";
+import type {
+  Connector,
+  ConnectorContentTruncation,
+  ConnectorCredentials,
+  ConnectorItemFailure,
+  ConnectorItemSkipped,
+  ConnectorSyncBatch,
+  ConnectorType,
+} from "@/types";
+
+export function truncateConnectorContent(params: {
+  content: string;
+  maxLength: number;
+}): { content: string; truncation?: ConnectorContentTruncation } {
+  if (params.content.length <= params.maxLength) {
+    return { content: params.content };
+  }
+
+  return {
+    content: params.content.slice(0, params.maxLength),
+    truncation: {
+      originalCharacterCount: params.content.length,
+      indexedCharacterCount: params.maxLength,
+      originalContentHash: createHash("sha256")
+        .update(params.content)
+        .digest("hex"),
+    },
+  };
+}
+
+/**
+ * The image MIME types a connector should ingest: empty unless the configured
+ * embedding model accepts image input, then the connector's own supported
+ * types intersected with the formats the embedding client accepts for the
+ * model (`undefined` accepted list = no per-format restriction). Ingestion and
+ * the embedder's embed-time skip gate on the same resolved capability, so a
+ * format filtered here can never reach a rejecting embed call.
+ */
+export function resolveIngestibleImageMimeTypes(params: {
+  connectorImageMimeTypes: Iterable<string>;
+  embeddingInputModalities?: ModelInputModality[];
+  embeddingAcceptedImageMimeTypes?: string[];
+}): ReadonlySet<string> {
+  const {
+    connectorImageMimeTypes,
+    embeddingInputModalities,
+    embeddingAcceptedImageMimeTypes,
+  } = params;
+  if (!embeddingInputModalities?.includes("image")) {
+    return new Set();
+  }
+  const supported = [...connectorImageMimeTypes];
+  return new Set(
+    embeddingAcceptedImageMimeTypes
+      ? supported.filter((mimeType) =>
+          embeddingAcceptedImageMimeTypes.includes(mimeType),
+        )
+      : supported,
+  );
+}
+
+/**
+ * Build a connector checkpoint with `lastSyncedAt` derived from the last
+ * fetched item's updated timestamp.  Falls back to the previous checkpoint
+ * value when the batch contains no items.
+ *
+ * Centralises the timestamp logic so every connector computes its checkpoint
+ * the same way (using item timestamps, never wall-clock time).
+ */
+export function buildCheckpoint<
+  T extends ConnectorType,
+  E extends Record<string, unknown> = Record<never, never>,
+>(params: {
+  type: T;
+  itemUpdatedAt: string | Date | null | undefined;
+  previousLastSyncedAt: string | undefined;
+  extra?: E;
+}): { type: T; lastSyncedAt: string | undefined } & E {
+  return {
+    type: params.type,
+    lastSyncedAt: params.itemUpdatedAt
+      ? new Date(String(params.itemUpdatedAt)).toISOString()
+      : params.previousLastSyncedAt,
+    ...params.extra,
+  } as { type: T; lastSyncedAt: string | undefined } & E;
+}
+
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 1000;
+const RETRY_MAX_DELAY_MS = 10000;
+const DEFAULT_RATE_LIMIT_DELAY_MS = 100;
+export const REQUEST_TIMEOUT_MS = 30000;
+
+export abstract class BaseConnector implements Connector {
+  abstract type: ConnectorType;
+
+  /**
+   * Whether this connector implements the permission-sync hooks
+   * (`syncPermissionSnapshot` / `syncGroups`). Default off so existing
+   * connectors are untouched; Jira/Confluence/GitHub (and Stage-2 connectors)
+   * override this `true` and implement the two generators. Nothing else in the
+   * permission-sync core is per-connector.
+   */
+  supportsPermissionSync = false;
+
+  protected log: pino.Logger = defaultLogger;
+  protected ocrContext: OcrRunContext | undefined;
+  private rateLimitDelayMs: number;
+  private itemFailures: ConnectorItemFailure[] = [];
+  private itemSkipped: ConnectorItemSkipped[] = [];
+
+  constructor(rateLimitDelayMs = DEFAULT_RATE_LIMIT_DELAY_MS) {
+    this.rateLimitDelayMs = rateLimitDelayMs;
+  }
+
+  setLogger(log: pino.Logger): void {
+    this.log = log;
+  }
+
+  /**
+   * Arm OCR for this run. Connector instances are constructed per run (see
+   * the registry), so like `setLogger` this is per-run wiring, not shared
+   * state; extractors read it to transcribe textless PDF pages.
+   */
+  setOcrContext(ocr: OcrRunContext): void {
+    this.ocrContext = ocr;
+  }
+
+  protected async validateConfigWithSchema<T>(params: {
+    config: Record<string, unknown>;
+    parser: (raw: Record<string, unknown>) => T | null;
+    label: string;
+    invalidConfigError?: string;
+    extraChecks?: (parsed: T) => string | null;
+  }): Promise<{ valid: boolean; error?: string }> {
+    const parsed = params.parser(params.config);
+    if (!parsed) {
+      return {
+        valid: false,
+        error:
+          params.invalidConfigError ?? `Invalid ${params.label} configuration`,
+      };
+    }
+    const extraError = params.extraChecks?.(parsed);
+    if (extraError) {
+      return { valid: false, error: extraError };
+    }
+    return { valid: true };
+  }
+
+  protected async runConnectionTest(params: {
+    label: string;
+    probe: () => Promise<void>;
+    errorContext?: (error: unknown) => Record<string, unknown>;
+  }): Promise<{ success: boolean; error?: string }> {
+    this.log.debug(
+      { connectorType: this.type },
+      `Testing ${params.label} connection`,
+    );
+    try {
+      await params.probe();
+      this.log.debug(
+        { connectorType: this.type },
+        `${params.label} connection test successful`,
+      );
+      return { success: true };
+    } catch (error) {
+      const message = extractErrorMessage(error);
+      this.log.error(
+        {
+          connectorType: this.type,
+          error: message,
+          ...(params.errorContext?.(error) ?? {}),
+        },
+        `${params.label} connection test failed`,
+      );
+      return { success: false, error: `Connection failed: ${message}` };
+    }
+  }
+
+  abstract validateConfig(
+    config: Record<string, unknown>,
+  ): Promise<{ valid: boolean; error?: string }>;
+
+  abstract testConnection(params: {
+    config: Record<string, unknown>;
+    credentials: ConnectorCredentials;
+  }): Promise<{ success: boolean; error?: string }>;
+
+  async estimateTotalItems(_params: {
+    config: Record<string, unknown>;
+    credentials: ConnectorCredentials;
+    checkpoint: Record<string, unknown> | null;
+    embeddingInputModalities?: ModelInputModality[];
+    embeddingAcceptedImageMimeTypes?: string[];
+  }): Promise<number | null> {
+    return null;
+  }
+
+  abstract sync(params: {
+    config: Record<string, unknown>;
+    credentials: ConnectorCredentials;
+    checkpoint: Record<string, unknown> | null;
+    startTime?: Date;
+    endTime?: Date;
+  }): AsyncGenerator<ConnectorSyncBatch>;
+
+  protected buildBasicAuthHeader(email: string, apiToken: string): string {
+    const encoded = Buffer.from(`${email}:${apiToken}`).toString("base64");
+    return `Basic ${encoded}`;
+  }
+
+  protected async fetchWithRetry(
+    url: string,
+    options: RequestInit,
+    maxRetries = MAX_RETRIES,
+  ): Promise<Response> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          REQUEST_TIMEOUT_MS,
+        );
+
+        try {
+          const response = await fetch(url, {
+            ...options,
+            signal: controller.signal,
+          });
+
+          if (response.ok || !isRetryableStatus(response.status)) {
+            return response;
+          }
+
+          if (attempt < maxRetries) {
+            const delay = calculateBackoffDelay(attempt);
+            this.log.warn(
+              {
+                connectorType: this.type,
+                attempt: attempt + 1,
+                maxRetries,
+                status: response.status,
+                delayMs: Math.round(delay),
+              },
+              "Retryable HTTP error, will retry",
+            );
+            await sleep(delay);
+            continue;
+          }
+
+          return response;
+        } finally {
+          clearTimeout(timeout);
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (isRetryableError(error) && attempt < maxRetries) {
+          const delay = calculateBackoffDelay(attempt);
+          this.log.warn(
+            {
+              connectorType: this.type,
+              attempt: attempt + 1,
+              maxRetries,
+              error: lastError.message,
+              delayMs: Math.round(delay),
+            },
+            "Transient error, will retry",
+          );
+          await sleep(delay);
+          continue;
+        }
+
+        throw lastError;
+      }
+    }
+
+    throw lastError || new Error("Unknown error during fetch retry");
+  }
+
+  protected async safeItemFetch<T>(params: {
+    fetch: () => Promise<T>;
+    fallback: T;
+    itemId: string | number;
+    resource: string;
+    /** The fallback omits the top-level document, not an optional subresource. */
+    itemUnavailable?: boolean;
+    /** A later document with this source id resolves the provisional failure. */
+    recoverySourceId?: string;
+  }): Promise<T> {
+    try {
+      return await params.fetch();
+    } catch (error) {
+      const message = extractErrorMessage(error);
+      this.log.warn(
+        {
+          connectorType: this.type,
+          itemId: params.itemId,
+          resource: params.resource,
+          error: message,
+        },
+        params.itemUnavailable
+          ? "Failed to fetch item; preserving any last-known-good indexed copy"
+          : "Failed to fetch sub-resource for item, using fallback",
+      );
+      this.itemFailures.push({
+        itemId: params.itemId,
+        resource: params.resource,
+        error: message,
+        ...(params.itemUnavailable ? { itemUnavailable: true } : {}),
+        ...(params.recoverySourceId
+          ? { recoverySourceId: params.recoverySourceId }
+          : {}),
+      });
+      return params.fallback;
+    }
+  }
+
+  protected flushFailures(): ConnectorItemFailure[] {
+    const failures = this.itemFailures;
+    this.itemFailures = [];
+    return failures;
+  }
+
+  protected trackSkipped(item: ConnectorItemSkipped): void {
+    this.itemSkipped.push(item);
+  }
+
+  protected flushSkipped(): ConnectorItemSkipped[] {
+    const skipped = this.itemSkipped;
+    this.itemSkipped = [];
+    return skipped;
+  }
+
+  protected async rateLimit(): Promise<void> {
+    if (this.rateLimitDelayMs > 0) {
+      await sleep(this.rateLimitDelayMs);
+    }
+  }
+
+  protected joinUrl(baseUrl: string, path: string): string {
+    const normalizedBase = baseUrl.replace(/\/+$/, "");
+    const normalizedPath = path.replace(/^\/+/, "");
+    return `${normalizedBase}/${normalizedPath}`;
+  }
+}
+
+// ===== Internal helpers =====
+
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    return (
+      message.includes("fetch") ||
+      message.includes("network") ||
+      message.includes("timeout") ||
+      message.includes("aborted") ||
+      message.includes("econnrefused") ||
+      message.includes("econnreset") ||
+      message.includes("etimedout") ||
+      message.includes("socket")
+    );
+  }
+  return false;
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status >= 500 || status === 429;
+}
+
+function calculateBackoffDelay(attempt: number): number {
+  const exponentialDelay = RETRY_BASE_DELAY_MS * 2 ** attempt;
+  const jitter = Math.random() * 0.25 * exponentialDelay;
+  return Math.min(exponentialDelay + jitter, RETRY_MAX_DELAY_MS);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Rewind an ISO timestamp a few minutes before using it as an upstream query
+ * cursor, so clock skew between this server and the upstream service cannot
+ * hide events stamped just before the cursor was taken. Re-reading the overlap
+ * is idempotent (permission probes only set dirty flags off what they read).
+ */
+export function isoCursorWithSkewBuffer(isoDate: string): string {
+  const d = new Date(isoDate);
+  d.setUTCMinutes(d.getUTCMinutes() - CURSOR_SKEW_BUFFER_MINUTES);
+  return d.toISOString();
+}
+
+const CURSOR_SKEW_BUFFER_MINUTES = 5;
+
+/**
+ * The audit cursor a probe stores for its successor. Atlassian audit
+ * pipelines ingest asynchronously — a record can become queryable minutes
+ * after its `created` stamp. A cursor taken at pass wall-clock slides past
+ * records still in flight (each pass, including manual re-triggers, advances
+ * it), permanently losing e.g. an access revocation until the daily full
+ * reconcile. Trailing the cursor keeps any record whose ingestion lag is
+ * under the allowance inside a later query window no matter how frequently
+ * passes run; re-read records only re-flag idempotent dirty bits.
+ */
+export function trailingAuditCursor(nowIso: string): string {
+  const d = new Date(nowIso);
+  d.setUTCMinutes(d.getUTCMinutes() - AUDIT_INGESTION_LAG_ALLOWANCE_MINUTES);
+  return d.toISOString();
+}
+
+const AUDIT_INGESTION_LAG_ALLOWANCE_MINUTES = 15;
+
+/**
+ * Extract a meaningful error message from unknown errors.
+ * Handles plain objects thrown by libraries like confluence.js,
+ * which extract Axios response data instead of wrapping in Error instances.
+ */
+export function extractErrorMessage(error: unknown): string {
+  // Google/gaxios errors carry the actionable detail (e.g. reason
+  // "cannotDownloadAbusiveFile" / "insufficientFilePermissions") in the response
+  // body, not in the generic "Request failed with status code 403" message.
+  const googleApiError = extractGoogleApiError(error);
+  if (googleApiError) {
+    return googleApiError;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error !== null && typeof error === "object") {
+    const obj = error as Record<string, unknown>;
+    if (typeof obj.message === "string") {
+      return obj.message;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return "[Unknown error object]";
+    }
+  }
+  return String(error);
+}
+
+/**
+ * Pull the `code`/`reason`/`message` out of a Google API (gaxios) error body,
+ * shaped `{ response: { data: { error: { code, message, errors: [{ reason }] }}}}`.
+ * Returns e.g. "403 cannotDownloadAbusiveFile: <message>", or null if the error
+ * is not that shape.
+ */
+function extractGoogleApiError(error: unknown): string | null {
+  if (error === null || typeof error !== "object") return null;
+  const data = (error as { response?: { data?: unknown } }).response?.data;
+  if (data === null || typeof data !== "object") return null;
+  const apiError = (data as { error?: unknown }).error;
+  if (apiError === null || typeof apiError !== "object") return null;
+
+  const { code, message, errors } = apiError as {
+    code?: unknown;
+    message?: unknown;
+    errors?: unknown;
+  };
+  const firstReason =
+    Array.isArray(errors) && typeof errors[0]?.reason === "string"
+      ? (errors[0].reason as string)
+      : undefined;
+
+  const prefix = [
+    typeof code === "number" ? String(code) : undefined,
+    firstReason,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const detail = typeof message === "string" ? message : "";
+  if (!prefix && !detail) return null;
+  return prefix && detail ? `${prefix}: ${detail}` : prefix || detail;
+}

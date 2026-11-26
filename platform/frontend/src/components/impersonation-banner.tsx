@@ -1,0 +1,60 @@
+"use client";
+
+import { E2eTestId } from "@archestra/shared";
+import { useEffect, useState } from "react";
+import { useSession } from "@/lib/auth/auth.query";
+import {
+  IMPERSONATION_RETURN_MARGIN_MS,
+  useStopImpersonating,
+} from "@/lib/impersonation.query";
+import { Button } from "./ui/button";
+
+export function ImpersonationBanner() {
+  const { data: session } = useSession();
+  const { mutate: stopImpersonating, isPending } = useStopImpersonating();
+  const expiresAt = session?.session.impersonatedBy
+    ? new Date(session.session.expiresAt).getTime()
+    : null;
+
+  // The end is a time of day on the reader's clock, so it is filled in on
+  // their device, not on the server that rendered the page.
+  const [until, setUntil] = useState<string | null>(null);
+  useEffect(() => {
+    setUntil(
+      expiresAt === null || Number.isNaN(expiresAt)
+        ? null
+        : new Date(
+            expiresAt - IMPERSONATION_RETURN_MARGIN_MS,
+          ).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    );
+  }, [expiresAt]);
+
+  if (!session?.session.impersonatedBy) {
+    return null;
+  }
+
+  const userName = session.user.name || session.user.email;
+
+  return (
+    <div
+      data-testid={E2eTestId.ImpersonationBanner}
+      className="bg-amber-100 dark:bg-amber-900/40 border-b border-amber-300 dark:border-amber-800 text-amber-900 dark:text-amber-100 px-4 py-2 flex items-center justify-between gap-4"
+    >
+      <span className="text-sm font-medium">
+        <span>Viewing as </span>
+        <strong>{userName}</strong>
+        {until ? <span>{` until ${until}`}</span> : null}
+        <span>. Permissions reflect that user&apos;s role.</span>
+      </span>
+      <Button
+        size="sm"
+        variant="outline"
+        data-testid={E2eTestId.ImpersonationStopButton}
+        onClick={() => stopImpersonating()}
+        disabled={isPending}
+      >
+        Return to admin
+      </Button>
+    </div>
+  );
+}

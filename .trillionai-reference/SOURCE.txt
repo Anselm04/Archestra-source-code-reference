@@ -1,0 +1,5 @@
+Upstream: https://github.com/archestra-ai/archestra
+Revision: 99dbdf8ef7558893d51dd78b3f2a006b5cdeda63
+Source snapshot; upstream automation, unsupported entries, and restricted enterprise code where applicable excluded. Original licences retained. Commercial reuse requires licence audit.
+Copied files: 11283
+Excluded files: 772

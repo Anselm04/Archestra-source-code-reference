@@ -1,0 +1,122 @@
+import { calculateCostSavings } from "@archestra/shared";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { formatCurrency } from "@/lib/utils/format-currency";
+import { formatCost } from "./cost";
+
+export function Savings({
+  cost,
+  baselineCost,
+  format = "percent",
+  tooltip = "never",
+  className,
+  variant = "default",
+  baselineModel,
+  actualModel,
+  precision = "exact",
+}: {
+  cost: string;
+  baselineCost: string;
+  format?: "percent" | "number";
+  tooltip?: "never" | "always" | "hover";
+  className?: string;
+  variant?: "default" | "session" | "interaction";
+  /** The model the request asked for */
+  baselineModel?: string | null;
+  /** The model the request actually ran on */
+  actualModel?: string | null;
+  /** `exact` keeps sub-cent digits; `cents` rounds to two decimals. */
+  precision?: "exact" | "cents";
+}) {
+  const formatAmount = precision === "cents" ? formatCurrency : formatCost;
+  const {
+    modelSwapSavings,
+    totalSavings,
+    estimatedCost,
+    actualCost,
+    savingsPercent: savingsPercentNum,
+  } = calculateCostSavings({ cost, baselineCost });
+  const savingsPercent =
+    savingsPercentNum % 1 === 0
+      ? savingsPercentNum.toFixed(0)
+      : savingsPercentNum.toFixed(1);
+
+  const colorClass =
+    totalSavings === 0
+      ? "text-muted-foreground"
+      : totalSavings > 0
+        ? "text-green-600 dark:text-green-400"
+        : "text-red-600 dark:text-red-400";
+
+  let content = null;
+  if (format === "percent") {
+    content = totalSavings > 0 ? `-${savingsPercent}%` : `${savingsPercent}%`;
+  } else if (format === "number") {
+    content = totalSavings === 0 ? "$0" : formatAmount(Math.abs(totalSavings));
+  }
+
+  if (tooltip !== "never") {
+    const isSession = variant === "session";
+
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className={`${className || ""} cursor-default`}>
+            {formatAmount(actualCost)}
+            {savingsPercentNum >= 0.05 && (
+              <span className="text-green-600 dark:text-green-400">
+                {" "}
+                (-{savingsPercent}%)
+              </span>
+            )}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          <div className="space-y-0.5 text-sm">
+            <div className="space-y-0.5">
+              {totalSavings > 0 ? (
+                <>
+                  <div>Estimated Cost: {formatAmount(estimatedCost)}</div>
+                  <div>Actual Cost: {formatAmount(actualCost)}</div>
+                  <div className="font-semibold">
+                    Savings: {formatAmount(totalSavings)}
+                    {savingsPercentNum >= 0.05 && ` (-${savingsPercent}%)`}
+                  </div>
+                </>
+              ) : (
+                <div>Cost: {formatAmount(actualCost)}</div>
+              )}
+            </div>
+
+            {isSession ? (
+              <div className="border-t border-border pt-1 mt-1 text-muted-foreground">
+                Check session logs to see the cost and savings breakdown.
+              </div>
+            ) : (
+              <div className="border-t border-border pt-1 mt-1 space-y-0.5 text-muted-foreground">
+                {/* Only historical interactions can carry a model swap: the
+                    rules that produced one are gone, so the line renders for
+                    that history and is absent otherwise. */}
+                {modelSwapSavings > 0 && (
+                  <div>
+                    Model swap: -{formatAmount(modelSwapSavings)}
+                    {baselineModel &&
+                    actualModel &&
+                    baselineModel !== actualModel
+                      ? ` (${baselineModel} \u2192 ${actualModel})`
+                      : ""}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  return <span className={`${colorClass} ${className || ""}`}>{content}</span>;
+}

@@ -1,0 +1,383 @@
+import { OAUTH_GRANT_TYPE } from "@archestra/shared";
+import Fastify, { type FastifyInstance } from "fastify";
+import {
+  serializerCompiler,
+  validatorCompiler,
+  type ZodTypeProvider,
+} from "fastify-type-provider-zod";
+import config, { parseTrustProxy } from "@/config";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import oauthServerRoutes from "./oauth-server";
+
+describe("OAuth Server - Well-Known Endpoints", () => {
+  let app: FastifyInstance;
+
+  beforeEach(async () => {
+    app = Fastify().withTypeProvider<ZodTypeProvider>();
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+    await app.register(oauthServerRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  describe("GET /.well-known/oauth-protected-resource/*", () => {
+    test("returns correct metadata with dynamic Host-based URLs", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-protected-resource/v1/mcp/some-profile-id",
+        headers: { host: "localhost:9000" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+
+      expect(body.resource).toBe(
+        "http://localhost:9000/v1/mcp/some-profile-id",
+      );
+      expect(body.authorization_servers).toEqual([config.frontendBaseUrl]);
+      const authorization = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-authorization-server",
+      });
+      expect(body.authorization_servers[0]).toBe(authorization.json().issuer);
+      expect(body.scopes_supported).toEqual(["mcp"]);
+      expect(body.bearer_methods_supported).toEqual(["header"]);
+    });
+
+    test("uses Docker host when Host header is from Docker", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-protected-resource/v1/mcp/test-id",
+        headers: { host: "host.docker.internal:9000" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+
+      expect(body.resource).toBe(
+        "http://host.docker.internal:9000/v1/mcp/test-id",
+      );
+      expect(body.authorization_servers).toEqual([config.frontendBaseUrl]);
+    });
+
+    test("ignores forwarded public origin when proxy trust is disabled", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-protected-resource/v1/mcp/test-id",
+        headers: {
+          host: "localhost:9000",
+          "x-forwarded-host": "gateway.example.com",
+          "x-forwarded-proto": "https",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+
+      expect(body.resource).toBe("http://localhost:9000/v1/mcp/test-id");
+      expect(body.authorization_servers).toEqual([config.frontendBaseUrl]);
+    });
+
+    test("returns app-connector metadata", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-protected-resource/api/mcp/app/11111111-1111-1111-1111-111111111111",
+        headers: { host: "localhost:9000" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().resource).toBe(
+        "http://localhost:9000/api/mcp/app/11111111-1111-1111-1111-111111111111",
+      );
+    });
+
+    test("strips a query string from resource and resolves an external IdP by profile slug", async ({
+      makeAgent,
+      makeIdentityProvider,
+      makeOrganization,
+    }) => {
+      const org = await makeOrganization();
+      const issuer = "https://idp.example.com/realms/test";
+      const identityProvider = await makeIdentityProvider(org.id, { issuer });
+      const agent = await makeAgent({
+        organizationId: org.id,
+        agentType: "mcp_gateway",
+        identityProviderId: identityProvider.id,
+      });
+      const metadataUrl = new URL(
+        `http://localhost:9000/.well-known/oauth-protected-resource/v1/mcp/${agent.slug}`,
+      );
+      metadataUrl.searchParams.set("client_hint", "query-secret-value");
+
+      const response = await app.inject({
+        method: "GET",
+        url: `${metadataUrl.pathname}${metadataUrl.search}`,
+        headers: { host: "localhost:9000" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body.resource).toBe(`http://localhost:9000/v1/mcp/${agent.slug}`);
+      expect(body.resource).not.toContain("?");
+      expect(JSON.stringify(body)).not.toContain("query-secret-value");
+      expect(body.authorization_servers).toEqual([
+        config.frontendBaseUrl,
+        issuer,
+      ]);
+    });
+  });
+
+  describe("GET /.well-known/oauth-authorization-server", () => {
+    test("returns correct OAuth 2.1 authorization server metadata", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-authorization-server",
+        headers: { host: "localhost:9000" },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+
+      // issuer and authorization_endpoint use the frontend base URL
+      // (browser-facing). Derive the expected values from config so the test
+      // is independent of a local .env that points the frontend origin at a
+      // tunnel domain.
+      const browserBaseUrl = config.frontendBaseUrl;
+      expect(body.issuer).toBe(browserBaseUrl);
+      // RFC 9207 regression: better-auth strips any trailing slash from the
+      // `iss` authorization-response parameter, so a slashed metadata issuer
+      // makes strict clients abort with an issuer mismatch.
+      expect(body.issuer).not.toMatch(/\/$/);
+      expect(body.authorization_endpoint).toBe(
+        `${browserBaseUrl}/api/auth/oauth2/authorize`,
+      );
+      // token, registration, and jwks use the request Host (server-to-server)
+      expect(body.token_endpoint).toBe(
+        "http://localhost:9000/api/auth/oauth2/token",
+      );
+      expect(body.registration_endpoint).toBe(
+        "http://localhost:9000/api/auth/oauth2/register",
+      );
+      expect(body.jwks_uri).toBe("http://localhost:9000/api/auth/jwks");
+      expect(body.response_types_supported).toEqual(["code"]);
+      expect(body.grant_types_supported).toEqual([
+        "authorization_code",
+        "refresh_token",
+        "client_credentials",
+        OAUTH_GRANT_TYPE.JwtBearer,
+      ]);
+      expect(body.code_challenge_methods_supported).toEqual(["S256"]);
+      expect(body.token_endpoint_auth_methods_supported).toContain("none");
+    });
+
+    test("includes all required OAuth 2.1 metadata fields", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-authorization-server",
+        headers: { host: "localhost:9000" },
+      });
+
+      const body = response.json();
+      const requiredFields = [
+        "issuer",
+        "authorization_endpoint",
+        "token_endpoint",
+        "registration_endpoint",
+        "jwks_uri",
+        "response_types_supported",
+        "grant_types_supported",
+        "code_challenge_methods_supported",
+        "token_endpoint_auth_methods_supported",
+        "scopes_supported",
+      ];
+
+      for (const field of requiredFields) {
+        expect(body).toHaveProperty(field);
+      }
+    });
+
+    test("uses dynamic Host header for Docker networking", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-authorization-server",
+        headers: { host: "host.docker.internal:9000" },
+      });
+
+      const body = response.json();
+
+      // issuer and authorization_endpoint use the frontend base URL
+      // (browser-facing) regardless of the Host header. Derive from config so
+      // the test is independent of a local .env that points the frontend origin
+      // at a tunnel domain.
+      const browserBaseUrl = config.frontendBaseUrl;
+      expect(body.issuer).toBe(browserBaseUrl);
+      expect(body.issuer).not.toMatch(/\/$/);
+      expect(body.authorization_endpoint).toBe(
+        `${browserBaseUrl}/api/auth/oauth2/authorize`,
+      );
+      // token endpoint uses the request Host (server-to-server)
+      expect(body.token_endpoint).toBe(
+        "http://host.docker.internal:9000/api/auth/oauth2/token",
+      );
+    });
+
+    test("ignores forwarded public origin for server-to-server endpoints when proxy trust is disabled", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/.well-known/oauth-authorization-server",
+        headers: {
+          host: "localhost:9000",
+          "x-forwarded-host": "gateway.example.com",
+          "x-forwarded-proto": "https",
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+
+      expect(body.token_endpoint).toBe(
+        "http://localhost:9000/api/auth/oauth2/token",
+      );
+      expect(body.registration_endpoint).toBe(
+        "http://localhost:9000/api/auth/oauth2/register",
+      );
+      expect(body.jwks_uri).toBe("http://localhost:9000/api/auth/jwks");
+    });
+
+    describe("reverse proxy (trustProxy enabled)", () => {
+      let proxyApp: FastifyInstance;
+      const originalEnv = process.env;
+
+      beforeEach(async () => {
+        process.env = {
+          ...originalEnv,
+          ARCHESTRA_TRUST_PROXY: "true",
+          // Public origins used by tests in this describe.
+          ARCHESTRA_API_BASE_URL:
+            "https://gateway.example.com,https://archestra.example.com",
+        };
+        proxyApp = Fastify({
+          trustProxy: parseTrustProxy(process.env.ARCHESTRA_TRUST_PROXY),
+        }).withTypeProvider<ZodTypeProvider>();
+        proxyApp.setValidatorCompiler(validatorCompiler);
+        proxyApp.setSerializerCompiler(serializerCompiler);
+        await proxyApp.register(oauthServerRoutes);
+      });
+
+      afterEach(async () => {
+        process.env = originalEnv;
+        await proxyApp.close();
+      });
+
+      test("uses https:// for token_endpoint when X-Forwarded-Proto is https", async () => {
+        const response = await proxyApp.inject({
+          method: "GET",
+          url: "/.well-known/oauth-authorization-server",
+          headers: {
+            host: "archestra.example.com",
+            "x-forwarded-proto": "https",
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json();
+
+        expect(body.token_endpoint).toMatch(/^https:\/\//);
+        expect(body.registration_endpoint).toMatch(/^https:\/\//);
+        expect(body.jwks_uri).toMatch(/^https:\/\//);
+      });
+
+      test("uses the forwarded protocol for the resource without changing the issuer", async () => {
+        const response = await proxyApp.inject({
+          method: "GET",
+          url: "/.well-known/oauth-protected-resource/v1/mcp/some-profile-id",
+          headers: {
+            host: "archestra.example.com",
+            "x-forwarded-proto": "https",
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json();
+
+        expect(body.resource).toMatch(/^https:\/\//);
+        expect(body.authorization_servers).toEqual([config.frontendBaseUrl]);
+      });
+
+      test("prefers forwarded public origin over internal upstream host", async () => {
+        const response = await proxyApp.inject({
+          method: "GET",
+          url: "/.well-known/oauth-protected-resource/v1/mcp/test-id",
+          headers: {
+            host: "localhost:9000",
+            "x-forwarded-host": "gateway.example.com",
+            "x-forwarded-proto": "https",
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json();
+
+        expect(body.resource).toBe(
+          "https://gateway.example.com/v1/mcp/test-id",
+        );
+        expect(body.authorization_servers).toEqual([config.frontendBaseUrl]);
+      });
+
+      test("prefers forwarded public origin for server-to-server endpoints", async () => {
+        const response = await proxyApp.inject({
+          method: "GET",
+          url: "/.well-known/oauth-authorization-server",
+          headers: {
+            host: "localhost:9000",
+            "x-forwarded-host": "gateway.example.com",
+            "x-forwarded-proto": "https",
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json();
+
+        expect(body.token_endpoint).toBe(
+          "https://gateway.example.com/api/auth/oauth2/token",
+        );
+        expect(body.registration_endpoint).toBe(
+          "https://gateway.example.com/api/auth/oauth2/register",
+        );
+        expect(body.jwks_uri).toBe("https://gateway.example.com/api/auth/jwks");
+      });
+
+      // A layer-4 proxy route cannot set X-Forwarded-Proto, so the scheme has
+      // to come from the operator's own ARCHESTRA_API_BASE_URL entry for this
+      // host. Advertising http here breaks the client's OAuth handshake.
+      test("keeps https:// for a configured https host when X-Forwarded-Proto is not set", async () => {
+        const response = await proxyApp.inject({
+          method: "GET",
+          url: "/.well-known/oauth-authorization-server",
+          headers: { host: "archestra.example.com" },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json();
+
+        expect(body.token_endpoint).toMatch(/^https:\/\//);
+      });
+
+      test("falls back to http:// for a host in no configured public URL", async () => {
+        const response = await proxyApp.inject({
+          method: "GET",
+          url: "/.well-known/oauth-authorization-server",
+          headers: { host: "unconfigured.example.com" },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json();
+
+        expect(body.token_endpoint).toMatch(/^http:\/\//);
+      });
+    });
+  });
+});

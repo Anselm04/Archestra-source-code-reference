@@ -1,0 +1,79 @@
+import { sql } from "drizzle-orm";
+import {
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
+import type { TaskStatus, TaskType } from "@/types";
+
+const tasksTable = pgTable(
+  "tasks",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    taskType: text("task_type").$type<TaskType>().notNull(),
+    payload: jsonb("payload")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    status: text("status").$type<TaskStatus>().notNull().default("pending"),
+    attempt: integer("attempt").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(5),
+    scheduledFor: timestamp("scheduled_for", { mode: "date" })
+      .notNull()
+      .defaultNow(),
+    startedAt: timestamp("started_at", { mode: "date" }),
+    // Liveness of the executing worker, renewed every poll tick while the task
+    // is in flight. The stuck sweep keys off this (falling back to started_at
+    // for rows claimed before the column existed): a stale heartbeat means the
+    // worker died — started_at age alone cannot tell a crash from a long task.
+    heartbeatAt: timestamp("heartbeat_at", { mode: "date" }),
+    completedAt: timestamp("completed_at", { mode: "date" }),
+    lastError: text("last_error"),
+    periodic: boolean("periodic").notNull().default(false),
+    createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("tasks_dequeue_idx").on(
+      table.taskType,
+      table.status,
+      table.scheduledFor,
+    ),
+    uniqueIndex("tasks_unique_periodic_idx")
+      .on(table.taskType)
+      .where(
+        sql`${table.periodic} = true AND ${table.status} IN ('pending', 'processing')`,
+      ),
+    // Lets the connector-run reaper ask "does this run still have live embedding
+    // work?" as an index lookup instead of a JSONB filter over every pending/
+    // processing batch_embedding task. Partial + expression: only in-flight
+    // embedding tasks are indexed, keyed by the connectorRunId in their payload.
+    index("tasks_batch_embedding_connector_run_idx")
+      .on(sql`(${table.payload} ->> 'connectorRunId')`)
+      .where(
+        sql`${table.taskType} = 'batch_embedding' AND ${table.status} IN ('pending', 'processing')`,
+      ),
+    uniqueIndex("tasks_openappa_github_sync_single_flight_idx")
+      .on(sql`(${table.payload} ->> 'organizationId')`)
+      .where(
+        sql`${table.taskType} = 'openappa_github_sync' AND ${table.status} IN ('pending', 'processing')`,
+      ),
+    uniqueIndex("tasks_auto_routing_fit_single_flight_idx")
+      .on(sql`(${table.payload} ->> 'routerId')`)
+      .where(
+        sql`${table.taskType} = 'auto_routing_fit' AND ${table.status} IN ('pending', 'processing')`,
+      ),
+    uniqueIndex("tasks_plugin_github_sync_single_flight_idx")
+      .on(sql`(${table.payload} ->> 'pluginId')`)
+      .where(
+        sql`${table.taskType} = 'plugin_github_sync' AND ${table.status} IN ('pending', 'processing')`,
+      ),
+  ],
+);
+
+export default tasksTable;

@@ -1,0 +1,83 @@
+name: Load MCP Server Base Image
+description: |
+  Loads the MCP server base Docker image from a registry or a co-located artifact.
+
+inputs:
+  source:
+    description: "Where to load the image from: registry or artifact"
+    required: false
+    default: artifact
+  image-tag:
+    description: "MCP server base image tag to pull or report"
+    required: false
+    default: ""
+  artifact-name:
+    description: "Artifact name to download when source=artifact"
+    required: false
+    default: mcp-server-base-docker-image
+  wait-timeout-seconds:
+    description: |
+      When source=artifact, wait up to this many seconds for the artifact to be uploaded
+      (e.g. by a build job running in parallel with the caller). Requires the calling job
+      to have the actions:read permission. 0 = artifact must already exist.
+    required: false
+    default: "0"
+
+outputs:
+  image-tag:
+    description: "The resolved MCP server base image tag"
+    value: ${{ steps.resolve-tag.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Pull MCP server base image from registry
+      if: ${{ inputs.source == 'registry' }}
+      shell: bash
+      env:
+        MCP_SERVER_BASE_IMAGE_TAG: ${{ inputs.image-tag }}
+      run: docker pull "${MCP_SERVER_BASE_IMAGE_TAG}"
+
+    - name: Wait for MCP server base image artifact
+      if: ${{ inputs.source == 'artifact' && inputs.wait-timeout-seconds != '0' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        WAIT_TIMEOUT_SECONDS: ${{ inputs.wait-timeout-seconds }}
+      run: |
+        deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
+        while true; do
+          if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" --paginate \
+              --jq '.artifacts[].name' | grep -qxF "${ARTIFACT_NAME}"; then
+            echo "Artifact ${ARTIFACT_NAME} is available"
+            break
+          fi
+          if [ "$(date +%s)" -ge "${deadline}" ]; then
+            echo "Timed out waiting for artifact ${ARTIFACT_NAME} to be uploaded"
+            exit 1
+          fi
+          echo "Artifact ${ARTIFACT_NAME} not uploaded yet, retrying in 15s..."
+          sleep 15
+        done
+
+    - name: Download MCP server base image artifact
+      if: ${{ inputs.source == 'artifact' }}
+      uses: $/.github/actions/github-download-artifact
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: /tmp
+
+    - name: Load MCP server base Docker image
+      if: ${{ inputs.source == 'artifact' }}
+      shell: bash
+      run: |
+        gunzip -c /tmp/mcp-server-base-image.tar.gz | docker load
+
+    - name: Resolve MCP server base image tag
+      id: resolve-tag
+      shell: bash
+      env:
+        MCP_SERVER_BASE_IMAGE_TAG: ${{ inputs.image-tag }}
+      run: |
+        echo "tag=${MCP_SERVER_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"

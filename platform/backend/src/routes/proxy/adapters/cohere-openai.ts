@@ -1,0 +1,307 @@
+import type {
+  Cohere,
+  CommonToolCall,
+  LLMProvider,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  OpenAi,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import { cohereAdapterFactory } from "./cohere";
+import {
+  type CohereOpenaiContext,
+  cohereResponseToOpenai,
+  mapCohereFinishReason,
+} from "./cohere-openai-translator";
+import { formatOpenAiChunkSse, toOpenAiStreamUsage } from "./openai-sse-chunk";
+
+type CohereRequest = Cohere.Types.ChatRequest;
+type CohereResponse = Cohere.Types.ChatResponse;
+type CohereMessages = Cohere.Types.ChatRequest["messages"];
+type CohereHeaders = Cohere.Types.ChatHeaders;
+type CohereStreamChunk = Parameters<
+  ReturnType<typeof cohereAdapterFactory.createStreamAdapter>["processChunk"]
+>[0];
+
+class CohereOpenaiResponseAdapter
+  implements LLMResponseAdapter<CohereResponse>
+{
+  readonly provider = "cohere" as const;
+  private inner: LLMResponseAdapter<CohereResponse>;
+  // The inner (logged-shape) response after a dispatch-mode repair, so
+  // getLoggedResponse persists the rewritten turn rather than the original.
+  private rewrittenInner: CohereResponse | null = null;
+  private ctx: CohereOpenaiContext;
+
+  constructor(response: CohereResponse, ctx: CohereOpenaiContext) {
+    this.inner = cohereAdapterFactory.createResponseAdapter(response);
+    this.ctx = ctx;
+  }
+
+  getId(): string {
+    return this.inner.getId();
+  }
+
+  getModel(): string {
+    return this.ctx.requestedModel;
+  }
+
+  getText(): string {
+    return this.inner.getText();
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    return this.inner.getToolCalls();
+  }
+
+  hasToolCalls(): boolean {
+    return this.inner.hasToolCalls();
+  }
+
+  getUsage(): UsageView {
+    return this.inner.getUsage();
+  }
+
+  getOriginalResponse(): CohereResponse {
+    return cohereResponseToOpenai(
+      this.inner.getOriginalResponse(),
+      this.ctx,
+    ) as unknown as CohereResponse;
+  }
+
+  getLoggedResponse(): CohereResponse {
+    return this.rewrittenInner ?? this.inner.getOriginalResponse();
+  }
+
+  getFinishReasons(): string[] {
+    return this.inner.getFinishReasons();
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): CohereResponse {
+    // Rewrite in the inner wire shape (which is what gets logged), then
+    // translate for the client exactly as getOriginalResponse does. If the
+    // inner adapter cannot rewrite, hand back the untouched translation — the
+    // handler only reaches here when the planner produced a rewrite, and a
+    // silent no-op would strand the client with a call it cannot execute; but
+    // every inner adapter this wraps does implement it.
+    const inner =
+      this.inner.withRewrittenToolCalls?.(toolCalls) ??
+      this.inner.getOriginalResponse();
+    this.rewrittenInner = inner;
+    return cohereResponseToOpenai(inner, this.ctx) as unknown as CohereResponse;
+  }
+
+  withReplacedText(text: string): CohereResponse {
+    // Replaced in the inner wire shape (which is what gets logged), then
+    // translated for the client as getOriginalResponse does.
+    const inner = this.inner.withReplacedText?.(text);
+    if (!inner) {
+      throw new Error("Wrapped response adapter cannot replace response text");
+    }
+    this.rewrittenInner = inner;
+    return cohereResponseToOpenai(inner, this.ctx) as unknown as CohereResponse;
+  }
+
+  toRefusalResponse(
+    refusalMessage: string,
+    contentMessage: string,
+  ): CohereResponse {
+    // Stores the refusal in the inner Cohere format for interaction logging.
+    // This prevents logging the blocked tool call payload.
+    this.rewrittenInner = this.inner.toRefusalResponse(
+      refusalMessage,
+      contentMessage,
+    );
+    const usage = this.inner.getUsage();
+    const response: OpenAi.Types.ChatCompletionsResponse = {
+      id: this.ctx.chatcmplId,
+      object: "chat.completion",
+      created: this.ctx.createdUnix,
+      model: this.ctx.requestedModel,
+      choices: [
+        {
+          index: 0,
+          logprobs: null,
+          finish_reason: "stop",
+          message: { role: "assistant", content: contentMessage },
+        },
+      ],
+      usage: {
+        prompt_tokens: usage.inputTokens,
+        completion_tokens: usage.outputTokens,
+        total_tokens: usage.inputTokens + usage.outputTokens,
+      },
+    };
+    return response as unknown as CohereResponse;
+  }
+}
+
+class CohereOpenaiStreamAdapter
+  implements LLMStreamAdapter<CohereStreamChunk, CohereResponse>
+{
+  readonly provider = "cohere" as const;
+  private inner: LLMStreamAdapter<CohereStreamChunk, CohereResponse>;
+  private ctx: CohereOpenaiContext;
+  // Set when a policy refusal replaced the response, so formatEndSSE finishes as
+  // "stop" without reconstructing the inner response just to read one field.
+  private responseReplacedWithText = false;
+
+  constructor(ctx: CohereOpenaiContext) {
+    this.inner = cohereAdapterFactory.createStreamAdapter();
+    this.ctx = ctx;
+  }
+
+  get state(): StreamAccumulatorState {
+    return this.inner.state;
+  }
+
+  processChunk(chunk: CohereStreamChunk) {
+    const innerResult = this.inner.processChunk(chunk);
+    return { ...innerResult, sseData: this.toOpenaiSse(chunk) };
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    };
+  }
+
+  formatTextDeltaSSE(text: string): string {
+    return this.formatChunk({ delta: { content: text }, finishReason: null });
+  }
+
+  getRawToolCallEvents(): string[] {
+    return [];
+  }
+
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // The inner (Cohere-shaped) read is a side effect only — it marks the calls
+    // as handed over so inner.toProviderResponse() names them — while the wire
+    // event below is the OpenAI-shaped one this surface speaks.
+    this.inner.formatToolCallsSSE?.(toolCalls);
+    return [
+      this.formatChunk({
+        delta: {
+          tool_calls: toolCalls.map((toolCall, index) => ({
+            index,
+            id: toolCall.id,
+            type: "function" as const,
+            function: { name: toolCall.name, arguments: toolCall.arguments },
+          })),
+        },
+        finishReason: null,
+      }),
+    ];
+  }
+
+  formatCompleteTextSSE(text: string): string[] {
+    // Mark the inner adapter as refusal-replaced (side effect only; its
+    // Cohere-format events are unused here) so it persists the refusal rather
+    // than the blocked calls. The finish reason is emitted once, by formatEndSSE.
+    this.responseReplacedWithText = true;
+    this.inner.formatCompleteTextSSE(text);
+    return [
+      this.formatChunk({
+        delta: { role: "assistant", content: text },
+        finishReason: null,
+      }),
+    ];
+  }
+
+  getOpenAiFinishReason(): string {
+    return this.responseReplacedWithText
+      ? "stop"
+      : mapCohereFinishReason(this.inner.state.stopReason);
+  }
+
+  formatEndSSE(): string {
+    return `${this.formatChunk({
+      delta: {},
+      finishReason: this.getOpenAiFinishReason(),
+      usage: this.state.usage,
+    })}data: [DONE]\n\n`;
+  }
+
+  toProviderResponse(): CohereResponse {
+    return this.inner.toProviderResponse();
+  }
+
+  private toOpenaiSse(chunk: CohereStreamChunk): string | null {
+    if (chunk.type === "message-start") {
+      return this.formatChunk({
+        delta: { role: "assistant" },
+        finishReason: null,
+      });
+    }
+    if (chunk.type === "content-delta") {
+      const text = getNestedString(chunk, [
+        "delta",
+        "message",
+        "content",
+        "text",
+      ]);
+      return text
+        ? this.formatChunk({ delta: { content: text }, finishReason: null })
+        : null;
+    }
+    return null;
+  }
+
+  private formatChunk(params: {
+    delta: Record<string, unknown>;
+    finishReason: string | null;
+    /** Only the final chunk passes this; delta chunks must stay usage-free. */
+    usage?: UsageView | null;
+  }): string {
+    return formatOpenAiChunkSse({
+      id: this.ctx.chatcmplId,
+      created: this.ctx.createdUnix,
+      model: this.ctx.requestedModel,
+      delta: params.delta,
+      finishReason: params.finishReason,
+      usage: toOpenAiStreamUsage(params.usage),
+    });
+  }
+}
+
+export function makeCohereOpenaiAdapterFactory(
+  ctx: CohereOpenaiContext,
+): LLMProvider<
+  CohereRequest,
+  CohereResponse,
+  CohereMessages,
+  CohereStreamChunk,
+  CohereHeaders
+> {
+  return {
+    ...cohereAdapterFactory,
+    translatesWireFormat: true,
+    extractApiKey(headers) {
+      const authorization = (headers as Record<string, unknown>).authorization;
+      if (typeof authorization === "string") {
+        return authorization.replace(/^Bearer\s+/i, "");
+      }
+      return cohereAdapterFactory.extractApiKey(headers);
+    },
+    createResponseAdapter(response) {
+      return new CohereOpenaiResponseAdapter(response, ctx);
+    },
+    createStreamAdapter() {
+      return new CohereOpenaiStreamAdapter(ctx);
+    },
+  };
+}
+
+function getNestedString(value: unknown, path: string[]): string | null {
+  let current = value;
+  for (const segment of path) {
+    if (typeof current !== "object" || current === null) return null;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return typeof current === "string" ? current : null;
+}

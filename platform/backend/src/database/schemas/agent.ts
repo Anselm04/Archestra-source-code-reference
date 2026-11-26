@@ -1,0 +1,425 @@
+import type {
+  GitHubActionsAccess,
+  IncomingEmailSecurityMode,
+  SubagentLoadBalancingConfig,
+} from "@archestra/shared";
+import { type SQL, sql } from "drizzle-orm";
+import {
+  boolean,
+  check,
+  index,
+  integer,
+  jsonb,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
+import type {
+  AgentScope,
+  AgentType,
+  BuiltInAgentConfig,
+  MissingCredentialBehavior,
+  ToolExposureMode,
+} from "@/types/agent";
+import type { AgentActivationSkillMode } from "@/types/agent-activation-skill-policy";
+import type { AgentRuntime } from "@/types/agent-runtime";
+import type { NetworkPolicy } from "@/types/environment";
+import autoRoutersTable from "./auto-router";
+import environmentsTable from "./environment";
+import identityProvidersTable from "./identity-provider";
+import llmProviderApiKeysTable from "./llm-provider-api-key";
+import modelsTable from "./model";
+import modelPoolsTable from "./model-pool";
+import secretsTable from "./secret";
+import serviceAccountsTable from "./service-account";
+import { softDeletablePgTable } from "./soft-deletable-table";
+import usersTable from "./user";
+
+/**
+ * Unified agents table supporting both external profiles and internal agents.
+ *
+ * External profiles (agent_type = 'profile'):
+ *   - API gateway profiles for routing LLM traffic
+ *   - Used for tool assignment and policy enforcement
+ *   - Prompt fields are null
+ *
+ * MCP Gateway (agent_type = 'mcp_gateway'):
+ *   - MCP gateway specific configuration
+ *
+ * LLM Proxy (agent_type = 'llm_proxy'):
+ *   - LLM proxy specific configuration
+ *
+ * Internal agents (agent_type = 'agent'):
+ *   - Chat agents with system/user prompts
+ *   - Can delegate to other internal agents via delegation tools
+ *   - Can be triggered by ChatOps providers
+ */
+const agentsTable = softDeletablePgTable(
+  "agents",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    organizationId: text("organization_id").notNull(),
+    authorId: text("author_id").references(() => usersTable.id, {
+      onDelete: "set null",
+    }),
+    scope: text("scope").$type<AgentScope>().notNull().default("personal"),
+    name: text("name").notNull(),
+    slug: text("slug"),
+    isDefault: boolean("is_default").notNull().default(false),
+    isPersonalGateway: boolean("is_personal_gateway").notNull().default(false),
+    isPersonalProxy: boolean("is_personal_proxy").notNull().default(false),
+    agentType: text("agent_type")
+      .$type<AgentType>()
+      .notNull()
+      .default("mcp_gateway"),
+    // Prompt fields (only used when agentType = 'agent')
+    systemPrompt: text("system_prompt"),
+    // Description (only used when agentType = 'agent')
+    /** Human-readable description of the agent */
+    description: text("description"),
+
+    /** Agent icon: emoji character or base64-encoded image data URL */
+    icon: text("icon"),
+
+    // Incoming email settings (only used when agentType = 'agent')
+    /** Whether incoming email invocation is enabled for this agent */
+    incomingEmailEnabled: boolean("incoming_email_enabled")
+      .notNull()
+      .default(false),
+    /** Security mode for incoming email: 'private', 'internal', or 'public' */
+    incomingEmailSecurityMode: text("incoming_email_security_mode")
+      .$type<IncomingEmailSecurityMode>()
+      .notNull()
+      .default("private"),
+    /** Allowed domain for 'internal' security mode (e.g., 'example.com') */
+    incomingEmailAllowedDomain: text("incoming_email_allowed_domain"),
+
+    // LLM configuration (allows per-agent model selection)
+    /** API key ID for LLM calls */
+    llmApiKeyId: uuid("llm_api_key_id").references(
+      () => llmProviderApiKeysTable.id,
+      {
+        onDelete: "set null",
+      },
+    ),
+    /** @deprecated Superseded by `modelId` (FK). Retained, no longer read or written. */
+    llmModel: text("llm_model"),
+    /** FK to models(id) — the agent's default model. ON DELETE SET NULL. */
+    modelId: uuid("model_id").references(() => modelsTable.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * A model pool as the agent's default model. `llmApiKeyId` and `modelId`
+     * then hold one member, for everything that needs a single model; its
+     * runs and new chats go to the pool. ON DELETE SET NULL.
+     */
+    modelPoolId: uuid("model_pool_id").references(() => modelPoolsTable.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * Runs on this auto router: each session goes to its fast, normal or
+     * smart tier. `llmApiKeyId`, `modelId` and `modelPoolId` are then null.
+     * Never set on Agent Runtime agents. ON DELETE SET NULL.
+     */
+    autoRouterId: uuid("auto_router_id").references(() => autoRoutersTable.id, {
+      onDelete: "set null",
+    }),
+
+    /** Optional Identity Provider for JWKS-based JWT validation on MCP Gateway requests */
+    identityProviderId: text("identity_provider_id").references(
+      () => identityProvidersTable.id,
+      { onDelete: "set null" },
+    ),
+
+    /**
+     * @deprecated Replaced by `agent_identity_bindings`, which ties the
+     * identity to an identity provider. Migration 0641 copied its values
+     * there. Nothing reads or writes it; kept because columns are never
+     * dropped.
+     */
+    entraAgentIdentityId: text("entra_agent_identity_id"),
+
+    /**
+     * Optional Environment whose runtime + egress NetworkPolicy this agent's
+     * code sandbox runs under. Null = the shared/default runtime. The agent's
+     * Dagger engine is provisioned per-environment and inherits the
+     * environment's `networkPolicy` (same machinery as MCP server pods).
+     * ON DELETE SET NULL — deleting an environment falls the agent back to the
+     * default runtime rather than orphaning it.
+     *
+     * The FK is referential only; it does NOT encode org ownership, so the write
+     * path that sets `agents.environment_id` validates the environment belongs to
+     * the agent's organization (via `EnvironmentModel.findByIdForOrganization`)
+     * to prevent cross-tenant binding.
+     */
+    environmentId: uuid("environment_id").references(
+      () => environmentsTable.id,
+      { onDelete: "set null" },
+    ),
+
+    /**
+     * Optional egress policy for this agent's own runtimes (Agent Runtime pods,
+     * their warm pools, and its Code Sandbox engine). Null inherits the
+     * environment's policy, then the organization default. MCP servers keep
+     * following their environment.
+     */
+    networkPolicy: jsonb("network_policy").$type<NetworkPolicy>(),
+
+    /**
+     * Optional dedicated runtime for durable and delegated work. Invocation
+     * surfaces decide whether to use the foreground loop or start a run.
+     */
+    runtime: jsonb("runtime").$type<AgentRuntime>(),
+    /** Bag holding shared credential values declared by runtime. */
+    runtimeSecretId: uuid("runtime_secret_id").references(
+      () => secretsTable.id,
+      { onDelete: "set null" },
+    ),
+
+    /** Allowlist of HTTP header names to forward from gateway requests to downstream MCP servers */
+    passthroughHeaders: text("passthrough_headers").array(),
+
+    /**
+     * MCP gateways only: which GitHub Actions pull-request jobs may trade
+     * their OIDC token for a token on this gateway that acts as the pull
+     * request's author. Null turns the exchange off.
+     */
+    githubActionsAccess: jsonb(
+      "github_actions_access",
+    ).$type<GitHubActionsAccess>(),
+
+    /** Whether tools/list exposes the full tool menu or only meta-discovery tools */
+    toolExposureMode: text("tool_exposure_mode")
+      .$type<ToolExposureMode>()
+      .notNull()
+      .default("search_and_run_only"),
+
+    /**
+     * How a shared agent behaves for a caller who has no usable connection to
+     * one of the MCP servers its tools come from — the case where an agent is
+     * shared org-wide but one of its servers is only connected personally by
+     * its author. `allow` (the default) preserves the historical behavior: the
+     * caller starts the conversation normally and only hits an error when a
+     * tool from the unconnected server runs. `warn` and `block` move that
+     * discovery to conversation start; `block` refuses the turn outright.
+     *
+     * Only meaningful for agents with explicitly assigned tools — under
+     * `accessAllTools` ("Auto") every caller resolves their own tools, so
+     * there is nothing to be missing.
+     */
+    missingCredentialBehavior: text("missing_credential_behavior")
+      .$type<MissingCredentialBehavior>()
+      .notNull()
+      .default("allow"),
+
+    /**
+     * "Auto" tool mode (vs "Custom"): whether search_tools/run_tool may
+     * dynamically discover and run tools the calling user can access (MCP
+     * catalog tools and knowledge sources) beyond the agent's assigned set.
+     * Nothing is assigned to the agent; the MCP server's default-credential
+     * policy decides which credential each call uses. This per-agent flag is
+     * the sole gate for dynamic tool access.
+     */
+    accessAllTools: boolean("access_all_tools").notNull().default(false),
+
+    /**
+     * "Auto" skill mode (vs "Custom"): whether the gateway's `skill://`
+     * resource surface exposes every org-scoped skill visible in this agent's
+     * environment (minus `agent_excluded_skills`) instead of only the skills
+     * explicitly assigned in `agent_skills`. Org scope only — team and personal
+     * skills never flow through Auto and must be Custom-assigned.
+     */
+    accessAllSkills: boolean("access_all_skills").notNull().default(false),
+
+    /**
+     * Which caller-visible skills an internal agent may activate. `all`
+     * preserves the historical behavior and applies exact-reference
+     * exclusions; `manual` permits only exact-reference allow rules. This is
+     * deliberately separate from `accessAllSkills`, which controls gateway
+     * publication rather than internal-agent activation.
+     */
+    activationSkillMode: text("activation_skill_mode")
+      .$type<AgentActivationSkillMode>()
+      .notNull()
+      .default("all"),
+
+    /** Compare-and-set revision for activation-skill policy edits. */
+    activationSkillPolicyRevision: integer("activation_skill_policy_revision")
+      .notNull()
+      .default(0),
+
+    /**
+     * "Auto" subagent mode (vs "Custom"): whether this agent may delegate to
+     * any internal agent the *calling user* can access (team/scope visibility),
+     * beyond the explicitly-configured delegation targets. Mirrors
+     * `accessAllTools` for agent-to-agent delegation. When on, delegation
+     * targets are resolved dynamically per caller (minus `agent_excluded_subagents`);
+     * when off, only explicitly-assigned delegation tools are exposed. This
+     * per-agent flag is the sole gate for dynamic subagent access.
+     */
+    accessAllSubagents: boolean("access_all_subagents")
+      .notNull()
+      .default(false),
+
+    /**
+     * "Progressive subagent loading" for Manual subagents: when on, the
+     * assigned delegation targets are not listed as `agent__…` tools and are
+     * reached through search_tools/run_tool instead. Has no effect while
+     * `accessAllSubagents` is on: that set has no bound, so it is always
+     * loaded progressively.
+     */
+    progressiveSubagentLoading: boolean("progressive_subagent_loading")
+      .notNull()
+      .default(false),
+
+    /**
+     * MCP gateways: how incoming requests are load-balanced across the
+     * subagents assigned to the gateway, including algorithm, per-subagent
+     * weights, and retry/fallback policy for failed subagent requests.
+     */
+    subagentLoadBalancing: jsonb(
+      "subagent_load_balancing",
+    ).$type<SubagentLoadBalancingConfig>(),
+
+    /** JSONB config for built-in agents (null for user-created agents) */
+    builtInAgentConfig: jsonb(
+      "built_in_agent_config",
+    ).$type<BuiltInAgentConfig>(),
+
+    /** Computed column: true when builtInAgentConfig is not null */
+    builtIn: boolean("built_in").generatedAlwaysAs(
+      (): SQL => sql`${agentsTable.builtInAgentConfig} IS NOT NULL`,
+    ),
+
+    /**
+     * Head pointer into `agent_versions`. 0 = legacy row that predates config
+     * versioning; the first config write forks version 1. Bumped by
+     * AgentVersionModel.forkIfChangedBestEffort at a config-mutating operation's
+     * boundary (agent create/update, tool/hook/exclusion/knowledge edits); see
+     * that model for the coverage surface and the lazy-capture caveat.
+     */
+    latestVersion: integer("latest_version").notNull().default(0),
+
+    /**
+     * When anything last ran through the agent: the later of its newest MCP
+     * request (`mcp_tool_calls`) and its newest LLM call (`interactions`).
+     * Null means never used. Stamped forward-only by `AgentUsageModel` after
+     * each insert into those two tables, so lists can sort by it without
+     * scanning them. It outlives log retention: deleting old log rows does not
+     * move it back.
+     */
+    lastUsedAt: timestamp("last_used_at", { mode: "date" }),
+
+    /** Service account creator; separate from human ownership. */
+    createdByServiceAccountId: uuid("created_by_service_account_id").references(
+      () => serviceAccountsTable.id,
+      { onDelete: "set null" },
+    ),
+    createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("agents_slug_idx")
+      .on(table.slug)
+      .where(sql`${table.slug} IS NOT NULL AND ${table.deletedAt} IS NULL`),
+    index("agents_organization_id_idx").on(table.organizationId),
+    index("agents_agent_type_idx").on(table.agentType),
+    index("agents_identity_provider_id_idx").on(table.identityProviderId),
+    index("agents_environment_id_idx").on(table.environmentId),
+    index("agents_author_id_idx").on(table.authorId),
+    index("agents_scope_idx").on(table.scope),
+    // Deleting a model clears this column through its foreign key, one
+    // lookup per deleted model. Without an index every lookup read the whole
+    // table, so removing a provider key's models outran the statement timeout.
+    index("agents_model_id_idx")
+      .on(table.modelId)
+      .where(sql`${table.modelId} IS NOT NULL`),
+    // Agent lists: walk visible agents in name or creation order and stop at
+    // the page. The name indexes also carry the columns the list's
+    // visibility filter reads, so the list's count is an index-only scan.
+    index("agents_org_name_live_idx")
+      .on(
+        table.organizationId,
+        table.name,
+        table.id,
+        table.agentType,
+        table.authorId,
+        table.builtIn,
+        table.isDefault,
+      )
+      .where(sql`${table.deletedAt} IS NULL`),
+    index("agents_org_name_deleted_idx")
+      .on(
+        table.organizationId,
+        table.name,
+        table.id,
+        table.agentType,
+        table.authorId,
+        table.builtIn,
+        table.isDefault,
+      )
+      .where(sql`${table.deletedAt} IS NOT NULL`),
+    index("agents_org_created_at_live_idx")
+      .on(table.organizationId, table.createdAt, table.id)
+      .where(sql`${table.deletedAt} IS NULL`),
+    // Selector select-all walks live agents newest first; the type and
+    // built-in flag let it read the index alone.
+    index("agents_org_created_at_type_live_idx")
+      .on(
+        table.organizationId,
+        table.createdAt,
+        table.id,
+        table.agentType,
+        table.builtIn,
+      )
+      .where(sql`${table.deletedAt} IS NULL`),
+    // Pickers and the chat roster order by name byte-wise (COLLATE "C"),
+    // which the name index above, in the database collation, cannot serve.
+    index("agents_org_name_c_live_idx")
+      .on(table.organizationId, sql`${table.name} COLLATE "C"`, table.id)
+      .where(sql`${table.deletedAt} IS NULL`),
+    // The Agents page's trash view lists deleted agents newest first.
+    index("agents_org_created_at_deleted_idx")
+      .on(table.organizationId, table.createdAt, table.id)
+      .where(sql`${table.deletedAt} IS NOT NULL`),
+    // The gateways and profiles list walks only those rows newest first.
+    // On agents_org_created_at_live_idx it filters every chat agent and
+    // can reach the end of the index before it fills a page.
+    index("agents_org_gateway_profile_created_at_live_idx")
+      .on(table.organizationId, table.createdAt, table.id)
+      .where(
+        sql`${table.deletedAt} IS NULL AND ${table.agentType} IN ('mcp_gateway', 'profile')`,
+      ),
+    check(
+      "agents_activation_skill_mode_check",
+      sql`${table.activationSkillMode} IN ('all', 'manual')`,
+    ),
+    uniqueIndex("agents_personal_gateway_per_member_idx")
+      .on(table.organizationId, table.authorId)
+      .where(
+        sql`${table.agentType} = 'mcp_gateway' AND ${table.isPersonalGateway} = true AND ${table.deletedAt} IS NULL`,
+      ),
+    uniqueIndex("agents_personal_proxy_per_member_idx")
+      .on(table.organizationId, table.authorId)
+      .where(
+        sql`${table.agentType} = 'llm_proxy' AND ${table.isPersonalProxy} = true AND ${table.deletedAt} IS NULL`,
+      ),
+    /**
+     * One LLM Proxy per organization: the `llm_proxy` row with
+     * `is_default = true` is THE organization's proxy, and every proxy
+     * request resolves to it. Backs the race-safe ON CONFLICT ensure in
+     * `AgentModel.getOrgLlmProxy`.
+     */
+    uniqueIndex("agents_org_default_llm_proxy_idx")
+      .on(table.organizationId)
+      .where(
+        sql`${table.agentType} = 'llm_proxy' AND ${table.isDefault} = true AND ${table.deletedAt} IS NULL`,
+      ),
+  ],
+);
+
+export default agentsTable;

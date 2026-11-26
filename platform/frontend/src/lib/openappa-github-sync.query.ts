@@ -1,0 +1,455 @@
+import {
+  archestraApiClient,
+  archestraApiSdk,
+  type archestraApiTypes,
+} from "@archestra/shared";
+import {
+  useIsMutating,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import {
+  appaGithubSyncQueryKey,
+  invalidatePolicyViews,
+} from "@/lib/openappa-policy-views";
+import { runtimeCredentialsQueryKey } from "@/lib/runtime-credentials.query";
+import { handleApiError, throwOnApiError, toApiError } from "@/lib/utils/api";
+
+export function useAppaGithubSync() {
+  const { data: canRead } = useHasPermissions({
+    organizationSettings: ["read"],
+  });
+  return useQuery({
+    enabled: canRead === true,
+    queryKey: appaGithubSyncQueryKey,
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getAppaGithubSync();
+      throwOnApiError(error, { toastOnError: false });
+      return data;
+    },
+    refetchInterval: 10000,
+  });
+}
+type AppaGithubAppGrants = NonNullable<
+  archestraApiTypes.GetAppaGithubAppGrantsResponses["200"]
+>;
+
+/**
+ * The GitHub App's grants, each with whether the App's settings ask for it
+ * now. Asked for and not granted: the installation has still to accept the
+ * change. `requested` is absent when the settings could not be read.
+ */
+export type AppaGithubAppPermissions = Omit<
+  AppaGithubAppGrants,
+  "permissions"
+> & {
+  permissions: Array<
+    AppaGithubAppGrants["permissions"][number] & { requested?: boolean }
+  >;
+};
+
+/**
+ * The GitHub App's permissions as GitHub grants them now. The Git sync card
+ * and every setup step read this one answer; every Git sync action reads it
+ * again, since it invalidates the queries under the same key. Whoever shows
+ * it shows its error too, so a failed read raises no toast.
+ */
+export function useAppaGithubAppGrants(enabled: boolean) {
+  const { data: canRead } = useHasPermissions({
+    organizationSettings: ["read"],
+  });
+  return useQuery({
+    enabled: enabled && canRead === true,
+    queryKey: [...appaGithubSyncQueryKey, "app-grants"],
+    queryFn: async () => {
+      // The endpoint is not in the API reference yet, so the generated
+      // client has no function for it.
+      const { data, error } = await archestraApiClient.get<{
+        200: AppaGithubAppPermissions | null;
+      }>({ url: "/api/openappa/github-sync/app-permissions" });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    staleTime: 60_000,
+  });
+}
+
+/**
+ * How the policy repository protects server rules files: the branch ruleset
+ * the administrator imports, as the server last read it. The server keeps a
+ * read for a minute, so polling more often only reads its cache; a change
+ * just made on GitHub is read with `useFreshAppaRepositoryProtection`.
+ */
+export function useAppaRepositoryProtection(enabled: boolean) {
+  const { data: canRead } = useHasPermissions({
+    organizationSettings: ["read"],
+  });
+  return useQuery({
+    enabled: enabled && canRead === true,
+    queryKey: [...appaGithubSyncQueryKey, "protection"],
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getAppaRepositoryProtection();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    refetchInterval: 60_000,
+  });
+}
+
+/**
+ * Read the protection from GitHub now, for the check-again buttons: the
+ * administrator just imported or edited the ruleset. What comes back
+ * replaces the cached read, so the Git sync card follows at once.
+ */
+export function useFreshAppaRepositoryProtection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const { data, error } = await archestraApiSdk.getAppaRepositoryProtection(
+        {
+          query: { fresh: "true" },
+        },
+      );
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData([...appaGithubSyncQueryKey, "protection"], data);
+    },
+  });
+}
+/**
+ * Whether this organization's MCP server editors change their servers' rules
+ * themselves, which shows the registry's Guardrails action. Anyone who may
+ * open the registry reads it.
+ */
+export function useAppaSelfService(enabled = true) {
+  const { data: canRead } = useHasPermissions({ mcpRegistry: ["read"] });
+  return useQuery({
+    enabled: enabled && canRead === true,
+    queryKey: appaSelfServiceQueryKey,
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getAppaSelfService();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? { enabled: false };
+    },
+    staleTime: 60_000,
+  });
+}
+export const appaSelfServiceQueryKey = ["openappa-github-sync", "self-service"];
+
+/**
+ * The MCP servers' rules files this reader may open with no Guardrails
+ * permission: those of servers they may open in the MCP registry.
+ */
+function useServerRulesFiles(enabled = true) {
+  const { data: canRead } = useHasPermissions({ mcpRegistry: ["read"] });
+  return useQuery({
+    enabled: enabled && canRead === true,
+    queryKey: serverRulesFilesQueryKey,
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getOpenappaServerRulesFiles();
+      throwOnApiError(error, { toastOnError: false });
+      return data?.files ?? [];
+    },
+    staleTime: 60_000,
+  });
+}
+const serverRulesFilesQueryKey = ["openappa-github-sync", "server-rules-files"];
+
+/**
+ * Whether the Policy page is open to this reader through their MCP servers
+ * alone: no Guardrails permission, and at least one server's rules file they
+ * may open. Null until known. The page then lists only those files.
+ */
+export function useServerRulesAccess(): {
+  scoped: boolean | null;
+  files: ServerRulesFile[];
+} {
+  const policy = useHasPermissions({ guardrailsPolicy: ["read"] });
+  const registry = useHasPermissions({ mcpRegistry: ["read"] });
+  // Asked only of a reader without the permission. With Guardrails off the
+  // list is empty, so the answer is no.
+  const wanted = policy.data === false;
+  const files = useServerRulesFiles(wanted);
+  const scoped = policy.isPending
+    ? null
+    : policy.data === true
+      ? false
+      : registry.isPending
+        ? null
+        : registry.data !== true
+          ? false
+          : files.isPending
+            ? null
+            : (files.data?.length ?? 0) > 0;
+  return { scoped, files: scoped ? (files.data ?? NO_FILES) : NO_FILES };
+}
+type ServerRulesFile =
+  archestraApiTypes.GetOpenappaServerRulesFilesResponses["200"]["files"][number];
+const NO_FILES: ServerRulesFile[] = [];
+
+export function useConfigureAppaGithubSync() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      body: archestraApiTypes.ConfigureAppaGithubSyncData["body"],
+    ) => {
+      const { data, error } = await archestraApiSdk.configureAppaGithubSync({
+        body,
+      });
+      if (error) {
+        handleApiError(error);
+        throw toApiError(error);
+      }
+      return data;
+    },
+    onSuccess: () => {
+      toast.success("GitHub source saved. First sync queued.");
+    },
+    // Syncing hands the text to the repository: every view of it follows.
+    onSettled: () => invalidatePolicyViews(client),
+  });
+}
+export function useCreateAppaGithubRepository() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      body: archestraApiTypes.CreateAppaGithubRepositoryData["body"],
+    ) => {
+      const { data, error } = await archestraApiSdk.createAppaGithubRepository({
+        body,
+      });
+      if (error) {
+        throw toApiError(error);
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      const gitlab = !!data?.source?.gitlabTokenId;
+      const repository = gitlab ? "Project" : "Repository";
+      toast.success(
+        data?.source?.setupPullRequestNumber
+          ? `${repository} connected. Merge the initial policy ${gitlab ? "merge request" : "pull request"} to finish setup.`
+          : `${repository} connected with your current policy.`,
+      );
+    },
+    onSettled: () => invalidatePolicyViews(client),
+  });
+}
+/** Every Git sync action; a sync started anywhere shows on the card. */
+const updateAppaGithubSyncKey = [...appaGithubSyncQueryKey, "update"];
+
+/** Whether a sync runs now, wherever it was started: the card, a dialog. */
+export function useAppaGithubSyncing() {
+  return (
+    useIsMutating({
+      mutationKey: updateAppaGithubSyncKey,
+      predicate: (mutation) =>
+        (mutation.state.variables as { action?: string } | undefined)
+          ?.action === "sync",
+    }) > 0
+  );
+}
+
+export function useUpdateAppaGithubSync({
+  quiet = false,
+}: {
+  /**
+   * For a wizard that shows each outcome in its own rows: no toast says it
+   * again. A failed request still shows its error toast.
+   */
+  quiet?: boolean;
+} = {}) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationKey: updateAppaGithubSyncKey,
+    mutationFn: async (
+      body: archestraApiTypes.UpdateAppaGithubSyncData["body"],
+    ) => {
+      const { data, error } = await archestraApiSdk.updateAppaGithubSync({
+        body,
+      });
+      if (error) {
+        handleApiError(error);
+        throw toApiError(error);
+      }
+      return data;
+    },
+    // Whether a setup pull request was pending when the sync was asked for:
+    // the row forgets its number once the merge imports the policy.
+    onMutate: () => ({
+      awaitingMerge: !!client.getQueryData<
+        archestraApiTypes.GetAppaGithubSyncResponses["200"]
+      >(appaGithubSyncQueryKey)?.source?.setupPullRequestNumber,
+    }),
+    onSettled: () => {
+      invalidatePolicyViews(client);
+      client.invalidateQueries({ queryKey: appaSelfServiceQueryKey });
+    },
+    onSuccess: (data, body, context) => {
+      // Every action answers with the status: whoever waits on a sync reads
+      // its outcome as soon as the sync ends, not at the next refetch.
+      if (data) client.setQueryData(appaGithubSyncQueryKey, data);
+      if (quiet) return;
+      if (body.action === "self_service") {
+        toast.success(
+          body.enabled
+            ? "MCP Guardrails Self-Service turned on."
+            : "MCP Guardrails Self-Service turned off. The branch ruleset was removed.",
+        );
+        return;
+      }
+      if (body.action === "include_servers") {
+        toast.success(
+          "Pull request opened. Merge it so the servers' files apply.",
+        );
+        return;
+      }
+      if (body.action === "sync" && data?.source?.lastSyncError) return;
+      // Still waiting on the setup PR: the dialog and panel already say so.
+      if (body.action === "sync" && data?.source?.setupPullRequestNumber)
+        return;
+      if (body.action === "sync" && context.awaitingMerge) {
+        toast.success("Initial policy merged. Policy synced from GitHub.");
+        return;
+      }
+      toast.success(
+        body.action === "sync"
+          ? "Sync complete"
+          : body.action === "disconnect"
+            ? "Sync stopped. The last accepted policy is kept."
+            : "Sync schedule updated",
+      );
+    },
+  });
+}
+
+/** The App created on GitHub during setup that still needs installing. */
+export function usePendingAppaGithubApp(enabled: boolean) {
+  return useQuery({
+    enabled,
+    queryKey: pendingAppaGithubAppQueryKey,
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getPendingAppaGithubApp();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+  });
+}
+/** Where each GitHub App is installed, and whether it can reach `repo`. */
+export function useAppaGithubAppAccounts(enabled: boolean) {
+  return useQuery({
+    enabled,
+    queryKey: ["openappa", "github-app", "accounts"],
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getAppaGithubAppAccounts();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+  });
+}
+
+/** Repositories a GitHub App can reach, so setup offers a list instead of a name. */
+export function useAppaGithubAppRepositories(credentialId: string | null) {
+  return useQuery({
+    enabled: !!credentialId,
+    queryKey: ["openappa", "github-app", "repositories", credentialId],
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getAppaGithubAppRepositories({
+          query: { credentialId: credentialId as string },
+        });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? { repositories: [], manageUrl: null };
+    },
+  });
+}
+
+/** Whether the policy repository already exists, as the organization's Apps see it. */
+export function useAppaGithubRepositoryStatus(
+  query: {
+    credentialId: string;
+    repo: string;
+    ref?: string;
+    path?: string;
+  } | null,
+) {
+  return useQuery({
+    enabled: !!query,
+    queryKey: ["openappa", "github-app", "repository", query],
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getAppaGithubRepositoryStatus({
+          query: query as NonNullable<typeof query>,
+        });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+  });
+}
+export function useStartAppaGithubApp() {
+  return useMutation({
+    mutationFn: async (
+      body: archestraApiTypes.StartAppaGithubAppData["body"],
+    ) => {
+      const { data, error } = await archestraApiSdk.startAppaGithubApp({
+        body,
+      });
+      if (error) throw toApiError(error);
+      return data;
+    },
+  });
+}
+export function useCompleteAppaGithubApp() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      body: archestraApiTypes.CompleteAppaGithubAppData["body"],
+    ) => {
+      const { data, error } = await archestraApiSdk.completeAppaGithubApp({
+        body,
+      });
+      if (error) throw toApiError(error);
+      return data;
+    },
+    onSuccess: (data) =>
+      client.setQueryData(pendingAppaGithubAppQueryKey, data ?? null),
+  });
+}
+export function useInstallAppaGithubApp() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const { data, error } = await archestraApiSdk.installAppaGithubApp();
+      if (error) throw toApiError(error);
+      return data;
+    },
+    onSuccess: (data) => {
+      if (data?.status !== "installed") return;
+      client.setQueryData(pendingAppaGithubAppQueryKey, null);
+      client.invalidateQueries({ queryKey: runtimeCredentialsQueryKey });
+    },
+    // The App may have been deleted on GitHub, which also clears it here.
+    onError: () =>
+      client.invalidateQueries({ queryKey: pendingAppaGithubAppQueryKey }),
+  });
+}
+
+export function useDiscardAppaGithubApp() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const { error } = await archestraApiSdk.discardAppaGithubApp();
+      if (error) throw toApiError(error);
+    },
+    onSuccess: () => client.setQueryData(pendingAppaGithubAppQueryKey, null),
+  });
+}
+
+const pendingAppaGithubAppQueryKey = ["openappa", "github-app", "pending"];

@@ -1,0 +1,251 @@
+"use client";
+
+import { Check, X } from "lucide-react";
+import * as React from "react";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverAnchor,
+  PopoverContent,
+} from "@/components/ui/popover";
+import { cn } from "@/lib/utils/tailwind";
+
+export interface MultiSelectOption {
+  value: string;
+  label: string;
+  /** Optional leading icon (provider/client logo, …). */
+  icon?: React.ReactNode;
+  /** Secondary line under the label, for options that need explaining. */
+  description?: React.ReactNode;
+  /** Offered but not selectable — say why in `description`. */
+  disabled?: boolean;
+}
+
+interface MultiSelectComboboxProps {
+  id?: string;
+  ariaLabel?: string;
+  options: MultiSelectOption[];
+  value: string[];
+  onChange: (value: string[]) => void;
+  placeholder?: string;
+  emptyMessage?: string;
+  className?: string;
+  disabled?: boolean;
+}
+
+export function MultiSelectCombobox({
+  id,
+  ariaLabel,
+  options,
+  value,
+  onChange,
+  placeholder = "Search...",
+  emptyMessage = "No items found.",
+  className,
+  disabled,
+}: MultiSelectComboboxProps) {
+  const [open, setOpen] = React.useState(false);
+  const [search, setSearch] = React.useState("");
+  const inputRef = React.useRef<HTMLInputElement>(null);
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const contentRef = React.useRef<HTMLDivElement>(null);
+  const listRef = React.useRef<HTMLDivElement>(null);
+
+  // The search input lives in the popover anchor, outside the Command, so
+  // CommandList's own show-from-the-top-on-query-change reset never fires
+  // here (cmdk's search state stays empty). Same rule, applied by hand: a
+  // new query must not keep the old scroll offset.
+  const lastSearch = React.useRef(search);
+  React.useEffect(() => {
+    if (lastSearch.current === search) {
+      return;
+    }
+    lastSearch.current = search;
+    if (listRef.current) {
+      listRef.current.scrollTop = 0;
+    }
+  }, [search]);
+
+  const selectedOptions = options.filter((opt) => value.includes(opt.value));
+
+  const handleSelect = (optionValue: string) => {
+    if (value.includes(optionValue)) {
+      onChange(value.filter((v) => v !== optionValue));
+    } else {
+      onChange([...value, optionValue]);
+    }
+    setSearch("");
+    inputRef.current?.focus();
+  };
+
+  const handleRemove = (optionValue: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    onChange(value.filter((v) => v !== optionValue));
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Backspace" && search === "" && value.length > 0) {
+      onChange(value.slice(0, -1));
+    }
+    if (e.key === "Escape") {
+      setOpen(false);
+      inputRef.current?.blur();
+    }
+  };
+
+  // Close popover when clicking outside. The dropdown content is portaled, so
+  // it lives outside containerRef — exclude it too, otherwise selecting an
+  // option counts as an outside click and closes the menu mid-multi-select.
+  React.useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(target) &&
+        !contentRef.current?.contains(target)
+      ) {
+        setOpen(false);
+      }
+    };
+
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () =>
+        document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [open]);
+
+  return (
+    <Popover open={disabled || options.length === 0 ? false : open}>
+      <PopoverAnchor asChild>
+        <div
+          ref={containerRef}
+          id={id}
+          role="combobox"
+          aria-label={ariaLabel}
+          aria-expanded={open}
+          aria-disabled={disabled}
+          tabIndex={disabled ? undefined : -1}
+          className={cn(
+            "flex min-h-9 w-full flex-wrap items-center gap-1.5 rounded-md border border-input bg-background px-3 py-1.5 text-sm ring-offset-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2",
+            disabled && "opacity-50 cursor-not-allowed",
+            className,
+          )}
+          onClick={() => {
+            if (disabled) return;
+            inputRef.current?.focus();
+            setOpen(true);
+          }}
+          onKeyDown={(e) => {
+            if (disabled) return;
+            if (e.key === "Enter" || e.key === " ") {
+              inputRef.current?.focus();
+              setOpen(true);
+            }
+          }}
+        >
+          {selectedOptions.map((option) => (
+            <span
+              key={option.value}
+              className="inline-flex items-center gap-1.5 rounded-md border bg-muted px-2 py-0.5 text-sm"
+            >
+              {option.icon && (
+                <span className="flex shrink-0 items-center">
+                  {option.icon}
+                </span>
+              )}
+              {option.label}
+              <button
+                type="button"
+                aria-label="Remove selected option"
+                disabled={disabled}
+                onClick={(e) => handleRemove(option.value, e)}
+                className="hover:bg-muted-foreground/20 rounded-sm"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          ))}
+          <input
+            ref={inputRef}
+            aria-label="Search options"
+            value={search}
+            disabled={disabled}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setOpen(true);
+            }}
+            onFocus={() => setOpen(true)}
+            onKeyDown={handleKeyDown}
+            placeholder={selectedOptions.length === 0 ? placeholder : ""}
+            className="flex-1 bg-transparent outline-none placeholder:text-muted-foreground min-w-[60px] disabled:cursor-not-allowed"
+          />
+        </div>
+      </PopoverAnchor>
+      <PopoverContent
+        ref={contentRef}
+        className="p-0"
+        style={{ width: "var(--radix-popper-anchor-width)" }}
+        align="start"
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        onInteractOutside={(e) => e.preventDefault()}
+      >
+        <Command shouldFilter={false}>
+          <CommandList ref={listRef}>
+            <CommandEmpty>{emptyMessage}</CommandEmpty>
+            <CommandGroup>
+              {options
+                .filter((opt) =>
+                  opt.label.toLowerCase().includes(search.toLowerCase()),
+                )
+                .map((option) => {
+                  const isSelected = value.includes(option.value);
+                  return (
+                    <CommandItem
+                      key={option.value}
+                      value={option.value}
+                      disabled={option.disabled}
+                      onSelect={() => {
+                        if (option.disabled) return;
+                        handleSelect(option.value);
+                      }}
+                      onMouseDown={(e) => e.preventDefault()}
+                      className="justify-between gap-2"
+                    >
+                      <span className="flex min-w-0 items-center gap-2">
+                        {option.icon && (
+                          <span className="flex shrink-0 items-center">
+                            {option.icon}
+                          </span>
+                        )}
+                        <span className="block min-w-0">
+                          <span className="block truncate">{option.label}</span>
+                          {option.description && (
+                            <span className="block whitespace-normal break-words text-xs text-muted-foreground">
+                              {option.description}
+                            </span>
+                          )}
+                        </span>
+                      </span>
+                      <Check
+                        className={cn(
+                          "h-4 w-4",
+                          isSelected ? "opacity-100" : "opacity-0",
+                        )}
+                      />
+                    </CommandItem>
+                  );
+                })}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}

@@ -1,0 +1,257 @@
+import {
+  type AnyPgColumn,
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgEnum,
+  text,
+  timestamp,
+  unique,
+  uuid,
+} from "drizzle-orm/pg-core";
+import type {
+  AuthField,
+  AwsIamMcpAuthConfig,
+  CatalogItemApprovalStatus,
+  DesktopMcpConfig,
+  EnterpriseManagedCredentialConfig,
+  InternalMcpCatalogServerType,
+  LocalConfig,
+  OAuthConfig,
+  UserConfig,
+  UserConfigFieldDefault,
+} from "@/types";
+import environmentsTable from "./environment";
+import mcpPresetEntriesTable from "./mcp-preset-entry";
+import secretTable from "./secret";
+import serviceAccountsTable from "./service-account";
+import { softDeletablePgTable } from "./soft-deletable-table";
+import usersTable from "./user";
+
+export const mcpCatalogScopeEnum = pgEnum("mcp_catalog_scope", [
+  "personal",
+  "team",
+  "org",
+]);
+
+const internalMcpCatalogTable = softDeletablePgTable(
+  "internal_mcp_catalog",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    /**
+     * The prefix this item's tools carry, when it is not the slugified name:
+     * a shorter one, cut at a word boundary, when the name leaves a tool no
+     * room under the 64-character tool-name limit, with a `-2`, `-3` suffix
+     * when another item already carries that cut; and for an app, its own
+     * prefix, so two apps of one name never share tool names. NULL means
+     * the slugified name. Written only by the tool-name allocation
+     * (`services/mcp-tool-names.ts`), never from input.
+     */
+    toolPrefix: text("tool_prefix"),
+    version: text("version"),
+    description: text("description"),
+    instructions: text("instructions"),
+    repository: text("repository"),
+    installationCommand: text("installation_command"),
+    requiresAuth: boolean("requires_auth").notNull().default(false),
+    authDescription: text("auth_description"),
+    authFields: jsonb("auth_fields").$type<Array<AuthField>>().default([]),
+    // Server type and remote configuration
+    serverType: text("server_type")
+      .$type<InternalMcpCatalogServerType>()
+      .notNull(),
+    /**
+     * When true (self-hosted only): one shared K8s deployment per catalog,
+     * caller-level credentials sent as request-time headers. When false:
+     * one deployment per caller (default).
+     */
+    multitenant: boolean("multitenant").notNull().default(false),
+    /**
+     * Frozen K8s deployment name for the shared multitenant deployment
+     * (one per catalog). Written once at creation with the legacy shape
+     * (`mcp-mt-<catalogId8>-<slug>`); the startup adopt pass backfills
+     * pre-existing rows from their live deployment's actual name. Never
+     * updated on rename. NULL for non-multitenant catalogs.
+     */
+    deploymentName: text("deployment_name"),
+    /**
+     * Default-credential policy for call-time ("dynamic") credential
+     * resolution — surfaced in the UI as the server's "Default credential"
+     * setting. It governs Auto-mode calls and Custom-mode assignments left on
+     * resolve-at-call-time. NULL (default) = each caller uses its
+     * own connection (user token → that user's install, team token → that
+     * team's install) and gets an actionable connect prompt when none exists.
+     * Set to an mcp_servers.id to pin a service account: every
+     * runtime-resolved agent call connects through that installation,
+     * regardless of the caller. Intentionally NOT a DB-level FK — mcp_servers
+     * already references this table, so the FK would create a schema import
+     * cycle; the resolver re-validates the id against the catalog's installs
+     * on every call, so a revoked connection degrades to resolve-at-call-time
+     * instead of dangling.
+     */
+    dynamicConnectionMcpServerId: uuid("dynamic_connection_mcp_server_id"),
+    serverUrl: text("server_url"), // For remote servers
+    /** Monotonic token preventing stale concurrent skills/list snapshots. */
+    skillsRefreshGeneration: integer("skills_refresh_generation")
+      .notNull()
+      .default(0),
+    docsUrl: text("docs_url"), // Documentation URL for remote servers
+    clientSecretId: uuid("client_secret_id").references(() => secretTable.id, {
+      onDelete: "set null",
+    }), // For OAuth client_secret storage
+    localConfigSecretId: uuid("local_config_secret_id").references(
+      () => secretTable.id,
+      {
+        onDelete: "set null",
+      },
+    ), // For local config secret env vars storage
+    // Local server configuration - uses LocalConfig type from @/types
+    localConfig: jsonb("local_config").$type<LocalConfig>(),
+    // Desktop MCP servers: the command or URL that each device gets for this
+    // catalog item
+    desktopConfig: jsonb("desktop_config").$type<DesktopMcpConfig>(),
+    // Custom Kubernetes deployment spec YAML (if null, generated from localConfig)
+    deploymentSpecYaml: text("deployment_spec_yaml"),
+    userConfig: jsonb("user_config").$type<UserConfig>().default({}),
+    // OAuth configuration for remote servers
+    oauthConfig: jsonb("oauth_config").$type<OAuthConfig>(),
+    enterpriseManagedConfig: jsonb(
+      "enterprise_managed_config",
+    ).$type<EnterpriseManagedCredentialConfig>(),
+    // AWS IAM (SigV4) sign-in for remote servers behind an AWS service
+    awsIamConfig: jsonb("aws_iam_config").$type<AwsIamMcpAuthConfig>(),
+    /** Catalog item icon: emoji character or base64-encoded image data URL */
+    icon: text("icon"),
+    organizationId: text("organization_id"),
+    authorId: text("author_id").references(() => usersTable.id, {
+      onDelete: "set null",
+    }),
+    scope: mcpCatalogScopeEnum("scope").notNull().default("org"),
+    /**
+     * NULL for visible root catalog items. Non-NULL rows are hidden runtime
+     * variants owned by a root item. Legacy preset rows may also remain here;
+     * both kinds are intentionally excluded from catalog discovery.
+     */
+    parentCatalogItemId: uuid("parent_catalog_item_id").references(
+      (): AnyPgColumn => internalMcpCatalogTable.id,
+      { onDelete: "cascade" },
+    ),
+    /**
+     * Legacy preset column (feature removed) — retained inert. Held a child
+     * row's bare name; the composed `name` was `${parent.name}-${childName}`.
+     * NULL for root rows; no longer read or written.
+     */
+    childName: text("child_name"),
+    /**
+     * Self-FK lineage pointer: the catalog item this one was cloned from.
+     * NULL for non-clones. ON DELETE SET NULL so deleting the source leaves
+     * the clone intact (just untracked), unlike the legacy parent-catalog cascade.
+     */
+    clonedFrom: uuid("cloned_from").references(
+      (): AnyPgColumn => internalMcpCatalogTable.id,
+      { onDelete: "set null" },
+    ),
+    /**
+     * Legacy preset column (feature removed) — retained inert. FK to the
+     * org-level preset-entry table a child row configured. NULL for root
+     * rows; no longer read or written.
+     */
+    presetEntryId: uuid("preset_entry_id").references(
+      () => mcpPresetEntriesTable.id,
+      { onDelete: "cascade" },
+    ),
+    /**
+     * Legacy preset column (feature removed) — retained inert. Held the
+     * non-secret preset field values for a row (secret-typed ones lived in
+     * the bundle referenced by presetSecretId). No longer read or written.
+     */
+    presetFieldValues: jsonb("preset_field_values")
+      .$type<Record<string, UserConfigFieldDefault>>()
+      .notNull()
+      .default({}),
+    /**
+     * Legacy preset column (feature removed) — retained inert. Referenced a
+     * secret bundle of secret-typed preset values for the row. No longer read
+     * or written.
+     */
+    presetSecretId: uuid("preset_secret_id").references(() => secretTable.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * Optional deployment environment this catalog item is assigned to.
+     * NULL = the virtual "Default" environment. Set-null on environment delete
+     * so items survive environment removal. Assignment is ungated in this
+     * iteration (see spec §9).
+     */
+    environmentId: uuid("environment_id").references(
+      () => environmentsTable.id,
+      { onDelete: "set null" },
+    ),
+    /**
+     * To re-install multi-tenant self-hosted MCPs.
+     *
+     * Set to `true` when an admin/owner edits a catalog-scope execution
+     * field (image, command, args, transport) on a `multitenant: true` +
+     * `serverType: "local"` catalog. Cleared by the catalog-reinstall
+     * endpoint after the shared K8s Deployment is updated and tools are
+     * re-synced for every install attached to this catalog.
+     *
+     * Not used for single-tenant or remote catalogs — those keep using
+     * the per-install `mcp_server.reinstall_required` flag.
+     */
+    catalogReinstallRequired: boolean("catalog_reinstall_required")
+      .notNull()
+      .default(false),
+    /**
+     * Image-approval gate for PERSONAL local catalog items whose custom image is
+     * not in the target environment's trusted registries (see
+     * services/mcp-install-policy.ts). NULL = no decision recorded. `pending` is
+     * set lazily on the first blocked install attempt; an admin sets `approved`
+     * (installs proceed) or `declined` (installs blocked, with the reason).
+     * Item-level — the decision applies to the catalog item, not a specific
+     * image string. System/admin-managed only; never writable via the catalog
+     * create/edit API.
+     */
+    catalogItemApprovalStatus: text(
+      "catalog_item_approval_status",
+    ).$type<CatalogItemApprovalStatus>(),
+    /** Admin's reason when `catalog_item_approval_status = 'declined'`. */
+    catalogItemApprovalReason: text("catalog_item_approval_reason"),
+    /** User who approved/declined; set null if that user is deleted. */
+    catalogItemApprovalReviewedBy: text(
+      "catalog_item_approval_reviewed_by",
+    ).references(() => usersTable.id, { onDelete: "set null" }),
+    /** When the approve/decline decision was made. */
+    catalogItemApprovalReviewedAt: timestamp(
+      "catalog_item_approval_reviewed_at",
+      { mode: "date" },
+    ),
+    /** Service account creator; separate from human ownership. */
+    createdByServiceAccountId: uuid("created_by_service_account_id").references(
+      () => serviceAccountsTable.id,
+      { onDelete: "set null" },
+    ),
+    createdAt: timestamp("created_at", { mode: "date" }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { mode: "date" })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    index("internal_mcp_catalog_organization_id_idx").on(table.organizationId),
+    index("internal_mcp_catalog_author_id_idx").on(table.authorId),
+    index("internal_mcp_catalog_scope_idx").on(table.scope),
+    index("internal_mcp_catalog_parent_id_idx").on(table.parentCatalogItemId),
+    index("internal_mcp_catalog_cloned_from_idx").on(table.clonedFrom),
+    unique("internal_mcp_catalog_parent_name_unique").on(
+      table.parentCatalogItemId,
+      table.name,
+    ),
+    index("internal_mcp_catalog_environment_id_idx").on(table.environmentId),
+    index("internal_mcp_catalog_deleted_at_idx").on(table.deletedAt),
+  ],
+);
+
+export default internalMcpCatalogTable;

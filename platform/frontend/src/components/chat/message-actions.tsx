@@ -1,0 +1,185 @@
+import type { ChatMessageFeedback } from "@archestra/shared";
+import {
+  Check,
+  Copy,
+  Pencil,
+  RefreshCw,
+  ThumbsDown,
+  ThumbsUp,
+} from "lucide-react";
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { copyToClipboard } from "@/lib/clipboard";
+import { cn } from "@/lib/utils/tailwind";
+
+export function MessageActions({
+  textToCopy,
+  onEditClick,
+  onRegenerateClick,
+  isRegenerateConfirming,
+  className,
+  editDisabled = false,
+  feedback = null,
+  onFeedbackChange,
+  feedbackDisabled = false,
+}: {
+  className?: string;
+  textToCopy: string;
+  onEditClick?: () => void;
+  onRegenerateClick?: () => void;
+  isRegenerateConfirming?: boolean;
+  editDisabled?: boolean;
+  feedback?: ChatMessageFeedback | null;
+  /** When set, thumbs up/down buttons render; clicking the selected thumb clears. */
+  onFeedbackChange?: (feedback: ChatMessageFeedback | null) => void;
+  feedbackDisabled?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    await copyToClipboard(textToCopy);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-0.5 rounded-md border bg-background/95 shadow-sm p-0.5",
+        className,
+      )}
+    >
+      {isRegenerateConfirming ? (
+        <>
+          <span className="text-xs text-muted-foreground whitespace-nowrap px-1.5">
+            All messages below will be regenerated
+          </span>
+          <Button
+            size="xs"
+            variant="ghost"
+            className="text-amber-500 hover:text-amber-600 hover:bg-muted"
+            onClick={onRegenerateClick}
+          >
+            Confirm
+          </Button>
+        </>
+      ) : (
+        <>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                className="hover:bg-muted"
+                onClick={handleCopy}
+              >
+                {copied ? (
+                  <Check className="h-3.5 w-3.5 text-green-500" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5 text-muted-foreground" />
+                )}
+                <span className="sr-only">{copied ? "Copied" : "Copy"}</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {copied ? "Copied" : "Copy"}
+            </TooltipContent>
+          </Tooltip>
+          {onEditClick && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="icon-xs"
+                  variant="ghost"
+                  className="hover:bg-muted"
+                  onClick={onEditClick}
+                  disabled={editDisabled}
+                >
+                  <Pencil className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="sr-only">Edit</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Edit</TooltipContent>
+            </Tooltip>
+          )}
+          {onRegenerateClick && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="icon-xs"
+                  variant="ghost"
+                  className="hover:bg-muted"
+                  onClick={onRegenerateClick}
+                  disabled={editDisabled}
+                >
+                  <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="sr-only">Regenerate</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Regenerate</TooltipContent>
+            </Tooltip>
+          )}
+          {onFeedbackChange && (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    className="hover:bg-muted"
+                    aria-pressed={feedback === "up"}
+                    disabled={feedbackDisabled}
+                    onClick={() =>
+                      onFeedbackChange(feedback === "up" ? null : "up")
+                    }
+                  >
+                    <ThumbsUp
+                      className={cn(
+                        "h-3.5 w-3.5",
+                        feedback === "up"
+                          ? "text-green-500"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    <span className="sr-only">Good response</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Good response</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    className="hover:bg-muted"
+                    aria-pressed={feedback === "down"}
+                    disabled={feedbackDisabled}
+                    onClick={() =>
+                      onFeedbackChange(feedback === "down" ? null : "down")
+                    }
+                  >
+                    <ThumbsDown
+                      className={cn(
+                        "h-3.5 w-3.5",
+                        feedback === "down"
+                          ? "text-red-500"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    <span className="sr-only">Bad response</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Bad response</TooltipContent>
+              </Tooltip>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,884 @@
+import type { UIMessageChunk } from "ai";
+import { z } from "zod";
+import type { A2AAttachment } from "./a2a-attachment";
+
+/**
+ * ChatOps provider types enum
+ * Used for PG ENUM in database schema
+ */
+export const ChatOpsProviderTypeSchema = z.enum([
+  "ms-teams",
+  "slack",
+  "telegram",
+  "jira",
+]);
+export type ChatOpsProviderType = z.infer<typeof ChatOpsProviderTypeSchema>;
+
+export const ChatOpsConnectionModeSchema = z.enum(["webhook", "socket"]);
+export type ChatOpsConnectionMode = z.infer<typeof ChatOpsConnectionModeSchema>;
+
+export const ChatOpsStatusSchema = z.enum(["configured", "unassigned"]);
+export type ChatOpsStatus = z.infer<typeof ChatOpsStatusSchema>;
+
+/** Credentials shape returned by the chatops status endpoint */
+export const ChatOpsProviderCredentialsSchema = z
+  .object({
+    botToken: z.string().optional(),
+    appId: z.string().optional(),
+    appSecret: z.string().optional(),
+    tenantId: z.string().optional(),
+    signingSecret: z.string().optional(),
+    appLevelToken: z.string().optional(),
+    connectionMode: ChatOpsConnectionModeSchema.optional(),
+  })
+  .optional();
+
+/** DM info returned by the chatops status endpoint */
+export const ChatOpsDmInfoSchema = z
+  .object({
+    botUserId: z.string().optional(),
+    teamId: z.string().optional(),
+    appId: z.string().optional(),
+    /** Telegram bot username, used to build t.me deep links */
+    botUsername: z.string().optional(),
+  })
+  .optional();
+
+/** Single provider entry in the chatops status response */
+export const ChatOpsProviderInfoSchema = z.object({
+  id: ChatOpsProviderTypeSchema,
+  displayName: z.string(),
+  configured: z.boolean(),
+  credentials: ChatOpsProviderCredentialsSchema,
+  dmInfo: ChatOpsDmInfoSchema,
+});
+
+/**
+ * Stored chatops config as the config routes read it back: only what is not a
+ * secret.
+ */
+const ChatOpsStoredConfigBaseSchema = z.object({
+  /** Whether the provider would start from this config: enabled, with the credentials its mode needs. */
+  configured: z.boolean(),
+  /** When the stored config last changed; null when none is stored. */
+  updatedAt: z.date().nullable(),
+  enabled: z.boolean(),
+});
+
+export const SlackChatOpsConfigViewSchema =
+  ChatOpsStoredConfigBaseSchema.extend({
+    appId: z.string().nullable(),
+    connectionMode: ChatOpsConnectionModeSchema,
+  });
+
+export const MsTeamsChatOpsConfigViewSchema =
+  ChatOpsStoredConfigBaseSchema.extend({
+    appId: z.string().nullable(),
+    tenantId: z.string().nullable(),
+    /**
+     * Whether people may sign in so the bot reads the files they share in
+     * group chats, and in channels the app's site grant does not cover.
+     */
+    groupChatFileSignIn: z.boolean(),
+    /** The Web redirect URI that sign-in needs on the bot's Entra app. */
+    signInRedirectUri: z.string(),
+  });
+
+export const TelegramChatOpsConfigViewSchema = ChatOpsStoredConfigBaseSchema;
+
+/** Full chatops status response schema */
+export const ChatOpsStatusResponseSchema = z.object({
+  providers: z.array(ChatOpsProviderInfoSchema),
+});
+
+/**
+ * Why an attached file was not included in the message sent to the model.
+ * - `too_large`: exceeded the per-file size limit (and, for images, could not
+ *   be shrunk under the model's inline-image limit).
+ * - `download_failed`: the provider download failed (auth, network, or a
+ *   non-file response such as an HTML login page).
+ * - `total_limit_reached`: the combined attachment budget was already spent.
+ * - `too_many`: more files than the per-message cap were attached.
+ * - `sign_in_required`: only the sender's own access can read the file (a
+ *   Teams group-chat file in their OneDrive, or a channel file the app has no
+ *   site grant for) and they have not signed in.
+ */
+export type SkippedAttachmentReason =
+  | "too_large"
+  | "download_failed"
+  | "total_limit_reached"
+  | "too_many"
+  | "sign_in_required";
+
+/**
+ * A file that was attached to a message but not delivered to the model. Carried
+ * so the chatops layer can tell the model, in-context, that a file was dropped
+ * and why — otherwise the model has no idea the file existed and denies it.
+ */
+export interface SkippedAttachment {
+  /** Filename from the provider, when known. */
+  name?: string;
+  /** Size in bytes from provider metadata, when known. */
+  sizeBytes?: number;
+  reason: SkippedAttachmentReason;
+}
+
+/**
+ * Per-input-file result of downloading thread-history files. The returned
+ * array is positionally aligned with the input: `outcomes[i]` describes
+ * `files[i]`, so callers can attribute every skip back to the history turn
+ * the file came from.
+ */
+export type ThreadFileOutcome =
+  | { status: "delivered"; attachment: A2AAttachment }
+  | { status: "skipped"; skipped: SkippedAttachment };
+
+/**
+ * Represents an incoming chat message from a chatops provider
+ */
+export interface IncomingChatMessage {
+  /** Unique message ID from the provider */
+  messageId: string;
+  /** The channel where the message was sent */
+  channelId: string;
+  /** The workspace/team ID (e.g., Teams team ID) */
+  workspaceId: string | null;
+  /** Thread/conversation ID for fetching history */
+  threadId?: string;
+  /** The sender's ID in the provider's system */
+  senderId: string;
+  /** Pre-resolved sender email (from Bot Framework TeamsInfo, avoids Graph API call) */
+  senderEmail?: string;
+  /** The sender's display name */
+  senderName: string;
+  /** The message text (with bot mentions cleaned) */
+  text: string;
+  /** Raw message text before cleaning */
+  rawText: string;
+  /** When the message was sent */
+  timestamp: Date;
+  /** Whether this is a reply to a thread */
+  isThreadReply: boolean;
+  /** Provider-specific metadata */
+  metadata?: Record<string, unknown>;
+  /** Attachments from the message (images, files, etc.) */
+  attachments?: A2AAttachment[];
+  /** Files that were attached but could not be delivered to the model. */
+  skippedAttachments?: SkippedAttachment[];
+}
+
+/**
+ * Options for sending a chat reply
+ */
+export interface ChatReplyOptions {
+  /** Use bounded delivery without retries for optional Slack acknowledgments. */
+  bestEffort?: boolean;
+  /** The original message to reply to */
+  originalMessage: IncomingChatMessage;
+  /** The reply text */
+  text: string;
+  /** Optional: Reply in thread (if supported) */
+  replyInThread?: boolean;
+  /**
+   * Optional: footer text stamping the reply with the responding agent (e.g.
+   * "🤖 Sales Bot"). Providers render it exactly once, as the last line of the
+   * reply, dropping any copy of it the model wrote itself.
+   */
+  footer?: string;
+  /**
+   * Optional: an even-more-subtle hint rendered on its own line ABOVE the
+   * footer (e.g. the one-time "you can mute me" tip on a thread's first reply),
+   * so the footer stays the reply's last line.
+   */
+  hint?: string;
+  /** Stable runtime conversation link, rendered separately from the answer. */
+  conversationUrl?: string;
+  /** Provider-specific conversation reference for reply routing */
+  conversationReference?: unknown;
+}
+
+/**
+ * A reply that is streamed into the chat while the agent is still running:
+ * text appears as the model writes it, and each tool call shows as a progress
+ * card. The manager feeds it the run's UI message chunks, then either finishes
+ * it with the authoritative final reply or abandons it.
+ */
+export interface ChatOpsReplyStream {
+  /** Feed one chunk of the agent run. Never throws and never blocks. */
+  push(chunk: UIMessageChunk): void;
+  /**
+   * Wait for pending sends and deliver the final reply, posting it normally
+   * if streaming has not started. The final text is authoritative:
+   * when it differs from what was streamed (thinking blocks, rewrites), the
+   * streamed message is replaced with it.
+   */
+  finish(
+    options: Pick<ChatReplyOptions, "text" | "footer" | "hint">,
+  ): Promise<void>;
+  /**
+   * End the stream without a final reply. `keepContent` leaves what was
+   * already shown (the user stopped it); otherwise the message is deleted (the
+   * agent chose silence, the run failed, or a follow-up superseded it).
+   */
+  abandon(options: { keepContent: boolean }): Promise<void>;
+}
+
+export interface AddApprovalRequestFormOptions {
+  channelId: string;
+  threadId?: string;
+  approvalId: string;
+  taskId: string;
+  /**
+   * The tool the user is approving. For a `run_tool` dispatch this is the
+   * underlying target tool, not the `run_tool` wrapper.
+   */
+  toolName: string;
+  /**
+   * The arguments the tool will be invoked with. Approval prompts keep them
+   * out of sight until the reviewer asks for them. Undefined/empty when there
+   * is nothing to show.
+   */
+  toolArgs?: Record<string, unknown>;
+  /** What approving the reviewed call also accepts, one line per item. */
+  alsoAccepts?: string[];
+  /**
+   * OpenAPPA's review text for a paused `execute_remedy_plan` call whose review
+   * names no structured tool, or whose scope is unknown. Shown in place of the tool and its arguments,
+   * which only name the remedy.
+   */
+  reviewText?: string;
+  originalMessage: IncomingChatMessage;
+}
+
+export interface UpdateApprovalRequestOptions {
+  channelId: string;
+  messageKey: string;
+  toolName: string;
+  approved: boolean;
+  /** Provider user id of the reviewer, shown as who decided (Slack). */
+  decidedByUserId?: string;
+  /** Display name of the reviewer, shown as who decided (Telegram). */
+  decidedByName?: string;
+  /**
+   * The paused tool call and its thread, so a streamed reply's task card for
+   * it can be settled too (Slack).
+   */
+  pausedToolCall?: { threadId: string; toolCallId: string };
+}
+
+/**
+ * Approval decision payload shared by chatops providers and approval handlers.
+ */
+export interface ChatOpsApprovalDecision {
+  taskId: string;
+  approvalId: string;
+  approved: boolean;
+  toolName: string;
+  messageTs: string;
+  channelId: string;
+  workspaceId: string | null;
+  originalMessage: IncomingChatMessage;
+  threadTs?: string;
+  userId: string;
+  userName: string;
+  responseUrl: string;
+  approverEmail?: string;
+}
+
+/**
+ * File metadata from a thread history message (not yet downloaded).
+ * Used to carry attachment info from provider-specific history APIs
+ * so the manager can download them for LLM context.
+ */
+export interface ChatThreadMessageFile {
+  /** Download URL for the file */
+  url: string;
+  /** MIME type of the file */
+  mimetype: string;
+  /** Optional filename */
+  name?: string;
+  /** Optional file size in bytes (from provider metadata) */
+  size?: number;
+}
+
+/**
+ * A message in a chat thread history
+ */
+export interface ChatThreadMessage {
+  /** Unique message ID */
+  messageId: string;
+  /** The sender's ID */
+  senderId: string;
+  /** The sender's display name */
+  senderName: string;
+  /** The message text */
+  text: string;
+  /** When the message was sent */
+  timestamp: Date;
+  /** Whether this message was from the bot */
+  isFromBot: boolean;
+  /** File attachments from this message (metadata only, not downloaded) */
+  files?: ChatThreadMessageFile[];
+}
+
+/**
+ * Parameters for fetching thread history
+ */
+export interface ThreadHistoryParams {
+  /** The channel ID */
+  channelId: string;
+  /** The workspace/team ID */
+  workspaceId: string | null;
+  /** The thread/conversation ID */
+  threadId: string;
+  /** Maximum number of messages to fetch */
+  limit?: number;
+  /** Exclude this message ID from results */
+  excludeMessageId?: string;
+}
+
+/**
+ * Result of processing a chatops message
+ */
+export interface ChatOpsProcessingResult {
+  success: boolean;
+  /** The agent response (if successful) */
+  agentResponse?: string;
+  /** Error message (if failed) */
+  error?: string;
+  /** The interaction ID for tracking */
+  interactionId?: string;
+}
+
+/**
+ * A channel discovered by a chatops provider.
+ * Used to auto-populate channel bindings so admins can assign agents from the UI.
+ */
+export interface DiscoveredChannel {
+  channelId: string;
+  channelName: string | null;
+  workspaceId: string;
+  workspaceName: string | null;
+}
+
+/**
+ * Interface for chatops providers (MS Teams, Slack, Discord, etc.)
+ *
+ * Implementations should:
+ * 1. Handle webhook validation and JWT verification
+ * 2. Parse incoming activities/events into IncomingChatMessage
+ * 3. Send replies using provider-specific APIs
+ * 4. Fetch thread history for conversation context
+ * 5. Discover available channels for auto-populating bindings
+ */
+export interface ChatOpsProvider {
+  /** Provider identifier */
+  readonly providerId: ChatOpsProviderType;
+
+  /** Display name for UI */
+  readonly displayName: string;
+
+  /**
+   * The provider's platform API cannot return chat history (Telegram), so the
+   * conversation is kept server-side instead: each thread runs against a
+   * persistent A2A context that accumulates messages across turns.
+   */
+  readonly usesServerSideSessions?: boolean;
+
+  /**
+   * Per-message form of {@link usesServerSideSessions}, for providers whose
+   * platform keeps history for some conversations but not others. MS Teams
+   * reads channel threads from Graph, but its 1:1 and group chats have no
+   * reply threads to read, so those run on server-side sessions.
+   */
+  usesServerSideSessionsFor?(message: IncomingChatMessage): boolean;
+
+  /**
+   * How often to re-send the typing indicator while an agent run is in
+   * flight. For platforms whose indicator expires on its own (Telegram's
+   * lasts ~5s), a heartbeat keeps it visible during long runs. Leave unset
+   * for platforms whose status persists until explicitly cleared.
+   */
+  readonly typingRefreshIntervalMs?: number;
+
+  /**
+   * The agent this connection always answers as (a Slack bot pinned to one
+   * agent). Such a connection skips channel agent assignment and inline
+   * "Agent >" routing.
+   */
+  readonly pinnedAgentId?: string;
+
+  /**
+   * Keeps this connection's per-thread state (sticky replies, stops, runs,
+   * processed messages) apart from other connections of the same provider
+   * that share a channel. Unset for a provider's main connection.
+   */
+  readonly stateScope?: string;
+
+  /**
+   * Check if the provider is properly configured
+   */
+  isConfigured(): boolean;
+
+  /**
+   * Initialize the provider (setup adapters, clients, etc.)
+   * Called once when the server starts if the provider is configured
+   */
+  initialize(): Promise<void>;
+
+  /**
+   * Clean up resources
+   * Called on graceful shutdown
+   */
+  cleanup(): Promise<void>;
+
+  /**
+   * Validate a webhook request (signature/JWT verification)
+   * @param payload - The raw webhook payload
+   * @param headers - HTTP headers from the webhook request
+   * @returns true if the request is valid
+   */
+  validateWebhookRequest(
+    payload: unknown,
+    headers: Record<string, string | string[] | undefined>,
+  ): Promise<boolean>;
+
+  /**
+   * Handle webhook validation challenge (for initial setup)
+   * @param payload - The challenge payload
+   * @returns Response to send back, or null if not a validation request
+   */
+  handleValidationChallenge(payload: unknown): unknown | null;
+
+  /**
+   * Parse a webhook notification into an IncomingChatMessage
+   * @param payload - The raw webhook payload
+   * @param headers - HTTP headers from the webhook request
+   * @returns Parsed message or null if not a processable message
+   */
+  parseWebhookNotification(
+    payload: unknown,
+    headers: Record<string, string | string[] | undefined>,
+  ): Promise<IncomingChatMessage | null>;
+
+  /**
+   * Send a reply to a chat message
+   * @param options - Reply options including original message and response text
+   * @returns The message ID of the sent reply
+   */
+  sendReply(options: ChatReplyOptions): Promise<string>;
+
+  /**
+   * Upload a file into a channel thread so it renders natively (a playable
+   * video, a viewable image). Optional: providers without a file API omit it
+   * and callers surface a clear "unsupported" error instead.
+   */
+  uploadFileToThread?(options: {
+    channelId: string;
+    threadId: string;
+    filename: string;
+    data: Buffer;
+    comment?: string;
+  }): Promise<void>;
+
+  /**
+   * Send a message with Approve/Decline buttons for a single approval request
+   */
+  addApprovalRequestForm(options: AddApprovalRequestFormOptions): Promise<void>;
+
+  /**
+   * Update the status of an existing approval request to Approved/Denied
+   */
+  updateApprovalRequest(options: UpdateApprovalRequestOptions): Promise<void>;
+
+  /**
+   * Send an ephemeral message visible only to a specific user.
+   * Used for welcome messages to auto-provisioned users.
+   * Falls back to a regular reply if ephemeral messaging is not supported.
+   */
+  sendEphemeralMessage?(params: {
+    channelId: string;
+    userId: string;
+    text: string;
+    threadId?: string;
+  }): Promise<void>;
+
+  /**
+   * Send a direct message (DM) to a user.
+   * Used for welcome messages to auto-provisioned users.
+   * @param params.userId - The user's ID in the provider's system
+   * @param params.text - The message text (markdown)
+   * @param params.actionUrl - Optional URL for an action button
+   * @param params.actionLabel - Optional label for the action button
+   */
+  sendDirectMessage?(params: {
+    userId: string;
+    text: string;
+    actionUrl?: string;
+    actionLabel?: string;
+    /** When provided, post to this channel instead of opening a new DM via conversations.open.
+     *  Useful for replying inside an existing DM without routing to the History tab. */
+    channelId?: string;
+    /** When provided, thread the message as a reply to this timestamp.
+     *  Required in DMs so the reply appears in Chat tab instead of History. */
+    threadId?: string;
+  }): Promise<void>;
+
+  /**
+   * Handle a provider-specific interactive payload.
+   * Slack uses this to route approval clicks and agent selections.
+   */
+  handleInteractivePayload?(payload: unknown): Promise<void>;
+
+  /**
+   * Set a typing/loading status indicator (optional, provider-specific).
+   * For Slack: shows "App is thinking..." in the assistant thread.
+   * For Teams: sends a typing activity indicator in DMs/group chats,
+   *   or a placeholder "Thinking..." message in channels (which sendReply
+   *   later updates with the real response).
+   * Non-fatal if unsupported or not configured.
+   *
+   * Implementations may mutate `metadata` to pass state to a subsequent
+   * `sendReply` call (e.g., storing a placeholder message ID). The caller
+   * passes `message.metadata` by reference, so mutations are visible when
+   * `sendReply` reads `options.originalMessage.metadata`.
+   */
+  setTypingStatus?(
+    channelId: string,
+    threadTs: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<void>;
+
+  /**
+   * Explicitly clear processing status or remove an unanswered placeholder.
+   * Metadata carries provider-specific placeholder cleanup state.
+   */
+  clearTypingStatus?(
+    channelId: string,
+    threadTs: string,
+    metadata?: Record<string, unknown>,
+  ): Promise<void>;
+
+  /**
+   * Open a reply stream for this message (optional). The stream posts nothing
+   * until the run produces content, so opening one is free when the agent ends
+   * up silent.
+   */
+  startReplyStream?(message: IncomingChatMessage): ChatOpsReplyStream;
+
+  /**
+   * Get thread/conversation history for context
+   * @param params - Parameters including channel, thread ID, and limit
+   * @returns Array of previous messages, oldest first
+   */
+  getThreadHistory(params: ThreadHistoryParams): Promise<ChatThreadMessage[]>;
+
+  /**
+   * Get a permalink to a specific message in the provider's web UI.
+   * Used to surface a clickable URL in the LLM context so tools can reference
+   * the originating message. Callers pass the message that triggered the run,
+   * not its thread root — Slack encodes the thread in a reply's permalink
+   * (`?thread_ts=`), so the reply link identifies both.
+   * @param params.channelId - The channel ID containing the message
+   * @param params.messageId - The message ID (Slack ts) to link to
+   * @returns Permalink URL, or null if unavailable
+   */
+  getMessagePermalink?(params: {
+    channelId: string;
+    messageId: string;
+  }): Promise<string | null>;
+
+  /**
+   * Get user's email address from their provider-specific ID
+   * Used for security validation to verify the user exists in Archestra
+   * @param userId - The user's ID in the provider's system (e.g., AAD Object ID for MS Teams)
+   * @returns The user's email address, or null if not available
+   */
+  getUserEmail(userId: string): Promise<string | null>;
+
+  /**
+   * Provider-specific guidance shown when the sender's identity cannot be
+   * resolved. Providers with no email concept (e.g. Telegram, where users must
+   * link their account first) override the generic manager message.
+   */
+  identityVerificationFailureText?(): string;
+
+  /**
+   * Get user's display name from their provider-specific ID.
+   * Used for auto-provisioning to set a meaningful user name.
+   * @param userId - The user's ID in the provider's system
+   * @returns The user's display name, or null if not available
+   */
+  getUserName?(userId: string): Promise<string | null>;
+
+  /**
+   * Get a channel's display name from its provider-specific ID.
+   * Used when creating early bindings for channels not yet in the discovery cache.
+   * @param channelId - The channel ID in the provider's system
+   * @returns The channel name, or null if not available
+   */
+  getChannelName(channelId: string): Promise<string | null>;
+
+  /**
+   * The description people gave a channel in the chat app (Slack's channel
+   * purpose), or null when it has none. Channel members write it, so it is
+   * context for the agent, never instructions.
+   */
+  getChannelDescription?(channelId: string): Promise<string | null>;
+
+  /**
+   * Parse an interactive payload (e.g. button click) into a structured selection.
+   * Each provider implements its own payload parsing (Block Kit for Slack, Adaptive Card for MS Teams).
+   * @param payload - The raw interactive payload from the provider
+   * @returns Parsed selection or null if not a valid agent selection
+   */
+  parseInteractivePayload(payload: unknown): {
+    agentId: string;
+    channelId: string;
+    workspaceId: string | null;
+    threadTs?: string;
+    userId: string;
+    userName: string;
+    responseUrl: string;
+    /**
+     * Whether the selection happened in a DM. Providers whose channel IDs
+     * don't encode this (e.g. Telegram's numeric chat IDs) set it explicitly;
+     * when absent the manager falls back to Slack's "D"-prefix convention.
+     */
+    isDm?: boolean;
+  } | null;
+
+  /**
+   * Send an agent selection card/message to a channel.
+   * Each provider renders the card in its native format (Adaptive Card for MS Teams, Block Kit for Slack).
+   * @param params.message - The incoming message that triggered the selection
+   * @param params.agents - Available agents to choose from
+   * @param params.isWelcome - Whether this is a first-time welcome (true) or a change-agent request (false)
+   * @param params.providerContext - Provider-specific context (e.g., TurnContext for MS Teams)
+   */
+  sendAgentSelectionCard(params: {
+    message: IncomingChatMessage;
+    agents: { id: string; name: string }[];
+    isWelcome: boolean;
+    providerContext?: unknown;
+  }): Promise<void>;
+
+  /**
+   * Get the workspace/team ID for this provider, if known without an incoming message.
+   * Used for eager channel discovery on startup.
+   * Returns null if the workspace ID can only be determined from incoming messages
+   * (e.g., MS Teams requires a TurnContext to know which team).
+   */
+  getWorkspaceId(): string | null;
+
+  /**
+   * Get the workspace/team display name for this provider, if known.
+   * Used to populate workspaceName on channel bindings (including DMs).
+   */
+  getWorkspaceName(): string | null;
+
+  /**
+   * Check whether the provider is missing any required scopes/permissions.
+   * Used to trigger rate-limited user notifications about scope drift.
+   */
+  hasMissingScopes(): boolean;
+
+  /**
+   * Send a rate-limited notification to the user about missing scopes/permissions.
+   * Implementations should throttle notifications (e.g., once per 30 days per workspace).
+   * No-op if the provider has no missing scopes or doesn't support scope detection.
+   * @param message - The incoming message to reply in-thread to
+   */
+  notifyMissingScopes(message: IncomingChatMessage): Promise<void>;
+
+  /**
+   * Download files from thread history messages.
+   * Reuses the provider's existing download logic (auth headers, SSRF protection, etc.).
+   * @param files - File metadata from thread history messages
+   * @returns One outcome per input file, positionally aligned with `files`:
+   * either the downloaded attachment (base64-encoded A2A format) or the
+   * skip record explaining why it was not delivered
+   */
+  downloadFiles(files: ChatThreadMessageFile[]): Promise<ThreadFileOutcome[]>;
+
+  /**
+   * Download files of the incoming message that the platform does not put on
+   * the message itself (MS Teams channels and group chats keep them in
+   * SharePoint). Called only for a message the bot is answering.
+   * @returns One outcome per file found on the message
+   */
+  downloadMessageFiles?(
+    message: IncomingChatMessage,
+  ): Promise<ThreadFileOutcome[]>;
+
+  /**
+   * Ask the sender to sign in so their `sign_in_required` files become
+   * readable, holding the message to answer once they have (MS Teams
+   * channels and group chats). Returns false when no sign-in could be
+   * offered.
+   */
+  requestFileSignIn?(params: {
+    message: IncomingChatMessage;
+    fileNames: string[];
+  }): Promise<boolean>;
+
+  /**
+   * Discover all channels in a workspace/team.
+   * Used to auto-populate channel bindings so admins can assign agents from the UI.
+   * @param context - Provider-specific context (e.g., TurnContext for MS Teams)
+   * @returns Discovered channels, or null if context doesn't support discovery
+   */
+  discoverChannels(context: unknown): Promise<DiscoveredChannel[] | null>;
+}
+
+/**
+ * Callback interface for socket-mode providers to delegate events
+ * back to the ChatOpsManager without depending on it directly.
+ */
+export interface ChatOpsEventHandler {
+  handleIncomingMessage(
+    provider: ChatOpsProvider,
+    body: unknown,
+  ): Promise<void>;
+  handleInteractiveApprovalDecision(
+    provider: ChatOpsProvider,
+    decision: ChatOpsApprovalDecision,
+    updateApprovalRequestCallback?: () => Promise<void> | void,
+  ): Promise<void>;
+  handleInteractiveSelection(
+    provider: ChatOpsProvider,
+    payload: unknown,
+  ): Promise<void>;
+  getAccessibleChatopsAgents({
+    senderEmail,
+    isDm,
+  }: {
+    senderEmail?: string;
+    isDm: boolean;
+  }): Promise<{ id: string; name: string }[]>;
+}
+
+/**
+ * MS Teams specific configuration from environment variables
+ */
+export interface MSTeamsConfig {
+  enabled: boolean;
+  /** Azure Bot App ID */
+  appId: string;
+  /** Azure Bot App Secret (Client Secret) */
+  appSecret: string;
+  /** Optional Graph API configuration for thread history */
+  graph?: {
+    tenantId: string;
+    clientId: string;
+    clientSecret: string;
+  };
+}
+
+/** MS Teams config stored as a DB secret */
+export interface MsTeamsDbConfig {
+  enabled: boolean;
+  appId: string;
+  appSecret: string;
+  tenantId: string;
+  graphTenantId: string;
+  graphClientId: string;
+  graphClientSecret: string;
+  /**
+   * Whether people may sign in to the bot so it can read the files they send
+   * in group chats, and in channels the app's site grant does not cover.
+   * Needs the sign-in redirect URI on the bot's Entra app.
+   */
+  groupChatFileSignIn?: boolean;
+}
+
+/** Slack config stored as a DB secret */
+export interface SlackDbConfig {
+  enabled: boolean;
+  botToken: string;
+  signingSecret: string;
+  appId: string;
+  connectionMode?: ChatOpsConnectionMode;
+  appLevelToken?: string;
+  /**
+   * OAuth client credentials of an app Archestra created itself (see
+   * SlackAppFactory): used to install it, and the mark that Archestra may
+   * delete it from Slack again.
+   */
+  clientId?: string;
+  clientSecret?: string;
+  /**
+   * Archestra manages this app's Slack settings: it created the app, or
+   * migrated an existing one (see SlackAppFactory.migrateExistingApps). Such
+   * an app is deleted from Slack when its bot is removed.
+   */
+  managed?: boolean;
+  /**
+   * The user whose Slack configuration token created or adopted this app.
+   * Slack makes that person the app's only collaborator, so later changes to
+   * the app go through their token. Unset for apps managed with the
+   * organization-wide token saved before tokens were per user.
+   */
+  configTokenUserId?: string;
+}
+
+/**
+ * An additional Slack app whose bot always answers as one agent, so people can
+ * @mention that agent by its own name (`@archestra_marketing`) in any channel.
+ */
+export interface SlackAgentBotConfig extends SlackDbConfig {
+  agentId: string;
+  /**
+   * The bot's name follows the agent's: renaming the agent renames the bot.
+   * Off once someone picks a handle of their own.
+   */
+  handleFollowsAgent?: boolean;
+  /** The agent name the bot's handle was last set from. */
+  syncedAgentName?: string;
+  /** Fingerprint of the agent icon last set as the app icon. */
+  syncedIconHash?: string;
+  /** Why Slack refused the last name or icon update, until one succeeds. */
+  identitySyncError?: string;
+}
+
+/** What happened to one Slack app when Archestra brought it up to date. */
+export interface SlackAppMigrationResult {
+  appId: string;
+  /** Set for an agent bot; unset for the main Slack app. */
+  agentId?: string;
+  ok: boolean;
+  error?: string;
+  /** Slack wants the app reinstalled to grant changed scopes. */
+  reinstallUrl?: string;
+}
+
+/**
+ * A Slack app configuration token, which lets Archestra create Slack apps from
+ * a manifest. Slack expires it every 12 hours; the refresh token renews it.
+ */
+export interface SlackAppConfigToken {
+  accessToken: string;
+  refreshToken: string;
+  /** Epoch milliseconds. */
+  expiresAt: number;
+}
+
+/** Telegram config stored as a DB secret */
+export interface TelegramDbConfig {
+  enabled: boolean;
+  /** Bot token from @BotFather */
+  botToken: string;
+}
+
+/** ngrok tunnel config stored as a DB secret */
+export interface NgrokDbConfig {
+  authToken: string;
+  /** Optional reserved domain for a stable public URL across restarts. */
+  domain: string;
+  /**
+   * False when the user explicitly stopped the tunnel — credentials are kept
+   * for reconnecting, but the tunnel must not come back up on restart.
+   * Missing (older rows) means enabled.
+   */
+  enabled?: boolean;
+}

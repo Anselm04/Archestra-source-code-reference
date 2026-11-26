@@ -1,0 +1,308 @@
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+/**
+ * Mistral LLM Proxy Adapter - OpenAI-compatible
+ *
+ * Mistral uses an OpenAI-compatible API at https://api.mistral.ai/v1
+ * This adapter reuses OpenAI's adapter factory with Mistral-specific configuration.
+ *
+ * Since Mistral is 100% OpenAI-compatible, we delegate all adapter logic to OpenAI
+ * and only override the provider-specific configuration (baseUrl, provider name, etc.).
+ *
+ * @see https://docs.mistral.ai/api
+ */
+
+import { ArchestraInternalErrorCode } from "@archestra/shared";
+import { get } from "lodash-es";
+import OpenAIProvider from "openai";
+import type {
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
+} from "openai/resources/chat/completions/completions";
+import config from "@/config";
+import { metrics } from "@/observability";
+import type {
+  CreateClientOptions,
+  LLMProvider,
+  LLMRequestAdapter,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  Mistral,
+  StreamAccumulatorState,
+} from "@/types";
+import { streamChatCompletionChunks } from "./chat-completions-stream";
+import {
+  OpenAIRequestAdapter,
+  OpenAIResponseAdapter,
+  OpenAIStreamAdapter,
+} from "./openai";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+
+// =============================================================================
+// TYPE ALIASES (reuse OpenAI types since Mistral is OpenAI-compatible)
+// =============================================================================
+
+type MistralRequest = Mistral.Types.ChatCompletionsRequest;
+type MistralResponse = Mistral.Types.ChatCompletionsResponse;
+type MistralMessages = Mistral.Types.ChatCompletionsRequest["messages"];
+type MistralHeaders = Mistral.Types.ChatCompletionsHeaders;
+type MistralStreamChunk = Mistral.Types.ChatCompletionChunk;
+
+// =============================================================================
+// ADAPTER CLASSES (delegate to OpenAI adapters, override provider)
+// =============================================================================
+
+/**
+ * Mistral request adapter - wraps OpenAI adapter with Mistral provider name.
+ * Uses composition to delegate all logic to OpenAI since APIs are identical.
+ */
+class MistralRequestAdapter
+  implements LLMRequestAdapter<MistralRequest, MistralMessages>
+{
+  readonly provider = "mistral" as const;
+  private delegate: OpenAIRequestAdapter;
+
+  constructor(request: MistralRequest) {
+    this.delegate = new OpenAIRequestAdapter(request);
+  }
+
+  getModel() {
+    return this.delegate.getModel();
+  }
+  isStreaming() {
+    return this.delegate.isStreaming();
+  }
+  getMessages() {
+    return this.delegate.getMessages();
+  }
+  getToolResults() {
+    return this.delegate.getToolResults();
+  }
+  getTools() {
+    return this.delegate.getTools();
+  }
+  hasTools() {
+    return this.delegate.hasTools();
+  }
+  getProviderMessages() {
+    return this.delegate.getProviderMessages();
+  }
+  getOriginalRequest() {
+    return this.delegate.getOriginalRequest();
+  }
+  setModel(model: string) {
+    return this.delegate.setModel(model);
+  }
+  updateToolResult(toolCallId: string, newContent: string) {
+    return this.delegate.updateToolResult(toolCallId, newContent);
+  }
+  applyToolResultUpdates(updates: Record<string, string>) {
+    return this.delegate.applyToolResultUpdates(updates);
+  }
+  convertToolResultContent(messages: MistralMessages) {
+    return this.delegate.convertToolResultContent(messages);
+  }
+  toProviderRequest(options?: { preserveToolCallIds?: boolean }) {
+    return this.delegate.toProviderRequest(options);
+  }
+}
+
+/**
+ * Mistral response adapter - wraps OpenAI adapter with Mistral provider name.
+ */
+class MistralResponseAdapter implements LLMResponseAdapter<MistralResponse> {
+  readonly provider = "mistral" as const;
+  private delegate: OpenAIResponseAdapter;
+
+  constructor(response: MistralResponse) {
+    this.delegate = new OpenAIResponseAdapter(response);
+  }
+
+  getId() {
+    return this.delegate.getId();
+  }
+  getModel() {
+    return this.delegate.getModel();
+  }
+  getText() {
+    return this.delegate.getText();
+  }
+  getToolCalls() {
+    return this.delegate.getToolCalls();
+  }
+  hasToolCalls() {
+    return this.delegate.hasToolCalls();
+  }
+  getUsage() {
+    return this.delegate.getUsage();
+  }
+  getFinishReasons() {
+    return this.delegate.getFinishReasons();
+  }
+  getOriginalResponse() {
+    return this.delegate.getOriginalResponse();
+  }
+  toRefusalResponse(refusalMessage: string, contentMessage: string) {
+    return this.delegate.toRefusalResponse(refusalMessage, contentMessage);
+  }
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ) {
+    return this.delegate.withRewrittenToolCalls(toolCalls);
+  }
+}
+
+/**
+ * Mistral stream adapter - wraps OpenAI adapter with Mistral provider name.
+ */
+class MistralStreamAdapter
+  implements LLMStreamAdapter<MistralStreamChunk, MistralResponse>
+{
+  readonly provider = "mistral" as const;
+  private delegate: OpenAIStreamAdapter;
+
+  constructor(request?: MistralRequest) {
+    this.delegate = new OpenAIStreamAdapter({ clientRequest: request });
+  }
+
+  get state() {
+    return this.delegate.state;
+  }
+
+  processChunk(chunk: MistralStreamChunk) {
+    return this.delegate.processChunk(chunk);
+  }
+  getSSEHeaders() {
+    return this.delegate.getSSEHeaders();
+  }
+  formatTextDeltaSSE(text: string) {
+    return this.delegate.formatTextDeltaSSE(text);
+  }
+  setTextSuffix(getSuffix: (completedText: string) => string) {
+    this.delegate.setTextSuffix(getSuffix);
+  }
+  getRawToolCallEvents() {
+    return this.delegate.getRawToolCallEvents();
+  }
+  formatCompleteTextSSE(text: string) {
+    return this.delegate.formatCompleteTextSSE(text);
+  }
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]) {
+    return this.delegate.formatToolCallsSSE(toolCalls);
+  }
+  formatEndSSE() {
+    return this.delegate.formatEndSSE();
+  }
+  toProviderResponse() {
+    return this.delegate.toProviderResponse();
+  }
+}
+
+// =============================================================================
+// ADAPTER FACTORY
+// =============================================================================
+
+export const mistralAdapterFactory: LLMProvider<
+  MistralRequest,
+  MistralResponse,
+  MistralMessages,
+  MistralStreamChunk,
+  MistralHeaders
+> = {
+  provider: "mistral",
+  interactionType: "mistral:chatCompletions",
+
+  createRequestAdapter(
+    request: MistralRequest,
+  ): LLMRequestAdapter<MistralRequest, MistralMessages> {
+    return new MistralRequestAdapter(request);
+  },
+
+  createResponseAdapter(
+    response: MistralResponse,
+  ): LLMResponseAdapter<MistralResponse> {
+    return new MistralResponseAdapter(response);
+  },
+
+  createStreamAdapter(
+    request?: MistralRequest,
+  ): LLMStreamAdapter<MistralStreamChunk, MistralResponse> {
+    return new MistralStreamAdapter(request);
+  },
+
+  extractApiKey(headers: MistralHeaders): string | undefined {
+    return headers.authorization;
+  },
+
+  getBaseUrl(): string | undefined {
+    return config.llm.mistral.baseUrl;
+  },
+
+  spanName: "chat",
+
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): OpenAIProvider {
+    const customFetch = options.agent
+      ? metrics.llm.getObservableFetch("mistral", options.agent, options.source)
+      : undefined;
+
+    return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      apiKey,
+      baseURL: options.baseUrl ?? config.llm.mistral.baseUrl,
+      fetch: fetchWithAbortSignal(customFetch, options.abortSignal),
+      defaultHeaders: options.defaultHeaders,
+    });
+  },
+
+  async execute(
+    client: unknown,
+    request: MistralRequest,
+  ): Promise<MistralResponse> {
+    const mistralClient = client as OpenAIProvider;
+    const mistralRequest = {
+      ...request,
+      stream: false,
+    } as unknown as ChatCompletionCreateParamsNonStreaming;
+    // Cast through unknown because MistralResponse uses .passthrough() which adds index signature
+    return mistralClient.chat.completions.create(
+      mistralRequest,
+    ) as unknown as Promise<MistralResponse>;
+  },
+
+  async executeStream(
+    client: unknown,
+    request: MistralRequest,
+  ): Promise<AsyncIterable<MistralStreamChunk>> {
+    const mistralClient = client as OpenAIProvider;
+    const mistralRequest = {
+      ...request,
+      stream: true,
+      stream_options: { include_usage: true },
+    } as unknown as ChatCompletionCreateParamsStreaming;
+    return streamChatCompletionChunks<MistralStreamChunk>(
+      mistralClient.chat.completions.create(mistralRequest),
+    );
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    if (get(error, "error.code") === "context_length_exceeded") {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return undefined;
+  },
+
+  extractErrorMessage(error: unknown): string {
+    const openaiMessage = get(error, "error.message");
+    if (typeof openaiMessage === "string") {
+      return openaiMessage;
+    }
+
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return "Internal server error";
+  },
+};

@@ -1,0 +1,468 @@
+import { RouteId } from "@archestra/shared";
+import {
+  permissionDescriptions,
+  requiredEndpointPermissionsMap,
+} from "@archestra/shared/access-control";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+
+// === Exports ===
+
+export function enrichOpenApiWithRbac<T extends OpenApiDocument>(spec: T): T {
+  const clonedSpec = structuredClone(spec);
+
+  for (const [path, pathItem] of Object.entries(clonedSpec.paths ?? {})) {
+    if (!pathItem) {
+      continue;
+    }
+
+    for (const operation of getOperations(pathItem)) {
+      if (hasTag(operation, "LLM Proxy")) {
+        operation.description = appendDescriptionSection(
+          operation.description,
+          createLlmProxyAuthenticationSection(operation.operationId),
+        );
+      }
+
+      if (!operation.operationId) {
+        continue;
+      }
+
+      if (!path.startsWith("/api/")) {
+        continue;
+      }
+
+      const rbacMetadata = getRbacMetadata(operation.operationId);
+      operation["x-required-permissions"] = rbacMetadata;
+
+      operation.description = appendDescriptionSection(
+        operation.description,
+        createAuthenticationSection(operation.operationId),
+      );
+      operation.description = appendDescriptionSection(
+        operation.description,
+        createPermissionSection(rbacMetadata),
+      );
+    }
+  }
+
+  brandSpecTextInPlace(clonedSpec);
+  linkPermissionReferencesInPlace(clonedSpec);
+  return clonedSpec;
+}
+
+// === Internal helpers ===
+
+/**
+ * Rebrand the prose fields of the served spec.
+ *
+ * Route schemas are registered while the server is being built, which happens
+ * *before* the branding singleton is synced from the organization — so a route's
+ * `description` cannot resolve the app name where it is written. The spec is
+ * assembled per request, though, which makes this the one place that can.
+ *
+ * Only `description`/`summary` are rewritten, never arbitrary strings: schema
+ * ids, `$ref` targets, operationIds and enum values are wire identifiers, and
+ * rewriting a `$ref` value while its schema key stays put would produce a spec
+ * that no longer resolves. `brandBuiltInText` is a no-op for non-white-labeled
+ * deployments.
+ *
+ * Mutates the given node in place — the caller hands it the fresh
+ * `structuredClone` it is about to serve, so nothing shared is touched and a
+ * copying transform would only churn allocations on every /openapi.json hit.
+ */
+const BRANDABLE_SPEC_KEYS = new Set(["description", "summary"]);
+
+function linkPermissionReferencesInPlace(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) linkPermissionReferencesInPlace(item);
+    return;
+  }
+  if (!node || typeof node !== "object") return;
+  for (const [key, child] of Object.entries(node)) {
+    if (key === "description" && typeof child === "string") {
+      (node as Record<string, unknown>)[key] = child.replace(
+        /(?<!\[)`([A-Za-z][A-Za-z0-9]*:[A-Za-z-]+)`(?!\]\()/g,
+        (match, permission: string) =>
+          Object.hasOwn(permissionDescriptions, permission)
+            ? `[${match}](/docs/reference/permissions#${permission})`
+            : match,
+      );
+    } else {
+      linkPermissionReferencesInPlace(child);
+    }
+  }
+}
+
+function brandSpecTextInPlace(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      brandSpecTextInPlace(item);
+    }
+    return;
+  }
+  if (node && typeof node === "object") {
+    for (const [key, child] of Object.entries(node)) {
+      if (typeof child === "string" && BRANDABLE_SPEC_KEYS.has(key)) {
+        (node as Record<string, unknown>)[key] =
+          archestraMcpBranding.brandBuiltInText(child);
+      } else {
+        brandSpecTextInPlace(child);
+      }
+    }
+  }
+}
+
+// === Types ===
+
+type OpenApiDocument = {
+  info?: {
+    title?: string;
+    version?: string;
+  };
+  paths?: Record<string, OpenApiPathItem | undefined>;
+};
+
+type OpenApiPathItem = Partial<
+  Record<HttpMethod, OpenApiOperation | undefined>
+>;
+
+type OpenApiOperation = {
+  operationId?: string;
+  description?: string;
+  tags?: string[];
+  "x-required-permissions"?: RequiredPermissionsExtension;
+};
+
+type HttpMethod =
+  | "delete"
+  | "get"
+  | "head"
+  | "options"
+  | "patch"
+  | "post"
+  | "put"
+  | "trace";
+
+type RequiredPermissionsExtension = {
+  kind: "dynamic" | "none" | "static";
+  note?: string;
+  permissions: string[];
+};
+
+// === Internal helpers ===
+
+function getOperations(pathItem: OpenApiPathItem): OpenApiOperation[] {
+  return Object.entries(pathItem)
+    .filter(([method]) => HTTP_METHODS.has(method as HttpMethod))
+    .map(([, operation]) => operation)
+    .filter(
+      (operation): operation is OpenApiOperation =>
+        operation !== undefined && operation !== null,
+    );
+}
+
+function hasTag(operation: OpenApiOperation, tag: string): boolean {
+  return operation.tags?.includes(tag) ?? false;
+}
+
+function getRbacMetadata(operationId: string): RequiredPermissionsExtension {
+  const dynamicNote =
+    DYNAMIC_ROUTE_PERMISSION_NOTES[
+      operationId as keyof typeof DYNAMIC_ROUTE_PERMISSION_NOTES
+    ];
+  if (dynamicNote) {
+    return {
+      kind: "dynamic",
+      note: dynamicNote,
+      permissions: [],
+    };
+  }
+
+  const permissions = flattenPermissions(
+    requiredEndpointPermissionsMap[
+      operationId as keyof typeof requiredEndpointPermissionsMap
+    ],
+  );
+  if (permissions.length === 0) {
+    return {
+      kind: "none",
+      note: "None (no additional RBAC permission required)",
+      permissions: [],
+    };
+  }
+
+  const note =
+    STATIC_ROUTE_PERMISSION_NOTES[
+      operationId as keyof typeof STATIC_ROUTE_PERMISSION_NOTES
+    ];
+
+  return {
+    kind: "static",
+    ...(note ? { note } : {}),
+    permissions,
+  };
+}
+
+function flattenPermissions(
+  permissions: Record<string, string[]> | undefined,
+): string[] {
+  if (!permissions) {
+    return [];
+  }
+
+  return Object.entries(permissions)
+    .flatMap(([resource, actions]) =>
+      [...actions].sort().map((action) => `${resource}:${action}`),
+    )
+    .sort();
+}
+
+function appendDescriptionSection(
+  description: string | undefined,
+  section: string,
+): string {
+  if (!description) {
+    return section;
+  }
+
+  return `${description}\n\n${section}`;
+}
+
+function createAuthenticationSection(operationId: string): string {
+  if (operationId === RouteId.McpAppProxyPost) {
+    return [
+      "Authentication:",
+      "",
+      // white-label-ok: App auth prose is rebranded by brandSpecTextInPlace before serving the spec.
+      "Use a browser session or an Archestra API key. External MCP clients can send a personal token or an app-scoped OAuth access token as a Bearer token. Organization and team tokens cannot access an app because they have no viewer.",
+    ].join("\n");
+  }
+  if (
+    PUBLIC_UNAUTHENTICATED_ROUTE_IDS.has(
+      operationId as typeof PUBLIC_UNAUTHENTICATED_ROUTE_IDS extends Set<
+        infer T
+      >
+        ? T
+        : never,
+    )
+  ) {
+    return ["Authentication:", "", "Not required."].join("\n");
+  }
+
+  return [
+    "Authentication:",
+    "",
+    // white-label-ok: OpenAPI prose; this section is appended to the operation's
+    // description, which brandSpecTextInPlace rebrands with everything else —
+    // branding it inline too would just be the same swap twice.
+    "Required. Use an authenticated browser session or send your Archestra API key in the `Authorization` header.",
+  ].join("\n");
+}
+
+const PROVIDER_FILE_ROUTES = new Set<string>([
+  RouteId.AzureCreateFile,
+  RouteId.AzureCreateFileWithAgent,
+  RouteId.AzureRetrieveFile,
+  RouteId.AzureRetrieveFileWithAgent,
+  RouteId.AzureListFiles,
+  RouteId.AzureListFilesWithAgent,
+  RouteId.AzureFileContent,
+  RouteId.AzureFileContentWithAgent,
+  RouteId.AzureDeleteFile,
+  RouteId.AzureDeleteFileWithAgent,
+]);
+
+function createLlmProxyAuthenticationSection(operationId?: string): string {
+  if (operationId?.startsWith("modelRouter"))
+    return [
+      "Authentication:",
+      "",
+      "Requires a mapped standard Virtual API Key or LLM OAuth access token, sent as a Bearer token. Provider API keys, passthrough keys, and external identity-provider JWTs are not accepted. See [Unified Model API](/docs/llm-proxy/unified-model).",
+    ].join("\n");
+  if (operationId && PROVIDER_FILE_ROUTES.has(operationId))
+    return [
+      "Authentication:",
+      "",
+      "Requires an authenticated platform principal and one permitted configured Azure account. A provider key alone is insufficient. File handles are scoped to the principal, organization, and provider account. See [Azure Provider Files](/docs/llm-proxy/providers/azure#use-provider-files).",
+    ].join("\n");
+  return [
+    "Authentication:",
+    "",
+    "This route accepts either an LLM provider API key or a Virtual API Key. See [LLM Proxy Authentication](/docs/llm-proxy/authentication).",
+  ].join("\n");
+}
+
+function createPermissionSection(
+  metadata: RequiredPermissionsExtension,
+): string {
+  if (metadata.kind === "static") {
+    return [
+      "Authorization:",
+      "",
+      ...metadata.permissions.map(
+        (permission) =>
+          `\`${permission}\`: ${permissionDescriptions[permission] ?? "No description available"}`,
+      ),
+      ...(metadata.note ? ["", metadata.note] : []),
+    ].join("\n");
+  }
+
+  return [
+    "Authorization:",
+    "",
+    metadata.note ?? "None (no additional RBAC permission required)",
+  ].join("\n");
+}
+
+const HTTP_METHODS = new Set<HttpMethod>([
+  "delete",
+  "get",
+  "head",
+  "options",
+  "patch",
+  "post",
+  "put",
+  "trace",
+]);
+
+const DYNAMIC_ROUTE_PERMISSION_NOTES = {
+  [RouteId.McpProxyPost]:
+    "The caller must have access to the agent. App tools must be visible to apps.",
+  [RouteId.McpAppProxyPost]:
+    "The caller must have `use` access to the app. Calls to assigned tools must be allowed for the app.",
+  [RouteId.McpServerProxyPost]:
+    "The caller must have access to the installed MCP server. App tools must be visible to apps.",
+  [RouteId.GetLimits]:
+    "Requires `llmLimit:read` for organization-wide access. A session-authenticated team admin receives only limits for teams they directly administer, with optional entity filters.",
+  [RouteId.GetLimit]:
+    "Requires `llmLimit:read`, or a session-authenticated team admin for a limit on their own team.",
+  [RouteId.GetTeamStatistics]:
+    "Requires `llmCost:read` for every team in the active organization. A session-authenticated team admin without it receives only the teams they administer and their sub-teams; any other caller gets 403, and so does a team admin filtering by another team.",
+  [RouteId.GetCostStatistics]:
+    "Requires `llmCost:read` for the whole organization. A session-authenticated team admin without it receives only requests charged to the teams they administer and their sub-teams; any other caller gets 403, and so does a team admin filtering by another team.",
+  [RouteId.CreateLimit]:
+    "Requires `llmLimit:create`, or a session-authenticated team admin creating a limit on their own team.",
+  [RouteId.UpdateLimit]:
+    "Requires `llmLimit:update`, or a session-authenticated team admin updating a limit on their own team.",
+  [RouteId.ResetLimitUsage]:
+    "Requires `llmLimit:update`, or a session-authenticated team admin resetting a limit on their own team.",
+  [RouteId.DeleteLimit]:
+    "Requires `llmLimit:delete`, or a session-authenticated team admin deleting a limit on their own team.",
+  [RouteId.BulkDeleteLimits]:
+    "Requires `llmLimit:delete`, or a session-authenticated team admin deleting only limits for teams they administer. Unauthorized targets are reported as not found.",
+  [RouteId.GetLimitLabelKeys]:
+    "Requires `llmLimit:read`, or a session-authenticated team admin. Label suggestions include only visible limits.",
+  [RouteId.GetLimitLabelValues]:
+    "Requires `llmLimit:read`, or a session-authenticated team admin. Label suggestions include only visible limits.",
+  [RouteId.GetOrganizationMemberOptions]:
+    "All authenticated callers may search visible member identities. member:read returns the organization roster; other callers receive only teammates in the active organization.",
+  [RouteId.GetAgentCatalog]:
+    "Requires `agent:read`; when `status=deleted`, requires `agent:delete`. External A2A rows are limited to agents visible to the caller unless they have `organizationSettings:update`; when `selectableOnly=true`, external rows are omitted unless the caller has that permission.",
+  [RouteId.GetAgents]:
+    "Checked dynamically based on agent type. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`. If no type filter is provided, the user must have read access to at least one agent type.",
+  [RouteId.GetAgentOptions]:
+    "Checked dynamically based on agent type. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`. If no type filter is provided, the user must have read access to at least one agent type.",
+  [RouteId.GetChatAgentRoster]:
+    "Requires `agent:read`; only internal agents visible to the caller are returned.",
+  [RouteId.GetAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`.",
+  [RouteId.PinAgent]:
+    "Checked dynamically based on the target agent's type and the caller's visibility. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`.",
+  [RouteId.CreateAgent]:
+    "Checked dynamically based on the agent type being created. `profile` and `agent` require `agent:create`; `mcp_gateway` requires `mcpGateway:create`. Grants on the agent may further restrict the request.",
+  [RouteId.UpdateAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:update`; `mcp_gateway` requires `mcpGateway:update`. Grants on the agent may further restrict the request.",
+  [RouteId.DeleteAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:delete`; `mcp_gateway` requires `mcpGateway:delete`. Additional scope checks may apply.",
+  [RouteId.RestoreAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:delete`; `mcp_gateway` requires `mcpGateway:delete`. Additional scope checks may apply.",
+  [RouteId.GetLogEvents]:
+    "Requires `log:read`, `guardrailsLog:read`, `clientConnection:read`, or `auditLog:read`. Each type is returned under its own permission: LLM Proxy and MCP Gateway under `log`, Guardrails under `guardrailsLog`, client connections under `clientConnection`, and audit events under `auditLog`. `read` returns the caller's own records, and `admin` returns everyone's.",
+  [RouteId.GetLogStats]:
+    "Requires `log:read`, `guardrailsLog:read`, `clientConnection:read`, or `auditLog:read`. Each type is returned under its own permission: LLM Proxy and MCP Gateway under `log`, Guardrails under `guardrailsLog`, client connections under `clientConnection`, and audit events under `auditLog`. `read` returns the caller's own records, and `admin` returns everyone's.",
+  [RouteId.CreateRuntimeCredential]:
+    "Checked dynamically based on the credential being created. A credential just for the caller (`allowPersonal: true`, `allowOrganization: false`, no `initialGrants`) needs no permission, and only its author can reach it. Organization credentials and credentials created with grants require `credential:create`.",
+  // The three purge routes are gated by role, not by permission: the caller
+  // must hold a built-in admin role. Recorded here because the static
+  // permission alone would advertise `delete` as sufficient, and the handler's
+  // refusal is a 404 — so a caller acting on that would see "not found" rather
+  // than anything pointing at the missing access.
+  [RouteId.PermanentlyDeleteAgent]:
+    "Restricted to the built-in Admin and Platform Admin roles. No permission grants it: `agent:delete` and even `agent:admin` reach the trash, not past it, and a service account never qualifies. A caller without it gets 404, not 403, so the endpoint never confirms the agent exists.",
+  [RouteId.PermanentlyDeleteSkill]:
+    "Restricted to the built-in Admin and Platform Admin roles. No permission grants it: `skill:delete` and even `skill:admin` reach the trash, not past it, and a service account never qualifies. A caller without it gets 404, not 403, so the endpoint never confirms the skill exists.",
+  [RouteId.PermanentlyDeleteProject]:
+    "Restricted to the built-in Admin and Platform Admin roles. No permission grants it: `project:delete`, `project:admin`, and ownership of the project all reach the trash, not past it, and a service account never qualifies. A caller without it gets 404, not 403, so the endpoint never confirms the project exists.",
+} satisfies Partial<Record<RouteId, string>>;
+
+const STATIC_ROUTE_PERMISSION_NOTES = {
+  [RouteId.GetLlmProxyLogs]:
+    "`log:read` returns the caller's rows. `log:admin` includes every row in the active organization.",
+  [RouteId.GetLlmProxyLogSummaries]:
+    "`log:read` returns the caller's rows. `log:admin` includes every row in the active organization.",
+  [RouteId.GetLlmProxyLogSessions]:
+    "`log:read` returns the caller's sessions. `log:admin` includes every session in the active organization.",
+  [RouteId.GetLlmProxyLogExternalAgentIds]:
+    "`log:read` returns identifiers from the caller's rows. `log:admin` includes identifiers from every row in the active organization.",
+  [RouteId.GetLlmProxyLogUserIds]:
+    "`log:read` returns the caller's identity. `log:admin` includes every represented user in the active organization.",
+  [RouteId.GetLlmProxyLog]:
+    "`log:read` permits a row attributed to the caller. `log:admin` permits any row in the active organization.",
+  [RouteId.GetInteractions]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetInteractionSummaries]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetInteractionSessions]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetUniqueExternalAgentIds]:
+    "`log:read` returns identifiers from rows attributed to the caller. `log:admin` includes identifiers from every row in the active organization.",
+  [RouteId.GetUniqueUserIds]:
+    "`log:read` returns the caller's identity. `log:admin` includes every represented user in the active organization.",
+  [RouteId.GetInteraction]:
+    "`log:read` permits a row attributed to the caller. `log:admin` permits any row in the active organization.",
+  [RouteId.GetOpenappaGuardrailEvents]:
+    "`guardrailsLog:read` returns the consults and yells of the caller's sessions. `guardrailsLog:admin` includes every session in the active organization.",
+  [RouteId.GetOpenappaExternalConsults]:
+    "`guardrailsLog:read` returns the consults of the caller's sessions. `guardrailsLog:admin` includes every session in the active organization.",
+  [RouteId.GetOpenappaExternalConsult]:
+    "`guardrailsLog:read` permits a consult of the caller's sessions. `guardrailsLog:admin` permits any consult in the active organization.",
+  [RouteId.GetOpenappaLabelChanges]:
+    "`guardrailsLog:read` permits the caller's sessions. `guardrailsLog:admin` permits any session in the active organization.",
+  [RouteId.GetConnectedClientLog]:
+    "`clientConnection:read` returns the events of the caller's own clients. `clientConnection:admin` includes every member's.",
+  [RouteId.GetOpenAppaYells]:
+    "`guardrailsLog:read` returns the caller's yells. `guardrailsLog:admin` includes every yell in the active organization.",
+  [RouteId.GetOpenAppaYellsSummary]:
+    "`guardrailsLog:read` counts the caller's yells. `guardrailsLog:admin` counts every yell in the active organization.",
+  [RouteId.GetOpenAppaYell]:
+    "`guardrailsLog:read` permits a yell of the caller's sessions. `guardrailsLog:admin` permits any yell in the active organization.",
+  [RouteId.DownloadOpenAppaYell]:
+    "`guardrailsLog:read` permits a yell of the caller's sessions. `guardrailsLog:admin` permits any yell in the active organization.",
+  [RouteId.UpdateOpenAppaYell]:
+    "`guardrailsLog:read` resolves a yell of the caller's sessions. `guardrailsLog:admin` resolves any yell in the active organization.",
+  [RouteId.GetMcpToolCalls]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetMcpToolCall]:
+    "`log:read` permits a row attributed to the caller. `log:admin` permits any row in the active organization.",
+  [RouteId.GetAgentStatistics]:
+    "Returns aggregate usage for every agent in the active organization.",
+  [RouteId.GetModelStatistics]:
+    "Returns aggregate model usage for the active organization.",
+  [RouteId.GetOverviewStatistics]:
+    "Returns aggregate usage for the active organization.",
+  [RouteId.GetCostSavingsStatistics]:
+    "Returns aggregate cost savings for the active organization.",
+  [RouteId.GetUserStatistics]:
+    "Returns the caller's usage. `member:read` includes identified users across the active organization.",
+  [RouteId.GetAppStatistics]:
+    "App details are limited to apps visible to the caller; `app:admin` includes every app in the active organization.",
+  [RouteId.GetSkillStatistics]:
+    "Skill details are limited to skills visible to the caller; `skill:admin` includes every skill in the active organization.",
+} satisfies Partial<Record<RouteId, string>>;
+
+const PUBLIC_UNAUTHENTICATED_ROUTE_IDS = new Set<RouteId>([
+  RouteId.GetPublicConfig,
+  RouteId.GetPublicIdentityProviders,
+  RouteId.GetAppearanceSettings,
+  RouteId.GetConnectionHealth,
+]);

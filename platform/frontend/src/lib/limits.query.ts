@@ -1,0 +1,160 @@
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { toBulkOutcome } from "@/lib/bulk-action";
+import { handleApiError, throwOnApiError, toApiError } from "@/lib/utils/api";
+
+const {
+  getLimits,
+  createLimit,
+  getLimit,
+  updateLimit,
+  resetLimitUsage,
+  deleteLimit,
+  bulkDeleteLimits,
+} = archestraApiSdk;
+
+type UpdateLimitParams = archestraApiTypes.UpdateLimitData["path"] &
+  Partial<archestraApiTypes.UpdateLimitData["body"]>;
+type DeleteLimitParams = archestraApiTypes.DeleteLimitData["path"];
+
+// The "list"/"detail" segments keep the two queries in separate cache entries.
+// Without them an id-less detail query and the unfiltered list hash alike, and
+// a mutation's refetch resolves the shared entry with whichever queryFn was
+// applied last — overwriting the list array with the detail query's null.
+export const limitKeys = {
+  all: ["limits"] as const,
+  lists: () => [...limitKeys.all, "list"] as const,
+  details: () => [...limitKeys.all, "detail"] as const,
+  detail: (id: string | undefined) => [...limitKeys.details(), id] as const,
+};
+
+export function useLimits(params?: {
+  enabled?: boolean;
+  /** Narrow the list server-side, e.g. to one team's limits. */
+  filters?: NonNullable<archestraApiTypes.GetLimitsData["query"]>;
+}) {
+  const filters = params?.filters;
+  return useQuery({
+    queryKey: filters ? [...limitKeys.lists(), filters] : limitKeys.lists(),
+    enabled: params?.enabled,
+    queryFn: async () => {
+      const { data, error } = await getLimits({ query: filters });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    // Automatically refetch every 5 seconds to keep usage data fresh
+    refetchInterval: 5000,
+    // Refetch when window regains focus
+    refetchOnWindowFocus: true,
+  });
+}
+
+export function useLimit(id: string | undefined) {
+  return useQuery({
+    queryKey: limitKeys.detail(id),
+    queryFn: async () => {
+      if (!id) return null;
+      const { data, error } = await getLimit({ path: { id } });
+      throwOnApiError(error, { allowNotFound: true });
+      return data ?? null;
+    },
+    enabled: !!id,
+  });
+}
+
+export function useCreateLimit() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: archestraApiTypes.CreateLimitData["body"]) => {
+      const { data, error } = await createLimit({ body });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: async (result) => {
+      if (!result) return;
+      await queryClient.invalidateQueries({ queryKey: limitKeys.all });
+      toast.success("Limit created successfully");
+    },
+  });
+}
+
+export function useUpdateLimit() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, ...body }: UpdateLimitParams) => {
+      const { data, error } = await updateLimit({ path: { id }, body });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: async (result, variables) => {
+      if (!result) return;
+      await queryClient.invalidateQueries({ queryKey: limitKeys.all });
+      await queryClient.invalidateQueries({
+        queryKey: limitKeys.detail(variables.id),
+      });
+      toast.success("Limit updated successfully");
+    },
+  });
+}
+
+export function useDeleteLimit() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }: DeleteLimitParams) => {
+      const { data, error } = await deleteLimit({ path: { id } });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data ?? { success: true };
+    },
+    onSuccess: async (result, variables) => {
+      if (!result) return;
+      await queryClient.invalidateQueries({ queryKey: limitKeys.all });
+      queryClient.removeQueries({ queryKey: limitKeys.detail(variables.id) });
+      toast.success("Limit deleted successfully");
+    },
+  });
+}
+
+/** Start a spend limit's window over from $0. */
+export function useResetLimitUsage() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id }: { id: string }) => {
+      const { data, error } = await resetLimitUsage({ path: { id } });
+      if (error) {
+        handleApiError(error);
+        throw toApiError(error);
+      }
+      return data;
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: limitKeys.all });
+      toast.success("Usage reset");
+    },
+  });
+}
+
+/** Deletes selected limits in one capped request and preserves partial outcomes. */
+export function useBulkDeleteLimits() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (limits: readonly { id: string }[]) => {
+      const { data, error } = await bulkDeleteLimits({
+        body: { ids: limits.map((limit) => limit.id) },
+      });
+      throwOnApiError(error);
+      return toBulkOutcome(data ?? { succeeded: [], failed: [] });
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: limitKeys.all }),
+  });
+}

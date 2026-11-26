@@ -1,0 +1,2209 @@
+import {
+  type ModelInputModality,
+  type ModelOutputModality,
+  OPENROUTER_FREE_MODEL_ID,
+  type SupportedProvider,
+} from "@archestra/shared";
+import { HttpResponse, http } from "msw";
+import { modelsDevClient } from "@/clients/models-dev-client";
+import LlmProviderApiKeyModelLinkModel from "@/models/llm-provider-api-key-model";
+import ModelModel from "@/models/model";
+import OrganizationModel from "@/models/organization";
+import { modelFetchers } from "@/routes/chat/model-fetchers";
+import { resolveModelRoute } from "@/routes/proxy/model-router-resolver";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import { useMswServer } from "@/test/msw";
+import {
+  buildModelsToUpsert,
+  modelSyncService,
+  resolveModelCapabilities,
+  withDistinctDisplayNames,
+} from "./model-sync";
+
+// Keep the real client and stub HTTP so imports through the runtime launch
+// path cannot capture a different singleton from a partial module mock.
+// biome-ignore lint/correctness/useHookAtTopLevel: Vitest lifecycle helper, not a React hook
+const server = useMswServer(
+  http.get("https://models.dev/api.json", () => HttpResponse.json({})),
+);
+beforeEach(() => modelsDevClient.clearFetchCache());
+afterEach(() => modelsDevClient.clearFetchCache());
+
+describe("ModelSyncService", () => {
+  test("imports context tiers without writing administrator overrides", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "openai",
+      models: [{ id: "tier-test" }],
+      modelsDevData: {
+        openai: {
+          id: "openai",
+          name: "OpenAI",
+          models: {
+            "tier-test": {
+              id: "tier-test",
+              name: "Tier test",
+              cost: {
+                input: 2,
+                output: 12,
+                tiers: [
+                  {
+                    input: 4,
+                    output: 18,
+                    tier: { type: "context", size: 272000 },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(model.syncedLongContextPricing).toMatchObject({
+      threshold: 272000,
+      pricePerMillionInput: "4",
+      pricePerMillionOutput: "18",
+    });
+    expect(model.longContextThreshold).toBeUndefined();
+    expect(model.customPricePerMillionInput).toBeUndefined();
+  });
+
+  test("does not combine a fetcher tariff with registry context prices", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "openai",
+      models: [
+        { id: "tier-test", capabilities: { promptPricePerToken: "0.000001" } },
+      ],
+      modelsDevData: {
+        openai: {
+          id: "openai",
+          name: "OpenAI",
+          models: {
+            "tier-test": {
+              id: "tier-test",
+              name: "Tier test",
+              cost: {
+                input: 2,
+                output: 12,
+                context_over_200k: { input: 4, output: 18 },
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(model.syncedLongContextPricing).toBeNull();
+  });
+
+  test("does not let metadata-only same-provider capabilities hide a cross-provider context tier", () => {
+    const capabilities = resolveModelCapabilities({
+      provider: "azure",
+      modelId: "synthetic-deployment",
+    });
+    const tier = {
+      threshold: 200000,
+      pricePerMillionInput: "6",
+      pricePerMillionOutput: "30",
+      pricePerMillionCacheRead: null,
+      pricePerMillionCacheWrite: null,
+    };
+    const result = resolveModelCapabilities({
+      provider: "azure",
+      modelId: "synthetic-deployment",
+      capabilities: {
+        ...capabilities,
+        description: "Metadata only",
+        syncedLongContextPricing: null,
+      },
+      crossProviderPrices: {
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+        syncedLongContextPricing: tier,
+      },
+    });
+    expect(result.promptPricePerToken).toBe("0.000003");
+    expect(result.syncedLongContextPricing).toEqual(tier);
+    const conflictingTier = { ...tier, pricePerMillionInput: "99" };
+    for (const cacheReadPricePerToken of [null, "0.0000004"]) {
+      const resolved = resolveModelCapabilities({
+        provider: "azure",
+        modelId: "synthetic-deployment",
+        capabilities: {
+          ...capabilities,
+          syncedLongContextPricing: conflictingTier,
+          cacheReadPricePerToken,
+        },
+        crossProviderPrices: {
+          promptPricePerToken: "0.000003",
+          completionPricePerToken: "0.000015",
+          cacheReadPricePerToken: null,
+          cacheWritePricePerToken: null,
+          syncedLongContextPricing: tier,
+        },
+      });
+      expect(resolved.syncedLongContextPricing).toEqual(
+        cacheReadPricePerToken === null ? tier : null,
+      );
+    }
+  });
+
+  test.each([
+    { cost: undefined, expectedInput: "0.000003", expectedTier: "6" },
+    { cost: {}, expectedInput: "0.000003", expectedTier: "6" },
+    {
+      cost: { context_over_200k: { input: 99, output: 999 } },
+      expectedInput: "0.000003",
+      expectedTier: "6",
+    },
+    {
+      cost: { cache_read: 0.4 },
+      expectedInput: "0.000003",
+      expectedTier: null,
+    },
+    {
+      cost: { cache_read: 0.4, context_over_200k: { input: 99, output: 999 } },
+      expectedInput: "0.000003",
+      expectedTier: null,
+    },
+    {
+      cost: { input: 3.3, output: 16.5 },
+      expectedInput: "0.0000033",
+      expectedTier: null,
+    },
+    { cost: { input: 0, output: 0 }, expectedInput: "0", expectedTier: null },
+  ])("keeps the context tier with the flat tariff source (cost=$cost)", ({
+    cost,
+    expectedInput,
+    expectedTier,
+  }) => {
+    const modelId = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+    const [model] = buildModelsToUpsert({
+      provider: "bedrock",
+      models: [{ id: modelId }],
+      modelsDevData: {
+        "amazon-bedrock": {
+          id: "amazon-bedrock",
+          name: "Bedrock",
+          models: {
+            [modelId]: {
+              id: modelId,
+              name: "Metadata-only profile",
+              limit: { context: 1000000 },
+              cost,
+            },
+          },
+        },
+        anthropic: {
+          id: "anthropic",
+          name: "Anthropic",
+          models: {
+            "claude-sonnet-4-5": {
+              id: "claude-sonnet-4-5",
+              name: "Canonical model",
+              cost: {
+                input: 3,
+                output: 15,
+                tiers: [
+                  {
+                    input: 6,
+                    output: 30,
+                    tier: { type: "context", size: 200000 },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(model.promptPricePerToken).toBe(expectedInput);
+    expect(model.syncedLongContextPricing?.pricePerMillionInput ?? null).toBe(
+      expectedTier,
+    );
+  });
+
+  test("keeps custom Jev endpoint prices unknown during model synchronization", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "test-custom-jev" } });
+    const baseUrl = "https://openrouter.ai/api/alpha/decisions";
+    const key = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "jev",
+      baseUrl,
+    });
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: key.id,
+      provider: "jev",
+      apiKeyValue: "test-custom-jev",
+      baseUrl,
+    });
+
+    const model = await ModelModel.findByProviderAndModelId(
+      "jev",
+      "jev-1.13.0",
+    );
+    expect(model).toMatchObject({
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      cacheReadPricePerToken: null,
+    });
+  });
+
+  test("keeps the original Nano Banana name searchable without registry metadata", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "gemini",
+      models: [{ id: "gemini-2.5-flash-image" }],
+      modelsDevData: {},
+    });
+    expect(model.description).toBe("Nano Banana");
+    expect(model.modelId).toBe("gemini-2.5-flash-image");
+  });
+  test("syncs Nano Banana 2.1 as an image model even without registry metadata", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "gemini",
+      models: [{ id: "gemini-nano-banana-2.1" }],
+      modelsDevData: {},
+    });
+
+    expect(model.description).toBe("Nano Banana 2.1");
+    expect(model.inputModalities).toEqual(["text", "image", "video", "pdf"]);
+    expect(model.outputModalities).toEqual(["text", "image"]);
+    expect(model.supportsToolCalling).toBe(false);
+    expect(model.supportsReasoningEffort).toBe(false);
+    expect(model.contextLength).toBe(131_072);
+    expect(model.outputLength).toBe(32_768);
+    expect(model.embeddingDimensions).toBeNull();
+  });
+  const originalOpenAiFetcher = modelFetchers.openai;
+  const originalAzureFetcher = modelFetchers.azure;
+  const originalGeminiFetcher = modelFetchers.gemini;
+  const originalOpenrouterFetcher = modelFetchers.openrouter;
+  const originalOllamaFetcher = modelFetchers.ollama;
+
+  afterEach(() => {
+    modelFetchers.openai = originalOpenAiFetcher;
+    modelFetchers.azure = originalAzureFetcher;
+    modelFetchers.gemini = originalGeminiFetcher;
+    modelFetchers.openrouter = originalOpenrouterFetcher;
+    modelFetchers.ollama = originalOllamaFetcher;
+  });
+
+  test("a GitHub Copilot sync reads the extended window and replaces a stored one, keeping the admin's", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    // Copilot reports only the default context tier unless the request names a
+    // current API version.
+    server.use(
+      http.get("https://api.github.com/copilot_internal/v2/token", () =>
+        HttpResponse.json({
+          token: "copilot-bearer",
+          expires_at: Math.floor(Date.now() / 1000) + 1800,
+        }),
+      ),
+      http.get("https://api.githubcopilot.com/models", ({ request }) => {
+        const extended =
+          request.headers.get("x-github-api-version") === "2026-08-01";
+        return HttpResponse.json({
+          data: ["claude-haiku-5.5", "claude-opus-5.5"].map((id) => ({
+            id,
+            supported_endpoints: ["/chat/completions"],
+            capabilities: {
+              type: "chat",
+              limits: extended
+                ? {
+                    max_context_window_tokens: 1_000_000,
+                    max_prompt_tokens: 936_000,
+                    max_output_tokens: 128_000,
+                  }
+                : {
+                    max_context_window_tokens: 200_000,
+                    max_prompt_tokens: 100_000,
+                    max_output_tokens: 100_000,
+                  },
+            },
+          })),
+        });
+      }),
+      http.post("https://api.githubcopilot.com/chat/completions", () =>
+        HttpResponse.json(
+          { error: { message: "messages must be non-empty", code: "" } },
+          { status: 400 },
+        ),
+      ),
+    );
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "gho_copilot" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "github-copilot",
+    });
+    // Rows an earlier build stored from the default tier, one with an
+    // administrator's window.
+    await ModelModel.bulkUpsert(
+      ["claude-haiku-5.5", "claude-opus-5.5"].map((modelId) => ({
+        externalId: `github-copilot/${modelId}`,
+        provider: "github-copilot",
+        modelId,
+        contextLength: 200_000,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        lastSyncedAt: new Date(),
+      })),
+    );
+    const opus = await ModelModel.findByProviderAndModelId(
+      "github-copilot",
+      "claude-opus-5.5",
+    );
+    if (!opus) throw new Error("model not stored");
+    await ModelModel.update(opus.id, { customContextLength: 150_000 });
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "github-copilot",
+      apiKeyValue: "gho_copilot",
+    });
+
+    const haiku = await ModelModel.findByProviderAndModelId(
+      "github-copilot",
+      "claude-haiku-5.5",
+    );
+    expect(haiku).toMatchObject({
+      contextLength: 1_000_000,
+      customContextLength: null,
+    });
+    expect(
+      await ModelModel.findByProviderAndModelId(
+        "github-copilot",
+        "claude-opus-5.5",
+      ),
+    ).toMatchObject({ contextLength: 1_000_000, customContextLength: 150_000 });
+    expect(
+      await LlmProviderApiKeyModelLinkModel.resolveOutputLength(
+        haiku,
+        apiKey.id,
+      ),
+    ).toBe(128_000);
+  });
+
+  test("two Ollama endpoints sharing a tag keep independent agent verdicts", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secretA = await makeSecret({ secret: { apiKey: "endpoint-a" } });
+    const secretB = await makeSecret({ secret: { apiKey: "endpoint-b" } });
+    const keyA = await makeLlmProviderApiKey(org.id, secretA.id, {
+      provider: "ollama",
+    });
+    const keyB = await makeLlmProviderApiKey(org.id, secretB.id, {
+      provider: "ollama",
+    });
+
+    // The same tag on both endpoints, naming different builds: a 4B on A and
+    // a 70B on B. Both syncs upsert the same globally unique (provider,
+    // model_id) row, so only the link can tell the two endpoints apart.
+    modelFetchers.ollama = async (apiKeyValue) => [
+      {
+        id: "custom:latest",
+        displayName: "custom:latest",
+        provider: "ollama" as SupportedProvider,
+        capabilities: {
+          parameterCount:
+            apiKeyValue === "endpoint-a" ? 4_000_000_000 : 70_000_000_000,
+        },
+      },
+    ];
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: keyA.id,
+      provider: "ollama",
+      apiKeyValue: "endpoint-a",
+    });
+    // B finishing last must not flip A's verdict, as a row-level column would.
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: keyB.id,
+      provider: "ollama",
+      apiKeyValue: "endpoint-b",
+    });
+
+    const [forA] = await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([
+      keyA.id,
+    ]);
+    const [forB] = await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([
+      keyB.id,
+    ]);
+    expect(forA.recommendedForAgents).toBe(false);
+    expect(forB.recommendedForAgents).toBe(true);
+
+    // A listing spanning both keys collapses to one row per model; the
+    // warning must survive the merge rather than be averaged away.
+    const merged = await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([
+      keyA.id,
+      keyB.id,
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].recommendedForAgents).toBe(false);
+  });
+
+  test("a sync that learns nothing keeps the link verdict; a full refresh corrects it", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "endpoint" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "ollama",
+    });
+
+    const serve = (parameterCount: number | null) => async () => [
+      {
+        id: "custom:latest",
+        displayName: "custom:latest",
+        provider: "ollama" as SupportedProvider,
+        capabilities: { parameterCount },
+      },
+    ];
+
+    modelFetchers.ollama = serve(4_000_000_000);
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "ollama",
+      apiKeyValue: "endpoint",
+    });
+
+    // A time-boxed /api/show miss reports no size, so the sync derives no
+    // verdict. The known one must survive rather than silently un-flag.
+    modelFetchers.ollama = serve(null);
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "ollama",
+      apiKeyValue: "endpoint",
+    });
+
+    let [linked] = await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([
+      apiKey.id,
+    ]);
+    expect(linked.recommendedForAgents).toBe(false);
+
+    // The tag was repointed at a 70B build; a full refresh is the way a
+    // stale verdict self-corrects.
+    modelFetchers.ollama = serve(70_000_000_000);
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "ollama",
+      apiKeyValue: "endpoint",
+      forceRefresh: true,
+    });
+
+    [linked] = await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([
+      apiKey.id,
+    ]);
+    expect(linked.recommendedForAgents).toBe(true);
+  });
+
+  test("stores models with the API key's provider, not detected provider", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+
+    // Register a fetcher that returns models with various detected providers
+    // (simulating an OpenAI-compatible proxy returning models from multiple providers)
+    modelFetchers.openai = async () => [
+      {
+        id: "gpt-4o",
+        displayName: "GPT-4o",
+        provider: "openai" as SupportedProvider,
+      },
+      {
+        // A proxy might return claude models; mapOpenAiModelToModelInfo
+        // would detect this as "anthropic", but sync should store as "openai"
+        id: "claude-3-5-sonnet",
+        displayName: "Claude 3.5 Sonnet",
+        provider: "anthropic" as SupportedProvider,
+      },
+      {
+        id: "gemini-2.5-pro",
+        displayName: "Gemini 2.5 Pro",
+        provider: "gemini" as SupportedProvider,
+      },
+    ];
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openai",
+      apiKeyValue: "test-key",
+    });
+
+    // All models should be stored with provider="openai" (the API key's provider)
+    const gpt = await ModelModel.findByProviderAndModelId("openai", "gpt-4o");
+    expect(gpt).not.toBeNull();
+    expect(gpt?.provider).toBe("openai");
+
+    const claude = await ModelModel.findByProviderAndModelId(
+      "openai",
+      "claude-3-5-sonnet",
+    );
+    expect(claude).not.toBeNull();
+    expect(claude?.provider).toBe("openai");
+
+    const gemini = await ModelModel.findByProviderAndModelId(
+      "openai",
+      "gemini-2.5-pro",
+    );
+    expect(gemini).not.toBeNull();
+    expect(gemini?.provider).toBe("openai");
+
+    // Models should NOT exist under the detected providers
+    const claudeAsAnthropic = await ModelModel.findByProviderAndModelId(
+      "anthropic",
+      "claude-3-5-sonnet",
+    );
+    expect(claudeAsAnthropic).toBeNull();
+
+    const geminiAsGemini = await ModelModel.findByProviderAndModelId(
+      "gemini",
+      "gemini-2.5-pro",
+    );
+    expect(geminiAsGemini).toBeNull();
+
+    // Verify all 3 models are linked to the API key
+    const linkedModels =
+      await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([apiKey.id]);
+    expect(linkedModels).toHaveLength(3);
+    expect(linkedModels.every((m) => m.model.provider === "openai")).toBe(true);
+  });
+
+  test("keeps OpenAI image and audio models as media models the Model Router can resolve", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+    server.use(
+      http.get("https://api.openai.com/v1/models", () =>
+        HttpResponse.json({
+          object: "list",
+          data: [
+            "gpt-4o",
+            "gpt-audio",
+            "gpt-4o-mini-audio-preview",
+            "gpt-image-1",
+            "tts-1",
+            "gpt-4o-mini-tts",
+            "whisper-1",
+            "gpt-4o-transcribe",
+            "gpt-transcribe",
+            "gpt-live-transcribe",
+            "gpt-realtime-2.1",
+            "omni-moderation-latest",
+            "gpt-4o-search-preview",
+            "text-embedding-ada-002",
+            "davinci-002",
+          ].map((id) => ({
+            id,
+            object: "model",
+            owned_by: "openai",
+            created: 1,
+          })),
+        }),
+      ),
+    );
+
+    // An older build synced this realtime model as a chat model; a normal
+    // sync keeps stored modalities unless the fetcher's classification wins.
+    await ModelModel.upsert({
+      externalId: "openai/gpt-realtime-2.1",
+      provider: "openai",
+      modelId: "gpt-realtime-2.1",
+      inputModalities: ["text", "audio", "image"],
+      outputModalities: ["text", "audio"],
+      supportsToolCalling: true,
+      lastSyncedAt: new Date(),
+    });
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openai",
+      apiKeyValue: "test-key",
+      baseUrl: "https://api.openai.com/v1",
+    });
+
+    const rows = await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([
+      apiKey.id,
+    ]);
+    const byId = new Map(rows.map(({ model }) => [model.modelId, model]));
+    expect([...byId.keys()].sort()).toEqual([
+      "gpt-4o",
+      "gpt-4o-mini-audio-preview",
+      "gpt-4o-mini-tts",
+      "gpt-4o-search-preview",
+      "gpt-4o-transcribe",
+      "gpt-audio",
+      "gpt-image-1",
+      "gpt-live-transcribe",
+      "gpt-realtime-2.1",
+      "gpt-transcribe",
+      "text-embedding-ada-002",
+      "tts-1",
+      "whisper-1",
+    ]);
+    // Realtime models are served over the router's WebSocket endpoint; their
+    // audio-only output keeps them out of chat.
+    expect(byId.get("gpt-realtime-2.1")?.inputModalities).toEqual([
+      "text",
+      "audio",
+    ]);
+    expect(byId.get("gpt-realtime-2.1")?.outputModalities).toEqual(["audio"]);
+    expect(byId.get("gpt-realtime-2.1")?.supportsToolCalling).toBe(false);
+    expect(byId.get("gpt-image-1")?.outputModalities).toEqual(["image"]);
+    // Audio chat models answer chat turns in text or speech; they stay chat models.
+    expect(byId.get("gpt-audio")?.inputModalities).toEqual(["text", "audio"]);
+    expect(byId.get("gpt-audio")?.outputModalities).toEqual(["text", "audio"]);
+    expect(byId.get("gpt-audio")?.supportsToolCalling).toBe(true);
+    expect(byId.get("gpt-4o-mini-tts")?.outputModalities).toEqual(["audio"]);
+    // Transcription ids pass the chat-name filter, so they used to sync as chat.
+    expect(byId.get("gpt-4o-transcribe")?.inputModalities).toEqual(["audio"]);
+    expect(byId.get("gpt-transcribe")?.inputModalities).toEqual(["audio"]);
+    // OpenAI rejects function tools on search models, so chat must send none.
+    expect(byId.get("gpt-4o-search-preview")?.supportsToolCalling).toBe(false);
+    expect(byId.get("text-embedding-ada-002")?.embeddingDimensions).toBe(1536);
+    const chatModels = rows
+      .filter(({ model }) => ModelModel.supportsTextChat(model))
+      .map(({ model }) => model.modelId)
+      .sort();
+    expect(chatModels).toEqual([
+      "gpt-4o",
+      "gpt-4o-mini-audio-preview",
+      "gpt-4o-search-preview",
+      "gpt-audio",
+    ]);
+
+    await expect(
+      resolveModelRoute({
+        requestedModel: "openai:gpt-image-1",
+        capability: "media",
+        allowedApiKeyIds: [apiKey.id],
+      }),
+    ).resolves.toMatchObject({ provider: "openai", modelId: "gpt-image-1" });
+  });
+
+  test("reclassifies a proxy-discovered model once the provider's catalog returns it", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+
+    // Both rows exist because the proxy saw the ids before any key synced them.
+    await ModelModel.ensureModelExists("gpt-4o", "openai");
+    // A client-invented id no catalog lists, so the sync below never names it.
+    await ModelModel.ensureModelExists("gpt-4o[1m]", "openai");
+
+    modelFetchers.openai = async () => [
+      {
+        id: "gpt-4o",
+        displayName: "GPT-4o",
+        provider: "openai" as SupportedProvider,
+      },
+    ];
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openai",
+      apiKeyValue: "test-key",
+    });
+
+    // The catalog returned it, so it is an ordinary synced model now and
+    // deleting the key can clean it up.
+    const synced = await ModelModel.findByProviderAndModelId(
+      "openai",
+      "gpt-4o",
+    );
+    expect(synced?.discoveredViaLlmProxy).toBe(false);
+
+    // Nothing returned this one, so it keeps the protection that lets a custom
+    // price survive having no API key link.
+    const untouched = await ModelModel.findByProviderAndModelId(
+      "openai",
+      "gpt-4o[1m]",
+    );
+    expect(untouched?.discoveredViaLlmProxy).toBe(true);
+  });
+
+  test("forceRefresh resets custom pricing, normal sync preserves it", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+
+    modelFetchers.openai = async () => [
+      {
+        id: "gpt-4o",
+        displayName: "GPT-4o",
+        provider: "openai" as SupportedProvider,
+      },
+    ];
+
+    // Initial sync creates the model
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openai",
+      apiKeyValue: "test-key",
+    });
+
+    // Set custom pricing and user-edited capabilities
+    const model = await ModelModel.findByProviderAndModelId("openai", "gpt-4o");
+    expect(model).not.toBeNull();
+    // biome-ignore lint/style/noNonNullAssertion: asserted above
+    await ModelModel.update(model!.id, {
+      customPricePerMillionInput: "1.00",
+      customPricePerMillionOutput: "2.00",
+      inputModalities: ["text", "image"],
+      outputModalities: ["text"],
+    });
+
+    // Normal sync should preserve custom pricing and capabilities
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openai",
+      apiKeyValue: "test-key",
+    });
+
+    const afterNormalSync = await ModelModel.findByProviderAndModelId(
+      "openai",
+      "gpt-4o",
+    );
+    expect(afterNormalSync?.customPricePerMillionInput).toBe("1.00000000");
+    expect(afterNormalSync?.customPricePerMillionOutput).toBe("2.00000000");
+    expect(afterNormalSync?.inputModalities).toEqual(["text", "image"]);
+    expect(afterNormalSync?.outputModalities).toEqual(["text"]);
+
+    // Force refresh should reset custom pricing and capabilities
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openai",
+      apiKeyValue: "test-key",
+      forceRefresh: true,
+    });
+
+    const afterForceRefresh = await ModelModel.findByProviderAndModelId(
+      "openai",
+      "gpt-4o",
+    );
+    expect(afterForceRefresh?.customPricePerMillionInput).toBeNull();
+    expect(afterForceRefresh?.customPricePerMillionOutput).toBeNull();
+    expect(afterForceRefresh?.inputModalities).toBeNull();
+    expect(afterForceRefresh?.outputModalities).toBeNull();
+  });
+
+  test("correcting a stale classification keeps admin overrides until a full refresh", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "test-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openai",
+    });
+    server.use(
+      http.get("https://api.openai.com/v1/models", () =>
+        HttpResponse.json({
+          object: "list",
+          data: [
+            {
+              id: "gpt-realtime-2.1",
+              object: "model",
+              owned_by: "openai",
+              created: 1,
+            },
+          ],
+        }),
+      ),
+    );
+
+    // An older build stored this realtime model as a chat model, and an
+    // administrator then priced it and set its limits.
+    const stale = await ModelModel.upsert({
+      externalId: "openai/gpt-realtime-2.1",
+      provider: "openai",
+      modelId: "gpt-realtime-2.1",
+      inputModalities: ["text", "audio", "image"],
+      outputModalities: ["text", "audio"],
+      supportsToolCalling: true,
+      lastSyncedAt: new Date(),
+    });
+    const overrides = {
+      customPricePerMillionInput: "4.00",
+      customPricePerMillionOutput: "16.00",
+      customPricePerMillionCacheRead: "0.40",
+      customPricePerMillionCacheWrite: "5.00",
+      customContextLength: 32000,
+      customOutputLength: 4096,
+    };
+    await ModelModel.update(stale.id, overrides);
+    const sync = (forceRefresh: boolean) =>
+      modelSyncService.syncModelsForApiKey({
+        apiKeyId: apiKey.id,
+        provider: "openai",
+        apiKeyValue: "test-key",
+        baseUrl: "https://api.openai.com/v1",
+        forceRefresh,
+      });
+    const realtimeClassification = {
+      inputModalities: ["text", "audio"],
+      outputModalities: ["audio"],
+      supportsToolCalling: false,
+    };
+
+    await sync(false);
+    expect(await ModelModel.findById(stale.id)).toMatchObject({
+      ...realtimeClassification,
+      customPricePerMillionInput: "4.00000000",
+      customPricePerMillionOutput: "16.00000000",
+      customPricePerMillionCacheRead: "0.40000000",
+      customPricePerMillionCacheWrite: "5.00000000",
+      customContextLength: 32000,
+      customOutputLength: 4096,
+    });
+
+    // Resetting the row to what the provider says is the full refresh's job.
+    await sync(true);
+    expect(await ModelModel.findById(stale.id)).toMatchObject({
+      ...realtimeClassification,
+      customPricePerMillionInput: null,
+      customPricePerMillionOutput: null,
+      customPricePerMillionCacheRead: null,
+      customPricePerMillionCacheWrite: null,
+      customContextLength: null,
+      customOutputLength: null,
+    });
+  });
+
+  test("infers Gemini modalities and backfills missing values without overwriting user edits", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({
+      secret: { apiKey: "vertex-placeholder" },
+    });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "gemini",
+    });
+
+    await ModelModel.create({
+      externalId: "gemini/gemini-2.5-flash",
+      provider: "gemini",
+      modelId: "gemini-2.5-flash",
+      description: null,
+      contextLength: null,
+      inputModalities: null,
+      outputModalities: null,
+      supportsToolCalling: null,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      lastSyncedAt: new Date(),
+    });
+
+    modelFetchers.gemini = async () => [
+      {
+        id: "gemini-2.5-flash",
+        displayName: "Gemini 2.5 Flash",
+        provider: "gemini" as SupportedProvider,
+      },
+      {
+        id: "gemini-embedding-001",
+        displayName: "Gemini Embedding 001",
+        provider: "gemini" as SupportedProvider,
+      },
+      {
+        id: "gemini-live-2.5-flash-native-audio",
+        displayName: "Gemini Live 2.5 Flash Native Audio",
+        provider: "gemini" as SupportedProvider,
+      },
+      {
+        id: "gemini-2.5-flash-image-preview",
+        displayName: "Gemini 2.5 Flash Image Preview",
+        provider: "gemini" as SupportedProvider,
+      },
+    ];
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "gemini",
+      apiKeyValue: "vertex-placeholder",
+    });
+
+    const flash = await ModelModel.findByProviderAndModelId(
+      "gemini",
+      "gemini-2.5-flash",
+    );
+    expect(flash).not.toBeNull();
+    expect(flash?.inputModalities).toEqual(["text"]);
+    expect(flash?.outputModalities).toEqual(["text"]);
+
+    const embedding = await ModelModel.findByProviderAndModelId(
+      "gemini",
+      "gemini-embedding-001",
+    );
+    expect(embedding?.inputModalities).toEqual(["text"]);
+    expect(embedding?.outputModalities).toEqual([]);
+
+    const liveAudio = await ModelModel.findByProviderAndModelId(
+      "gemini",
+      "gemini-live-2.5-flash-native-audio",
+    );
+    expect(liveAudio?.inputModalities).toEqual(["text", "audio"]);
+    expect(liveAudio?.outputModalities).toEqual(["audio"]);
+
+    const imagePreview = await ModelModel.findByProviderAndModelId(
+      "gemini",
+      "gemini-2.5-flash-image-preview",
+    );
+    expect(imagePreview?.inputModalities).toEqual(["text", "image"]);
+    expect(imagePreview?.outputModalities).toEqual(["image"]);
+
+    // biome-ignore lint/style/noNonNullAssertion: asserted above
+    await ModelModel.update(flash!.id, {
+      inputModalities: ["text", "image"],
+      outputModalities: ["text", "image"],
+    });
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "gemini",
+      apiKeyValue: "vertex-placeholder",
+    });
+
+    const flashAfterResync = await ModelModel.findByProviderAndModelId(
+      "gemini",
+      "gemini-2.5-flash",
+    );
+    expect(flashAfterResync?.inputModalities).toEqual(["text", "image"]);
+    expect(flashAfterResync?.outputModalities).toEqual(["text", "image"]);
+  });
+
+  test("normalizes gemini-embedding-2 as multimodal during sync", () => {
+    const capabilities = resolveModelCapabilities({
+      provider: "gemini",
+      modelId: "gemini-embedding-2",
+      capabilities: {
+        description: "Gemini Embedding 2 Preview",
+        contextLength: null,
+        outputLength: null,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        supportsReasoningEffort: null,
+        supportedEndpoints: null,
+        supportedReasoningEfforts: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+      },
+    });
+
+    expect(capabilities.inputModalities).toEqual(["text", "image"]);
+    expect(capabilities.outputModalities).toEqual([]);
+    expect(capabilities.supportsToolCalling).toBe(false);
+  });
+
+  test("normalizes Vertex multimodalembedding@001 as a multimodal embedding model with its native dimension", () => {
+    const capabilities = resolveModelCapabilities({
+      provider: "gemini",
+      modelId: "multimodalembedding@001",
+    });
+    expect(capabilities.inputModalities).toEqual(["text", "image"]);
+    expect(capabilities.outputModalities).toEqual([]);
+    expect(capabilities.supportsToolCalling).toBe(false);
+
+    const [model] = buildModelsToUpsert({
+      provider: "gemini",
+      models: [{ id: "multimodalembedding@001" }],
+      modelsDevData: {},
+    });
+    expect(model.embeddingDimensions).toBe(1408);
+  });
+
+  test("normalizes KB-supported Cohere embedding models to the KB client's modality support", () => {
+    const base = {
+      description: null,
+      contextLength: null,
+      outputLength: null,
+      inputModalities: ["text"] as ModelInputModality[],
+      outputModalities: ["text"] as ModelOutputModality[],
+      supportsToolCalling: true,
+      supportsReasoningEffort: null,
+      supportedEndpoints: null,
+      supportedReasoningEfforts: null,
+      promptPricePerToken: null,
+      completionPricePerToken: null,
+      cacheReadPricePerToken: null,
+      cacheWritePricePerToken: null,
+    };
+    const v4 = resolveModelCapabilities({
+      provider: "cohere",
+      modelId: "embed-v4.0",
+      capabilities: base,
+    });
+    expect(v4.inputModalities).toEqual(["text", "image"]);
+    expect(v4.outputModalities).toEqual([]);
+    expect(v4.supportsToolCalling).toBe(false);
+
+    // A Cohere model outside the KB table keeps whatever the registries say.
+    const unknown = resolveModelCapabilities({
+      provider: "cohere",
+      modelId: "embed-english-v2.0",
+      capabilities: base,
+    });
+    expect(unknown.inputModalities).toEqual(["text"]);
+    expect(unknown.outputModalities).toEqual(["text"]);
+  });
+
+  test("normalizes KB-supported Bedrock embedding models to the KB client's modality support", () => {
+    // Titan Multimodal G1: whatever the registries say, the row must reflect the
+    // KB client's image path.
+    const titanImage = resolveModelCapabilities({
+      provider: "bedrock",
+      modelId: "amazon.titan-embed-image-v1",
+      capabilities: {
+        description: "Titan Multimodal Embeddings G1",
+        contextLength: null,
+        outputLength: null,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: null,
+        supportsReasoningEffort: null,
+        supportedEndpoints: null,
+        supportedReasoningEfforts: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+      },
+    });
+    expect(titanImage.inputModalities).toEqual(["text", "image"]);
+    expect(titanImage.outputModalities).toEqual([]);
+    expect(titanImage.supportsToolCalling).toBe(false);
+
+    // Titan text: the vendor entry (Cohere direct also takes images for their
+    // models; Titan text does not) can't out-vote the KB client's text-only path.
+    const titanText = resolveModelCapabilities({
+      provider: "bedrock",
+      modelId: "amazon.titan-embed-text-v2:0",
+      capabilities: {
+        description: "Titan Text Embeddings V2",
+        contextLength: null,
+        outputLength: null,
+        inputModalities: ["text", "image"],
+        outputModalities: null,
+        supportsToolCalling: null,
+        supportsReasoningEffort: null,
+        supportedEndpoints: null,
+        supportedReasoningEfforts: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+      },
+    });
+    expect(titanText.inputModalities).toEqual(["text"]);
+
+    // A Cohere profile resolves through its underlying foundation-model id.
+    const cohereProfile = resolveModelCapabilities({
+      provider: "bedrock",
+      modelId: "us.cohere.embed-english-v3",
+      underlyingModelName: "cohere.embed-english-v3",
+    });
+    expect(cohereProfile.inputModalities).toEqual(["text", "image"]);
+
+    // Non-embedding Bedrock models are untouched by the normalization.
+    const chat = resolveModelCapabilities({
+      provider: "bedrock",
+      modelId: "us.anthropic.claude-opus-5-v1:0",
+    });
+    expect(chat.inputModalities).toBeNull();
+  });
+
+  test("records perplexity models as tool-less when nothing upstream declares tool support", () => {
+    // Neither the provider's endpoint nor models.dev carries `tool_call` for
+    // sonar, and an undeclared capability reads as "send tools anyway" — which
+    // the chat-completions endpoint rejects outright.
+    const capabilities = resolveModelCapabilities({
+      provider: "perplexity",
+      modelId: "sonar-pro",
+    });
+
+    expect(capabilities.supportsToolCalling).toBe(false);
+  });
+
+  test("lets a perplexity model that declares tool support keep it", () => {
+    // The gate is per model, not per provider: a declared capability outranks
+    // the inferred default, so a tool-capable model needs no code change.
+    const capabilities = resolveModelCapabilities({
+      provider: "perplexity",
+      modelId: "sonar-with-tools",
+      fetched: { supportsToolCalling: true },
+    });
+
+    expect(capabilities.supportsToolCalling).toBe(true);
+  });
+
+  test("records perplexity Agent API models as tool-capable", () => {
+    // Accepting tools is the Agent API's whole purpose, and nothing upstream
+    // states it: the catalog is static and models.dev has no entry for it.
+    const capabilities = resolveModelCapabilities({
+      provider: "perplexity",
+      modelId: "perplexity/glm-5.2",
+    });
+
+    expect(capabilities.supportsToolCalling).toBe(true);
+    // A null modality list makes the model edit dialog invalid on open.
+    expect(capabilities.inputModalities).toEqual(["text"]);
+    expect(capabilities.outputModalities).toEqual(["text"]);
+  });
+
+  test("splits perplexity tool capability by transport, not provider", () => {
+    // One provider, two surfaces: the bare `sonar*` chat-completions ids stay
+    // tool-less while the vendor-prefixed Agent API ids take tools, so the
+    // vendor prefix is what must decide.
+    const sonar = resolveModelCapabilities({
+      provider: "perplexity",
+      modelId: "sonar",
+    });
+    expect(sonar.supportsToolCalling).toBe(false);
+    // Text modalities are recorded on this branch too — see the agent-model
+    // test above for what null modalities break.
+    expect(sonar.inputModalities).toEqual(["text"]);
+    expect(sonar.outputModalities).toEqual(["text"]);
+    expect(
+      resolveModelCapabilities({
+        provider: "perplexity",
+        modelId: "anthropic/claude-opus-5",
+      }).supportsToolCalling,
+    ).toBe(true);
+  });
+
+  test("persists a sanitized outputLength from the models.dev limit.output", () => {
+    const [good, bad] = buildModelsToUpsert({
+      provider: "openai",
+      models: [{ id: "gpt-4o" }, { id: "gpt-legacy" }],
+      modelsDevData: {
+        openai: {
+          id: "openai",
+          name: "OpenAI",
+          models: {
+            "gpt-4o": {
+              id: "gpt-4o",
+              name: "GPT-4o",
+              limit: { context: 128000, output: 16384 },
+            },
+            "gpt-legacy": {
+              id: "gpt-legacy",
+              name: "GPT Legacy",
+              limit: { context: 8192, output: 0 },
+            },
+          },
+        },
+      },
+    });
+
+    expect(good.outputLength).toBe(16384);
+    // A non-positive/garbage limit.output is dropped to null by sanitizeOutputLimit.
+    expect(bad.outputLength).toBeNull();
+  });
+
+  test("gives Ollama models text modalities so the edit dialog is not born invalid", () => {
+    // Ollama's endpoints report no modalities and models.dev only covers the
+    // `ollama/` namespace, so a locally built or fine-tuned model stored null
+    // for both. The edit dialog requires at least one input modality, so every
+    // save on such a row failed react-hook-form validation with the message
+    // rendered far above the fold — indistinguishable from a dead button.
+    for (const provider of ["ollama", "ollama-native"] as const) {
+      const capabilities = resolveModelCapabilities({
+        provider,
+        modelId: "qwen3-8k:latest",
+      });
+      expect(capabilities.inputModalities).toEqual(["text"]);
+      expect(capabilities.outputModalities).toEqual(["text"]);
+    }
+  });
+
+  test("an Ollama embedding model produces no output modality", () => {
+    const capabilities = resolveModelCapabilities({
+      provider: "ollama",
+      modelId: "nomic-embed-text",
+      fetched: { embeddingDimensions: 768 },
+    });
+
+    expect(capabilities.inputModalities).toEqual(["text"]);
+    expect(capabilities.outputModalities).toEqual([]);
+  });
+
+  test("models.dev still outranks the Ollama fallback", () => {
+    const capabilities = resolveModelCapabilities({
+      provider: "ollama",
+      modelId: "llava",
+      capabilities: {
+        description: "LLaVA",
+        contextLength: null,
+        outputLength: null,
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: false,
+        supportsReasoningEffort: null,
+        supportedEndpoints: null,
+        supportedReasoningEfforts: null,
+        promptPricePerToken: null,
+        completionPricePerToken: null,
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+      },
+    });
+
+    expect(capabilities.inputModalities).toEqual(["text", "image"]);
+  });
+
+  test("prefers fetcher capabilities over models.dev with per-field fallthrough", () => {
+    const capabilities = resolveModelCapabilities({
+      provider: "openrouter",
+      modelId: "deepseek/deepseek-chat-v3.1:free",
+      capabilities: {
+        description: "DeepSeek V3.1",
+        contextLength: 32000,
+        outputLength: 16384,
+        inputModalities: ["text"],
+        outputModalities: ["text"],
+        supportsToolCalling: false,
+        supportsReasoningEffort: null,
+        supportedEndpoints: null,
+        supportedReasoningEfforts: null,
+        promptPricePerToken: "0.0000002",
+        completionPricePerToken: "0.0000008",
+        cacheReadPricePerToken: null,
+        cacheWritePricePerToken: null,
+      },
+      fetched: {
+        contextLength: 64000,
+        outputLength: 4096,
+        supportsToolCalling: true,
+        promptPricePerToken: "0",
+        completionPricePerToken: "0",
+      },
+    });
+
+    // Fetcher wins on the fields it carries.
+    expect(capabilities.contextLength).toBe(64000);
+    expect(capabilities.supportsToolCalling).toBe(true);
+    expect(capabilities.promptPricePerToken).toBe("0");
+    expect(capabilities.completionPricePerToken).toBe("0");
+    // models.dev still fills fields the fetcher does not carry.
+    expect(capabilities.description).toBe("DeepSeek V3.1");
+    expect(capabilities.inputModalities).toEqual(["text"]);
+    // Endpoint output caps belong to the API-key/model link, not this shared row.
+    expect(capabilities.outputLength).toBe(16384);
+  });
+
+  test("persists fetcher pricing so :free models sync as zero-priced", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "openrouter-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openrouter",
+    });
+
+    modelFetchers.openrouter = async () => [
+      {
+        id: "deepseek/deepseek-chat-v3.1:free",
+        displayName: "DeepSeek V3.1 (free)",
+        provider: "openrouter" as SupportedProvider,
+        capabilities: {
+          contextLength: 64000,
+          supportsToolCalling: true,
+          promptPricePerToken: "0",
+          completionPricePerToken: "0",
+        },
+      },
+    ];
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openrouter",
+      apiKeyValue: "openrouter-key",
+    });
+
+    const model = await ModelModel.findByProviderAndModelId(
+      "openrouter",
+      "deepseek/deepseek-chat-v3.1:free",
+    );
+    expect(Number(model?.promptPricePerToken)).toBe(0);
+    expect(Number(model?.completionPricePerToken)).toBe(0);
+    expect(model?.contextLength).toBe(64000);
+    expect(model?.supportsToolCalling).toBe(true);
+  });
+
+  test("auto-selects the Free Models Router as the org default for a new OpenRouter key", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "openrouter-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openrouter",
+    });
+
+    modelFetchers.openrouter = async () => [
+      {
+        id: "deepseek/deepseek-chat-v3.1:free",
+        displayName: "DeepSeek V3.1 (free)",
+        provider: "openrouter" as SupportedProvider,
+        capabilities: {
+          contextLength: 64000,
+          supportsToolCalling: true,
+          promptPricePerToken: "0",
+          completionPricePerToken: "0",
+        },
+      },
+      {
+        id: OPENROUTER_FREE_MODEL_ID,
+        displayName: "Free Models Router",
+        provider: "openrouter" as SupportedProvider,
+        capabilities: {
+          contextLength: 200000,
+          supportsToolCalling: true,
+          promptPricePerToken: "0",
+          completionPricePerToken: "0",
+        },
+      },
+    ];
+
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openrouter",
+      apiKeyValue: "openrouter-key",
+    });
+    await modelSyncService.maybeAutoSetOrgDefaultModel({
+      organizationId: org.id,
+      apiKeyId: apiKey.id,
+      provider: "openrouter",
+    });
+
+    const routerModel = await ModelModel.findByProviderAndModelId(
+      "openrouter",
+      OPENROUTER_FREE_MODEL_ID,
+    );
+    const updatedOrg = await OrganizationModel.getById(org.id);
+    expect(updatedOrg?.defaultModelId).toBe(routerModel?.id);
+    expect(updatedOrg?.defaultLlmApiKeyId).toBe(apiKey.id);
+  });
+
+  test("does not override an existing org default model", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "openrouter-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openrouter",
+    });
+
+    modelFetchers.openrouter = async () => [
+      {
+        id: OPENROUTER_FREE_MODEL_ID,
+        displayName: "Free Models Router",
+        provider: "openrouter" as SupportedProvider,
+        capabilities: {
+          contextLength: 200000,
+          supportsToolCalling: true,
+          promptPricePerToken: "0",
+          completionPricePerToken: "0",
+        },
+      },
+    ];
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openrouter",
+      apiKeyValue: "openrouter-key",
+    });
+
+    const routerModel = await ModelModel.findByProviderAndModelId(
+      "openrouter",
+      OPENROUTER_FREE_MODEL_ID,
+    );
+    if (!routerModel) throw new Error("router model not synced");
+    await OrganizationModel.patch(org.id, {
+      defaultModelId: routerModel.id,
+      defaultLlmApiKeyId: apiKey.id,
+    });
+
+    // A non-openrouter provider must never trigger an auto-default.
+    await modelSyncService.maybeAutoSetOrgDefaultModel({
+      organizationId: org.id,
+      apiKeyId: apiKey.id,
+      provider: "openai",
+    });
+    const unchanged = await OrganizationModel.getById(org.id);
+    expect(unchanged?.defaultModelId).toBe(routerModel.id);
+  });
+
+  test("infers dimensions for Azure OpenAI embedding deployments", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "azure-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "azure",
+    });
+
+    modelFetchers.azure = async () => [
+      {
+        id: "gpt-5.4-mini",
+        displayName: "GPT 5.4 Mini",
+        provider: "azure" as SupportedProvider,
+      },
+      {
+        id: "text-embedding-3-large",
+        underlyingModelName: "text-embedding-3-large",
+        displayName: "Text Embedding 3 Large",
+        provider: "azure" as SupportedProvider,
+      },
+    ];
+
+    const count = await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "azure",
+      apiKeyValue: "azure-key",
+    });
+
+    expect(count).toBe(2);
+
+    const embedding = await ModelModel.findByProviderAndModelId(
+      "azure",
+      "text-embedding-3-large",
+    );
+    expect(embedding).toEqual(
+      expect.objectContaining({
+        provider: "azure",
+        modelId: "text-embedding-3-large",
+        embeddingDimensions: 1536,
+        inputModalities: ["text"],
+        outputModalities: [],
+        supportsToolCalling: false,
+      }),
+    );
+  });
+
+  test("syncs Jev models as decision models that no chat picker offers", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "jev-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "jev",
+    });
+
+    const count = await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "jev",
+      apiKeyValue: "jev-key",
+    });
+
+    expect(count).toBe(1);
+    const model = await ModelModel.findByProviderAndModelId(
+      "jev",
+      "jev-1.13.0",
+    );
+    expect(model).toEqual(
+      expect.objectContaining({
+        outputModalities: [],
+        supportsToolCalling: false,
+      }),
+    );
+    if (!model) throw new Error("jev-1.13.0 was not synced");
+    expect(ModelModel.supportsTextChat(model)).toBe(false);
+    expect(ModelModel.supportsEmbeddings(model)).toBe(false);
+  });
+
+  test("infers dimensions for known OpenRouter embedding models", async ({
+    makeOrganization,
+    makeSecret,
+    makeLlmProviderApiKey,
+  }) => {
+    const org = await makeOrganization();
+    const secret = await makeSecret({ secret: { apiKey: "openrouter-key" } });
+    const apiKey = await makeLlmProviderApiKey(org.id, secret.id, {
+      provider: "openrouter",
+    });
+
+    modelFetchers.openrouter = async () => [
+      {
+        id: "openrouter/auto",
+        displayName: "openrouter/auto",
+        provider: "openrouter" as SupportedProvider,
+      },
+      {
+        id: "openai/text-embedding-3-small",
+        displayName: "Text Embedding 3 Small",
+        provider: "openrouter" as SupportedProvider,
+      },
+      {
+        id: "nomic-ai/nomic-embed-text",
+        displayName: "Nomic Embed Text",
+        provider: "openrouter" as SupportedProvider,
+      },
+    ];
+
+    const count = await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: "openrouter",
+      apiKeyValue: "openrouter-key",
+    });
+
+    expect(count).toBe(3);
+
+    const embedding = await ModelModel.findByProviderAndModelId(
+      "openrouter",
+      "openai/text-embedding-3-small",
+    );
+    expect(embedding).toEqual(
+      expect.objectContaining({
+        provider: "openrouter",
+        modelId: "openai/text-embedding-3-small",
+        embeddingDimensions: 1536,
+      }),
+    );
+
+    const nomic = await ModelModel.findByProviderAndModelId(
+      "openrouter",
+      "nomic-ai/nomic-embed-text",
+    );
+    expect(nomic?.embeddingDimensions).toBe(768);
+
+    const linkedModels =
+      await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds([apiKey.id]);
+    const selectableEmbeddingModels = linkedModels
+      .map((link) => link.model)
+      .filter((model) => model.embeddingDimensions !== null);
+    expect(
+      selectableEmbeddingModels.map((model) => model.modelId).sort(),
+    ).toEqual(["nomic-ai/nomic-embed-text", "openai/text-embedding-3-small"]);
+  });
+
+  test("collapses duplicate model ids so one batch never carries the same (provider, model_id) twice", () => {
+    // Azure AI Foundry lists an entry per model/SKU, so the same id repeats.
+    // Postgres rejects a whole INSERT whose rows share the ON CONFLICT target,
+    // which previously rolled the entire model sync back to zero.
+    const built = buildModelsToUpsert({
+      provider: "azure",
+      models: [
+        { id: "claude-opus-5" },
+        { id: "DeepSeek-R1" },
+        { id: "claude-opus-5" },
+      ],
+      modelsDevData: {},
+    });
+
+    expect(built.map((model) => model.modelId)).toEqual([
+      "claude-opus-5",
+      "DeepSeek-R1",
+    ]);
+  });
+
+  test("prices a custom-named Claude deployment on Microsoft Foundry from its backing model", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "anthropic",
+      models: [{ id: "team-sonnet", underlyingModelName: "claude-sonnet-4-6" }],
+      modelsDevData: {
+        anthropic: {
+          id: "anthropic",
+          name: "Anthropic",
+          models: {
+            "claude-sonnet-4-6": {
+              id: "claude-sonnet-4-6",
+              name: "Claude Sonnet 4.6",
+              tool_call: true,
+              modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+              cost: {
+                input: 3,
+                output: 15,
+                cache_read: 0.3,
+                cache_write: 3.75,
+              },
+              limit: { context: 1000000, output: 64000 },
+            },
+          },
+        },
+      },
+    });
+
+    expect(model).toEqual(
+      expect.objectContaining({
+        modelId: "team-sonnet",
+        contextLength: 1000000,
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+      }),
+    );
+  });
+
+  test("uses an authoritative fetched embedding dimension over the name heuristic", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "ollama",
+      models: [
+        {
+          id: "mxbai-embed-large",
+          capabilities: { embeddingDimensions: 1024 },
+        },
+      ],
+      modelsDevData: {},
+    });
+    expect(model.embeddingDimensions).toBe(1024);
+  });
+
+  test("drops an authoritative embedding dimension the KB cannot store", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "ollama",
+      models: [
+        { id: "exotic-embed", capabilities: { embeddingDimensions: 999 } },
+      ],
+      modelsDevData: {},
+    });
+    expect(model.embeddingDimensions).toBeNull();
+  });
+
+  test("does not tag an authoritatively-generative model as embedding even if its id matches an embed name", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "ollama",
+      // capabilities present with embeddingDimensions null ⇒ authoritative chat model.
+      models: [
+        {
+          id: "mxbai-embed-large",
+          capabilities: { embeddingDimensions: null },
+        },
+      ],
+      modelsDevData: {},
+    });
+    expect(model.embeddingDimensions).toBeNull();
+  });
+
+  test("falls back to the name heuristic for Ollama when capabilities are absent", () => {
+    const [mxbai, minilm] = buildModelsToUpsert({
+      provider: "ollama",
+      models: [{ id: "mxbai-embed-large:335m" }, { id: "all-minilm" }],
+      modelsDevData: {},
+    });
+    expect(mxbai.embeddingDimensions).toBe(1024);
+    expect(minilm.embeddingDimensions).toBe(384);
+  });
+
+  test("enriches GitHub Copilot models from the models.dev github-copilot catalog", () => {
+    // Copilot's /models endpoint reports neither modalities nor prices, and
+    // MODELS_DEV_PROVIDER_MAP excludes github-copilot from direct models.dev
+    // row creation (availability is subscription-dependent) — so without the
+    // enrichment map these fields all stored null.
+    const [model] = buildModelsToUpsert({
+      provider: "github-copilot",
+      models: [
+        {
+          id: "claude-sonnet-4.6",
+          capabilities: {
+            contextLength: 144000,
+            supportsToolCalling: true,
+            supportedEndpoints: ["/chat/completions"],
+          },
+        },
+      ],
+      modelsDevData: {
+        "github-copilot": {
+          id: "github-copilot",
+          name: "GitHub Copilot",
+          models: {
+            "claude-sonnet-4.6": {
+              id: "claude-sonnet-4.6",
+              name: "Claude Sonnet 4.6",
+              tool_call: true,
+              modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+              cost: {
+                input: 3,
+                output: 15,
+                cache_read: 0.3,
+                cache_write: 3.75,
+              },
+              limit: { context: 200000, output: 32000 },
+            },
+          },
+        },
+      },
+    });
+
+    expect(model).toEqual(
+      expect.objectContaining({
+        provider: "github-copilot",
+        modelId: "claude-sonnet-4.6",
+        description: "Claude Sonnet 4.6",
+        // The fetcher's per-subscription context window wins over the registry.
+        contextLength: 144000,
+        outputLength: 32000,
+        inputModalities: ["text", "image", "pdf"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        supportedEndpoints: ["/chat/completions"],
+        promptPricePerToken: "0.000003",
+        completionPricePerToken: "0.000015",
+        cacheReadPricePerToken: "3e-7",
+        cacheWritePricePerToken: "0.00000375",
+      }),
+    );
+  });
+
+  test("Copilot's vision flag and reasoning levels outrank the registry's description of the model", () => {
+    const registryEntry = (modalities: string[]) => ({
+      id: "gpt-6.2",
+      name: "GPT-6.2",
+      reasoning: true,
+      modalities: { input: modalities, output: ["text"] },
+    });
+    const [visionAdded] = buildModelsToUpsert({
+      provider: "github-copilot",
+      models: [
+        {
+          id: "gpt-6.2",
+          capabilities: {
+            supportsVision: true,
+            supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+          },
+        },
+      ],
+      modelsDevData: {
+        "github-copilot": {
+          id: "github-copilot",
+          name: "GitHub Copilot",
+          models: { "gpt-6.2": registryEntry(["text"]) },
+        },
+      },
+    });
+    expect(visionAdded).toEqual(
+      expect.objectContaining({
+        inputModalities: ["text", "image"],
+        supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+      }),
+    );
+
+    const [visionRemoved] = buildModelsToUpsert({
+      provider: "github-copilot",
+      models: [{ id: "gpt-6.2", capabilities: { supportsVision: false } }],
+      modelsDevData: {
+        "github-copilot": {
+          id: "github-copilot",
+          name: "GitHub Copilot",
+          models: { "gpt-6.2": registryEntry(["text", "image", "pdf"]) },
+        },
+      },
+    });
+    // The rest of the registry's list survives.
+    expect(visionRemoved.inputModalities).toEqual(["text", "pdf"]);
+  });
+
+  test("floors an uncovered GitHub Copilot model to text modalities so the edit dialog stays valid", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "github-copilot",
+      models: [{ id: "copilot-experimental-model" }],
+      modelsDevData: {},
+    });
+
+    expect(model.inputModalities).toEqual(["text"]);
+    expect(model.outputModalities).toEqual(["text"]);
+    expect(model.promptPricePerToken).toBeNull();
+  });
+
+  test("enriches an Azure deployment from its backing model in the azure catalog", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "azure",
+      models: [{ id: "gpt-4o", underlyingModelName: "gpt-4o" }],
+      modelsDevData: {
+        azure: {
+          id: "azure",
+          name: "Azure",
+          models: {
+            "gpt-4o": {
+              id: "gpt-4o",
+              name: "GPT-4o",
+              tool_call: true,
+              modalities: { input: ["text", "image"], output: ["text"] },
+              cost: { input: 2.5, output: 10 },
+              limit: { context: 128000, output: 16384 },
+            },
+          },
+        },
+      },
+    });
+
+    expect(model).toEqual(
+      expect.objectContaining({
+        provider: "azure",
+        modelId: "gpt-4o",
+        inputModalities: ["text", "image"],
+        outputModalities: ["text"],
+        supportsToolCalling: true,
+        promptPricePerToken: "0.0000025",
+        completionPricePerToken: "0.00001",
+      }),
+    );
+  });
+
+  test("keeps an Azure embedding deployment classified as embedding despite the registry's text output", () => {
+    // models.dev records embeddings with a "text" output modality, which would
+    // make the deployment look generative — the post-pass normalization must
+    // outrank the registry tier.
+    const [model] = buildModelsToUpsert({
+      provider: "azure",
+      models: [
+        {
+          id: "text-embedding-3-small",
+          underlyingModelName: "text-embedding-3-small",
+        },
+      ],
+      modelsDevData: {
+        azure: {
+          id: "azure",
+          name: "Azure",
+          models: {
+            "text-embedding-3-small": {
+              id: "text-embedding-3-small",
+              name: "Text Embedding 3 Small",
+              tool_call: false,
+              modalities: { input: ["text"], output: ["text"] },
+              cost: { input: 0.02, output: 0 },
+            },
+          },
+        },
+      },
+    });
+
+    expect(model.inputModalities).toEqual(["text"]);
+    expect(model.outputModalities).toEqual([]);
+    expect(model.supportsToolCalling).toBe(false);
+    expect(model.embeddingDimensions).toBe(1536);
+    expect(model.promptPricePerToken).toBe("2e-8");
+  });
+
+  test("describes a vLLM model's reasoning from the registry entry for those weights", () => {
+    // A self-hosted server publishes no capabilities, and the id is a
+    // HuggingFace path rather than a registry key — the trailing segment is
+    // what bridges the two.
+    const [model] = buildModelsToUpsert({
+      provider: "vllm",
+      models: [{ id: "Qwen/Qwen3.8-27B" }],
+      modelsDevData: {
+        // A reseller, deliberately: no first-party entry exists for this model,
+        // which is the ordinary case for open weights.
+        openrouter: {
+          id: "openrouter",
+          name: "OpenRouter",
+          models: {
+            "qwen/qwen3.8-27b": {
+              id: "qwen/qwen3.8-27b",
+              name: "Qwen3.8 27B",
+              reasoning: true,
+              tool_call: true,
+              modalities: { input: ["text"], output: ["text"] },
+              cost: { input: 0.1, output: 0.4 },
+            },
+          },
+        },
+      },
+    });
+
+    expect(model.supportsReasoningEffort).toBe(true);
+    // The deployment's own price stays out: the operator serves this model.
+    expect(model.promptPricePerToken).toBeNull();
+  });
+
+  test("lets the Ollama server outrank the registry on whether a model thinks", () => {
+    // The registry describes the weights; /api/show answers for the build this
+    // server will actually run.
+    const [model] = buildModelsToUpsert({
+      provider: "ollama",
+      models: [
+        {
+          id: "qwen3",
+          capabilities: { supportsReasoningEffort: false },
+        },
+      ],
+      modelsDevData: {
+        openrouter: {
+          id: "openrouter",
+          name: "OpenRouter",
+          models: {
+            qwen3: {
+              id: "qwen3",
+              name: "Qwen3",
+              reasoning: true,
+              tool_call: true,
+              modalities: { input: ["text"], output: ["text"] },
+              cost: { input: 0.1, output: 0.4 },
+            },
+          },
+        },
+      },
+    });
+
+    expect(model.supportsReasoningEffort).toBe(false);
+  });
+
+  test("persists fetched default parameters", () => {
+    const [model] = buildModelsToUpsert({
+      provider: "ollama",
+      models: [
+        {
+          id: "llama3",
+          capabilities: {
+            defaultParameters: { num_ctx: 4096, stop: ["<|eot_id|>"] },
+          },
+        },
+      ],
+      modelsDevData: {},
+    });
+    expect(model.defaultParameters).toEqual({
+      num_ctx: 4096,
+      stop: ["<|eot_id|>"],
+    });
+  });
+
+  test("distinguishes a pinned snapshot from the moving alias it borrows its name from", () => {
+    // OpenAI lists both, and the registry only keys the undated id, so the
+    // snapshot resolved its name through the date-stripped lookup and both rows
+    // rendered as an identical "GPT-4.1" in every model picker.
+    const built = buildModelsToUpsert({
+      provider: "openai",
+      models: [{ id: "gpt-4.1" }, { id: "gpt-4.1-2025-04-14" }],
+      modelsDevData: {
+        openai: {
+          id: "openai",
+          name: "OpenAI",
+          models: {
+            "gpt-4.1": {
+              id: "gpt-4.1",
+              name: "GPT-4.1",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+          },
+        },
+      },
+    });
+
+    expect(built.map((model) => [model.modelId, model.description])).toEqual([
+      ["gpt-4.1", "GPT-4.1"],
+      // Matches the convention the registry uses for the snapshots it does name
+      // itself, e.g. "GPT-4o (2024-08-06)".
+      ["gpt-4.1-2025-04-14", "GPT-4.1 (2025-04-14)"],
+    ]);
+  });
+
+  test("leaves a dated model id alone when the catalog lists no alias for it", () => {
+    // Anthropic publishes only the dated id, so there is nothing to confuse it
+    // with and the clean family name is the better label.
+    const [model] = buildModelsToUpsert({
+      provider: "anthropic",
+      models: [{ id: "claude-sonnet-4-5-20250929" }],
+      modelsDevData: {
+        anthropic: {
+          id: "anthropic",
+          name: "Anthropic",
+          models: {
+            "claude-sonnet-4-5": {
+              id: "claude-sonnet-4-5",
+              name: "Claude Sonnet 4.5",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+          },
+        },
+      },
+    });
+
+    expect(model.description).toBe("Claude Sonnet 4.5");
+  });
+
+  test("distinguishes two model ids the registry itself names alike", () => {
+    // Not every collision comes from the date fallback: models.dev names
+    // `gemini-3-pro-image` and its `-preview` sibling identically.
+    const built = buildModelsToUpsert({
+      provider: "gemini",
+      models: [
+        { id: "gemini-3-pro-image" },
+        { id: "gemini-3-pro-image-preview" },
+      ],
+      modelsDevData: {
+        google: {
+          id: "google",
+          name: "Google",
+          models: {
+            "gemini-3-pro-image": {
+              id: "gemini-3-pro-image",
+              name: "Nano Banana Pro",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+            "gemini-3-pro-image-preview": {
+              id: "gemini-3-pro-image-preview",
+              name: "Nano Banana Pro",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+          },
+        },
+      },
+    });
+
+    expect(built.map((model) => model.description)).toEqual([
+      "Nano Banana Pro",
+      "Nano Banana Pro (preview)",
+    ]);
+  });
+
+  test("distinguishes colliding ids by whole tokens rather than mid-token characters", () => {
+    // The shared characters run into the middle of the context-window token, so
+    // a character-wise cut would label these "(000)" and "(768)".
+    const built = buildModelsToUpsert({
+      provider: "openrouter",
+      models: [
+        { id: "claude-opus-4-thinking:32000" },
+        { id: "claude-opus-4-thinking:32768" },
+      ],
+      modelsDevData: {
+        openrouter: {
+          id: "openrouter",
+          name: "OpenRouter",
+          models: {
+            "claude-opus-4-thinking:32000": {
+              id: "claude-opus-4-thinking:32000",
+              name: "Claude 4 Opus Thinking",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+            "claude-opus-4-thinking:32768": {
+              id: "claude-opus-4-thinking:32768",
+              name: "Claude 4 Opus Thinking",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+          },
+        },
+      },
+    });
+
+    expect(built.map((model) => model.description)).toEqual([
+      "Claude 4 Opus Thinking (32000)",
+      "Claude 4 Opus Thinking (32768)",
+    ]);
+  });
+
+  test("falls back to raw ids when two colliding ids tokenise identically", () => {
+    // The safety net behind the invariant: `-` and `.` tokenise the same, so
+    // there is no distinguishing suffix to cut and the group would otherwise
+    // stay ambiguous. The raw ids always tell them apart.
+    const built = buildModelsToUpsert({
+      provider: "openai",
+      models: [{ id: "foo-bar" }, { id: "foo.bar" }],
+      modelsDevData: {
+        openai: {
+          id: "openai",
+          name: "OpenAI",
+          models: {
+            "foo-bar": {
+              id: "foo-bar",
+              name: "Foo Bar",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+            "foo.bar": {
+              id: "foo.bar",
+              name: "Foo Bar",
+              modalities: { input: ["text"], output: ["text"] },
+            },
+          },
+        },
+      },
+    });
+
+    expect(built.map((model) => model.description)).toEqual([
+      "Foo Bar (foo-bar)",
+      "Foo Bar (foo.bar)",
+    ]);
+  });
+});
+
+describe("withDistinctDisplayNames", () => {
+  test("suffixes response rows that share a display name within one provider", () => {
+    // The read-time counterpart of the sync-time pass: stored descriptions can
+    // still collide (rows synced before names were disambiguated, or keys
+    // whose catalogs each contain only one member of the pair).
+    const models = withDistinctDisplayNames([
+      { id: "gpt-4.1", provider: "openai" as const, displayName: "GPT-4.1" },
+      {
+        id: "gpt-4.1-2025-04-14",
+        provider: "openai" as const,
+        displayName: "GPT-4.1",
+      },
+      {
+        id: "gpt-4.1-mini",
+        provider: "openai" as const,
+        displayName: "GPT-4.1 mini",
+      },
+    ]);
+
+    expect(models.map((model) => model.displayName)).toEqual([
+      "GPT-4.1",
+      "GPT-4.1 (2025-04-14)",
+      "GPT-4.1 mini",
+    ]);
+  });
+
+  test("a name shared across providers is not a collision", () => {
+    // The UI groups the list by provider, so these are never shown side by
+    // side under one name — and their ids only mean anything per provider.
+    const models = withDistinctDisplayNames([
+      { id: "gpt-4o", provider: "openai" as const, displayName: "GPT-4o" },
+      { id: "gpt-4o", provider: "azure" as const, displayName: "GPT-4o" },
+    ]);
+
+    expect(models.map((model) => model.displayName)).toEqual([
+      "GPT-4o",
+      "GPT-4o",
+    ]);
+  });
+});

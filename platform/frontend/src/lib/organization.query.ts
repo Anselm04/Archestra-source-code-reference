@@ -1,0 +1,1132 @@
+import {
+  ADMIN_ROLE_NAME,
+  type AnyRoleName,
+  archestraApiSdk,
+  type archestraApiTypes,
+  PLATFORM_ADMIN_ROLE_NAME,
+} from "@archestra/shared";
+import {
+  keepPreviousData,
+  QueryClientContext,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import type { Invitation } from "better-auth/plugins/organization";
+import { useRouter } from "next/navigation";
+import { useContext, useMemo } from "react";
+import { toast } from "sonner";
+import { awaitBootstrapSeed, useSession } from "@/lib/auth/auth.query";
+import { usePermissionSources } from "@/lib/auth/permission-sources.query";
+import { authClient } from "@/lib/clients/auth/auth-client";
+import {
+  flushPersistedQueryCache,
+  PERSISTED_QUERY_META,
+} from "@/lib/query-persistence";
+import { isDocumentSeedFresh } from "@/lib/shell-deferral";
+import { environmentKeys } from "./environment.query";
+import { parseRoleAssignmentBlocked } from "./role-assignment-blocked";
+import {
+  getApiErrorInternalCode,
+  getApiErrorMessage,
+  handleApiError,
+  throwOnApiError,
+  toApiError,
+} from "./utils";
+
+export const appearanceKeys = {
+  all: ["appearance"] as const,
+  public: () => [...appearanceKeys.all, "public"] as const,
+};
+
+/**
+ * Hook to fetch public appearance settings.
+ * Used on login/auth pages where the user is not yet authenticated.
+ * Returns theme, customFont, and logo without requiring authentication.
+ * On API failure the query enters its error state (no toast, since this is a
+ * pre-auth surface); callers keep using their local fallback appearance values.
+ */
+export function useAppearanceSettings(enabled = true) {
+  return useQuery({
+    queryKey: appearanceKeys.public(),
+    queryFn: async ({ client }) => {
+      const seed = await awaitBootstrapSeed(client);
+      if (seed?.appearance) return seed.appearance;
+      const { data, error } = await archestraApiSdk.getAppearanceSettings();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    enabled,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+    throwOnError: false,
+    meta: PERSISTED_QUERY_META,
+  });
+}
+
+/**
+ * Query key factory for organization-related queries
+ */
+export const organizationKeys = {
+  mcpRuntimeTiers: () =>
+    [...organizationKeys.all, "mcp-runtime-tiers"] as const,
+  agentRuntimeTiers: () =>
+    [...organizationKeys.all, "agent-runtime-tiers"] as const,
+  defaultModelRuntimeDependents: (modelId?: string | null) =>
+    modelId === undefined
+      ? ([...organizationKeys.all, "default-model-runtime-dependents"] as const)
+      : ([
+          ...organizationKeys.all,
+          "default-model-runtime-dependents",
+          modelId,
+        ] as const),
+  all: ["organization"] as const,
+  invitations: () => [...organizationKeys.all, "invitations"] as const,
+  invitation: (id: string) => [...organizationKeys.invitations(), id] as const,
+  activeOrg: () => [...organizationKeys.all, "active"] as const,
+  activeMemberRole: (organizationId: string | undefined) =>
+    [...organizationKeys.activeOrg(), "member-role", organizationId] as const,
+  details: () => [...organizationKeys.all, "details"] as const,
+  defaultModel: () => [...organizationKeys.all, "default-model"] as const,
+  onboardingStatus: () =>
+    [...organizationKeys.all, "onboarding-status"] as const,
+  memberSignupStatus: (userIds?: string[]) =>
+    [
+      ...organizationKeys.all,
+      "member-signup-status",
+      ...(userIds ? [{ userIds }] : []),
+    ] as const,
+};
+
+/**
+ * Fetch invitation details by ID
+ */
+export function useInvitation(invitationId: string) {
+  const session = useSession();
+  return useQuery({
+    queryKey: organizationKeys.invitation(invitationId),
+    queryFn: async () => {
+      const response = await authClient.organization.getInvitation({
+        query: { id: invitationId },
+      });
+      return response.data;
+    },
+    enabled: !!session.data?.user,
+  });
+}
+
+/**
+ * The caller's active organization id, from the session: no full-organization
+ * fetch, which also loads the members.
+ */
+export function useActiveOrganizationId() {
+  const { data: session, isPending } = useSession();
+  return {
+    data: session?.session?.activeOrganizationId ?? undefined,
+    isPending,
+  };
+}
+
+/**
+ * Fetch the caller's role in their active organization. Resolves to null when
+ * the endpoint reports no role; stays disabled (data undefined) while the
+ * session is unresolved or names no active organization.
+ *
+ * The endpoint resolves the organization from the session itself, so this
+ * gates on the session's activeOrganizationId rather than on a
+ * full-organization fetch, which would put an extra request in front of the
+ * role for no reason.
+ */
+export function useActiveMemberRole() {
+  const { data: session, isPending: isSessionPending } = useSession();
+  const activeOrganizationId =
+    session?.session?.activeOrganizationId ?? undefined;
+
+  return useQuery({
+    // The organization id in the key stops one organization's cached role
+    // from being served for another after a switch of the active org.
+    queryKey: organizationKeys.activeMemberRole(activeOrganizationId),
+    queryFn: async () => {
+      const { data } = await authClient.organization.getActiveMemberRole();
+      return data?.role ?? null;
+    },
+    enabled: !isSessionPending && !!activeOrganizationId,
+  });
+}
+
+/**
+ * Whether the caller holds a built-in admin ROLE (Admin or Platform Admin) in
+ * their active organization — the frontend mirror of the backend's
+ * `isGlobalAdmin`.
+ *
+ * Deliberately a role check and not a permission check: the actions gated on
+ * this (permanent delete) are refused to every custom role, however broad, so
+ * `useHasPermissions({ x: ["admin"] })` would show them to users the API
+ * answers 404 to. Resolves to `false` while the role is still loading, so a
+ * destructive action never flashes enabled before the answer arrives.
+ *
+ * `isLoading`, not `isPending`, for the role query: it is disabled until the
+ * session names an active organization, and a disabled query stays `pending`
+ * forever. `isLoading` is `isPending && isFetching`, so "no organization to
+ * resolve a role against" reads as a settled "not an admin" — which is what
+ * the API answers such a caller anyway — rather than a request still in
+ * flight.
+ *
+ * The session's own pending state has to be folded in for the same reason it
+ * disables the role query: while it is in flight the role query has not
+ * started, so its `isLoading` is false and an admin cold-loading a trash page
+ * would be told they lack the role. Unlike the role query, `useSession` is
+ * never disabled, so `isPending` is the right signal there.
+ */
+export function useIsGlobalAdmin() {
+  const { data: session, isPending: isSessionPending } = useSession();
+  const { data: sources = [], isLoading } = usePermissionSources({
+    enabled: !!session?.session.activeOrganizationId,
+  });
+  return {
+    isGlobalAdmin: sources.some(
+      (source) =>
+        source.role === ADMIN_ROLE_NAME ||
+        source.role === PLATFORM_ADMIN_ROLE_NAME,
+    ),
+    isLoading: isSessionPending || isLoading,
+  };
+}
+
+/**
+ * Accept invitation mutation
+ */
+export function useAcceptInvitation() {
+  const router = useRouter();
+  return useMutation({
+    mutationFn: async (invitationId: string) => {
+      const response = await authClient.organization.acceptInvitation({
+        invitationId,
+      });
+      return response.data;
+    },
+    onSuccess: () => {
+      router.push("/");
+    },
+    onError: (error) => {
+      // Extract the error message from the error object
+      const errorMessage =
+        error?.message ||
+        (error as { error?: { message: string } })?.error?.message ||
+        "Failed to accept invitation";
+
+      toast.error("Error", {
+        description: errorMessage,
+      });
+    },
+  });
+}
+
+/**
+ * List all pending invitations for an organization
+ */
+export function useInvitationsList(organizationId: string | undefined) {
+  return useQuery({
+    queryKey: [...organizationKeys.invitations(), organizationId],
+    queryFn: async () => {
+      if (!organizationId) return [];
+
+      const response = await authClient.organization.listInvitations({
+        query: { organizationId },
+      });
+
+      if (!response.data) return [];
+
+      const now = new Date();
+      type InvitationListItem = {
+        id: string;
+        email: string;
+        role: Invitation["role"];
+        expiresAt: Invitation["expiresAt"] | null;
+        isExpired: boolean;
+        status: Invitation["status"];
+      };
+      return response.data
+        .filter((inv: Invitation) => inv.status === "pending")
+        .map((inv: Invitation) => {
+          const expiresAt = inv.expiresAt || null;
+          const isExpired = expiresAt ? new Date(expiresAt) < now : false;
+
+          return {
+            id: inv.id,
+            email: inv.email,
+            role: inv.role,
+            expiresAt,
+            isExpired,
+            status: inv.status,
+          };
+        })
+        .sort((a: InvitationListItem, b: InvitationListItem) => {
+          // Sort by status first (pending > accepted > rejected)
+          const statusOrder: Record<string, number> = {
+            pending: 0,
+            accepted: 1,
+            rejected: 2,
+          };
+          const statusDiff = statusOrder[a.status] - statusOrder[b.status];
+          if (statusDiff !== 0) return statusDiff;
+
+          // Then by expiry
+          if (a.isExpired !== b.isExpired) {
+            return a.isExpired ? 1 : -1;
+          }
+          return 0;
+        });
+    },
+  });
+}
+
+/**
+ * Delete invitation mutation
+ */
+export function useCancelInvitation() {
+  return useMutation({
+    mutationFn: async (invitationId: string) => {
+      const response = await authClient.organization.cancelInvitation({
+        invitationId,
+      });
+      return response.data;
+    },
+    onSuccess: () => {
+      toast.success("Invitation deleted");
+    },
+    onError: (error) => {
+      toast.error("Failed to delete invitation", {
+        description: error.message,
+      });
+    },
+  });
+}
+
+/**
+ * Create invitation mutation
+ */
+export function useCreateInvitation(organizationId: string | undefined) {
+  return useMutation({
+    mutationFn: async ({
+      email,
+      role,
+    }: {
+      email: string;
+      role: AnyRoleName;
+    }) => {
+      const response = await authClient.organization.inviteMember({
+        email,
+        /**
+         * TODO: it looks like better-auth authClient has strict typing here..
+         * and apparently, according to their docs, it can only be "owner", "admin", or "member".
+         * https://www.better-auth.com/docs/plugins/organization#send-invitation
+         */
+        role: role as NonNullable<
+          Parameters<typeof authClient.organization.inviteMember>[0]
+        >["role"],
+        organizationId,
+      });
+
+      if (response.error) {
+        // A refused role is explained in the dialog, not a toast.
+        const blocked = parseRoleAssignmentBlocked(response.error);
+        if (blocked) throw blocked;
+        toast.error(
+          response.error.message || "Failed to generate invitation link",
+        );
+        return null;
+      }
+
+      return response.data;
+    },
+    onSuccess: () => {
+      toast.success("Invitation link generated", {
+        description: "Share this link with the person you want to invite",
+      });
+    },
+  });
+}
+
+/**
+ * Get organization
+ */
+export function useOrganization(
+  enabled = true,
+  options: {
+    fresh?: boolean;
+    refetchInterval?: number;
+    refetchOnWindowFocus?: boolean | "always";
+  } = {},
+) {
+  const session = useSession();
+  // Read through the context, not useQueryClient(): that hook throws without
+  // a provider, and only the seed check below needs the client, so the hook
+  // keeps working where no provider is mounted.
+  const client = useContext(QueryClientContext);
+  const { fresh = false } = options;
+
+  return useQuery({
+    queryKey: organizationKeys.details(),
+    queryFn: async ({ client }) => {
+      const seed = await awaitBootstrapSeed(client);
+      if (seed?.organization) return seed.organization;
+      const { data, error } = await archestraApiSdk.getOrganization();
+      throwOnApiError(error, { toastOnError: false });
+      return data;
+    },
+    // Only fetch when user is authenticated to prevent 403 errors during initial auth check
+    enabled: enabled && !!session.data?.user,
+    retry: false, // Don't retry on auth pages to avoid repeated 401 errors
+    throwOnError: false, // Don't throw errors to prevent crashes
+    // Org settings (theme, app name, etc.) change rarely and all mutations
+    // imperatively setQueryData() this key, so a long stale time keeps
+    // re-mounts cheap. Connect opts into a fresh read because these settings
+    // authorize which setup artifacts may be generated. A value the server
+    // read for this document (a seeded approval page) is that fresh read.
+    staleTime: fresh ? 0 : 5 * 60 * 1000,
+    refetchOnMount: fresh
+      ? (query) =>
+          client && isDocumentSeedFresh(client, query) ? false : "always"
+      : undefined,
+    refetchOnWindowFocus: options.refetchOnWindowFocus ?? (fresh || undefined),
+    refetchInterval: options.refetchInterval,
+    // Restored on refresh: the shell reads the app name and theme from here,
+    // so without it a reload repaints the branding a beat after the layout.
+    meta: PERSISTED_QUERY_META,
+  });
+}
+
+/**
+ * What "Organization default" runs on, readable by every member: the default
+ * model, or the trio auto routing routes it across.
+ */
+export function useOrganizationDefaultModelSummary(
+  enabled = true,
+  forChat = false,
+) {
+  return useQuery({
+    queryKey: forChat
+      ? [...organizationKeys.defaultModel(), "chat"]
+      : organizationKeys.defaultModel(),
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getOrganizationDefaultModel(
+        forChat ? { query: { forChat: "true" } } : undefined,
+      );
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    enabled,
+  });
+}
+
+/**
+ * Check if organization onboarding is complete
+ * Only polls when enabled
+ */
+export function useOrganizationOnboardingStatus(enabled: boolean) {
+  return useQuery({
+    queryKey: organizationKeys.onboardingStatus(),
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getOnboardingStatus();
+
+      throwOnApiError(error);
+
+      return (
+        data ?? {
+          hasProfilesConfigured: false,
+          hasToolsConfigured: false,
+          isComplete: false,
+        }
+      );
+    },
+    refetchInterval: enabled ? 3000 : false, // Poll every 3 seconds when dialog is open
+    enabled, // Only run query when enabled
+  });
+}
+
+/**
+ * Update appearance settings
+ */
+export function useUpdateAppearanceSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateAppearanceSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateAppearanceSettings({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization, variables) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      queryClient.setQueryData(appearanceKeys.public(), {
+        theme: updatedOrganization.theme,
+        customFont: updatedOrganization.customFont,
+        logo: updatedOrganization.logo,
+        logoDark: updatedOrganization.logoDark,
+        favicon: updatedOrganization.favicon,
+        iconLogo: updatedOrganization.iconLogo,
+        iconLogoDark: updatedOrganization.iconLogoDark,
+        appName: updatedOrganization.appName,
+        ogDescription: updatedOrganization.ogDescription,
+        footerText: updatedOrganization.footerText,
+        chatLinks: updatedOrganization.chatLinks,
+        onboardingWizard: updatedOrganization.onboardingWizard,
+        chatErrorSupportMessage: updatedOrganization.chatErrorSupportMessage,
+        slimChatErrorUi: updatedOrganization.slimChatErrorUi,
+        animateChatPlaceholders: updatedOrganization.animateChatPlaceholders,
+      });
+      // The app name is baked into the built-in skills' and tools' names on the
+      // backend, so a rename re-brands those rows. Drop their cached lists so the
+      // Skills/Tools pages show the new name without a manual page refresh.
+      if (variables.appName !== undefined) {
+        queryClient.invalidateQueries({ queryKey: ["skills"] });
+        queryClient.invalidateQueries({ queryKey: ["tools"] });
+      }
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Update security settings (default tool guardrails, chat file uploads)
+ */
+export function useUpdateSecuritySettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateSecuritySettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateSecuritySettings({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage, { description: toApiError(error).message });
+        // A disable can commit before runtime cleanup fails. Refresh the policy
+        // even on an error; keep the form dirty so Save retries cleanup.
+        await queryClient.invalidateQueries({
+          queryKey: organizationKeys.details(),
+        });
+        throw toApiError(error);
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      queryClient.invalidateQueries({ queryKey: ["config"] });
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Update MCP settings (online catalog availability)
+ */
+export function useUpdateMcpSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateMcpSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateMcpSettings({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Update Skills settings (online catalog availability)
+ */
+export function useUpdateSkillsSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateSkillsSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateSkillsSettings({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * The organization's Agent Runtime tiers in effect, smallest first, with the
+ * memory each tier's CPU gives it and the default tier.
+ */
+export function useAgentRuntimeTiers(enabled = true) {
+  return useQuery({
+    queryKey: organizationKeys.agentRuntimeTiers(),
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getAgentRuntimeTiers();
+      throwOnApiError(error);
+      return data ?? null;
+    },
+    enabled,
+  });
+}
+
+/**
+ * Agent Runtime agents with no model of their own: they run on the
+ * organization's default model, so a new default must suit their runtimes.
+ */
+export function useDefaultModelRuntimeDependents(params: {
+  /** The candidate default (models.id), to count blockers the viewer can't read. */
+  modelId: string | null;
+  enabled?: boolean;
+}) {
+  return useQuery({
+    queryKey: organizationKeys.defaultModelRuntimeDependents(params.modelId),
+    queryFn: async () => {
+      const { data, error } =
+        await archestraApiSdk.getDefaultModelRuntimeDependents({
+          query: params.modelId ? { modelId: params.modelId } : undefined,
+        });
+      throwOnApiError(error);
+      return data ?? { agents: [], hiddenBlockingCount: 0 };
+    },
+    // Keep the agents on screen while the next candidate's count loads.
+    placeholderData: keepPreviousData,
+    enabled: params.enabled ?? true,
+  });
+}
+
+/**
+ * Update agent settings (default model, default agent)
+ */
+export function useUpdateAgentSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateAgentSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateAgentSettings({ body: data });
+
+      if (error) {
+        // The server says why (e.g. which agents block a default model), so
+        // show its reason instead of only the generic message.
+        const reason = getApiErrorMessage(error);
+        toast.error(onErrorMessage, {
+          description: reason === "API request failed" ? undefined : reason,
+        });
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.defaultModel(),
+      });
+      // The tiers in effect are their own query: a save that renames, adds or
+      // removes tiers refetches them, and the form rebuilds from the saved list.
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.agentRuntimeTiers(),
+      });
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.defaultModelRuntimeDependents(),
+      });
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Save the organization's runtime tiers: the whole list with its default.
+ * A refusal (a tier still in use, a taken name) rejects with the server's
+ * reason and no toast, so the dialog that asked shows it next to the fields.
+ */
+export function useSaveAgentRuntimeTiers() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      agentRuntimeTiers: archestraApiTypes.UpdateAgentSettingsData["body"]["agentRuntimeTiers"],
+    ) => {
+      const { data, error } = await archestraApiSdk.updateAgentSettings({
+        body: { agentRuntimeTiers },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (updatedOrganization) {
+        queryClient.setQueryData(
+          organizationKeys.details(),
+          updatedOrganization,
+        );
+      }
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.agentRuntimeTiers(),
+      });
+    },
+  });
+}
+
+/**
+ * Update /connection admin settings (default gateway/proxy, hidden client/provider lists)
+ */
+export function useUpdateConnectionSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateConnectionSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateConnectionSettings({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      // A refresh immediately after Save must not restore the old visibility.
+      flushPersistedQueryCache(queryClient);
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Hide entries of the built-in integration catalogs (model providers,
+ * messaging channels, knowledge connectors) or override how they are labelled.
+ */
+export function useUpdateIntegrationSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateIntegrationSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateIntegrationSettings({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Update the org-wide default environment (the implicit "Default" target that
+ * catalog items use when no environment is assigned). Unlike real environments,
+ * the default has no slug, so both its name and namespace are freely editable.
+ * Pass `name`/`namespace` (or null to reset to the built-in "Default").
+ */
+export function useUpdateDefaultEnvironment(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateDefaultEnvironmentData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateDefaultEnvironment({ body: data });
+
+      if (error) {
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      queryClient.invalidateQueries({ queryKey: environmentKeys.list() });
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Returns the org-configured default environment fields. When unconfigured,
+ * `name` falls back to "Default", nullable fields fall back to null, and
+ * `restricted` falls back to false.
+ */
+export function useDefaultEnvironment() {
+  const { data: organization } = useOrganization();
+  // Memoized on the query data so the object is reference-stable across renders:
+  // consumers seed a form off it in an effect, and a fresh object each render
+  // would re-run that effect on every background refetch and wipe unsaved edits.
+  return useMemo(
+    () => ({
+      name: organization?.defaultEnvironmentName ?? "Default",
+      namespace: organization?.defaultEnvironmentNamespace ?? null,
+      description: organization?.defaultEnvironmentDescription ?? null,
+      networkPolicy: organization?.defaultNetworkPolicy ?? null,
+      validationRegex: organization?.defaultEnvironmentValidationRegex ?? null,
+      trustedImageRegistries:
+        organization?.defaultEnvironmentTrustedImageRegistries ?? null,
+    }),
+    [organization],
+  );
+}
+
+/**
+ * Update Auth settings (OAuth access token lifetime)
+ */
+export function useUpdateAuthSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateAuthSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateAuthSettings({ body: data });
+
+      if (error) {
+        // A refused default role is explained on the page, not a toast.
+        const blocked = parseRoleAssignmentBlocked(error);
+        if (blocked) throw blocked;
+        toast.error(onErrorMessage);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Update knowledge settings (embedding model)
+ */
+export function useUpdateKnowledgeSettings(
+  onSuccessMessage: string,
+  onErrorMessage: string,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.UpdateKnowledgeSettingsData["body"],
+    ) => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.updateKnowledgeSettings({ body: data });
+
+      if (error) {
+        // Field-validation failures carry an `internal_code` (which of
+        // embedding/reranker failed) and are shown inline per-field by the page,
+        // so don't also toast them; every other error toasts generically. The
+        // code is preserved on the thrown error for the page to read.
+        const internalCode = getApiErrorInternalCode(error);
+        if (!internalCode) {
+          toast.error(onErrorMessage);
+        }
+        const apiError = toApiError(error) as Error & { internalCode?: string };
+        apiError.internalCode = internalCode;
+        throw apiError;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      toast.success(onSuccessMessage);
+    },
+  });
+}
+
+/**
+ * Drop embedding configuration (deletes all KB documents, resets connector checkpoints)
+ */
+export function useDropEmbeddingConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const { data: updatedOrganization, error } =
+        await archestraApiSdk.dropEmbeddingConfig();
+
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+
+      return updatedOrganization;
+    },
+    onSuccess: (updatedOrganization) => {
+      if (!updatedOrganization) return;
+      queryClient.setQueryData(organizationKeys.details(), updatedOrganization);
+      toast.success("Embedding configuration dropped");
+    },
+  });
+}
+
+/**
+ * Test the embedding connection by embedding a sample text. Returns the result
+ * (never throws) so the caller can drive a per-section status indicator; a
+ * transport error still toasts.
+ */
+export function useTestEmbeddingConnection() {
+  return useMutation({
+    mutationFn: async (
+      params: NonNullable<
+        archestraApiTypes.TestEmbeddingConnectionData["body"]
+      >,
+    ) => {
+      const { data, error } = await archestraApiSdk.testEmbeddingConnection({
+        body: params,
+      });
+
+      if (error) {
+        handleApiError(error);
+        return { success: false, error: "Request failed" };
+      }
+
+      return data ?? { success: false, error: "No response" };
+    },
+  });
+}
+
+/**
+ * Test the reranker connection with a sample structured-output call. Same
+ * contract as the embedding test — returns the result for a per-section status.
+ */
+export function useTestRerankerConnection() {
+  return useMutation({
+    mutationFn: async (
+      params: NonNullable<archestraApiTypes.TestRerankerConnectionData["body"]>,
+    ) => {
+      const { data, error } = await archestraApiSdk.testRerankerConnection({
+        body: params,
+      });
+
+      if (error) {
+        handleApiError(error);
+        return { success: false, error: "Request failed" };
+      }
+
+      return data ?? { success: false, error: "No response" };
+    },
+  });
+}
+
+/**
+ * Where BM25 keyword ranking stands (statistics coverage and the refresh
+ * task's schedule), for the status line under Keyword ranking in Knowledge
+ * settings. Polls only while the answer is about to change — a refresh in
+ * flight, or statistics still missing — and rests once ranking is ready.
+ */
+export function useKeywordRankingStatus() {
+  return useQuery({
+    queryKey: [...organizationKeys.all, "keyword-ranking-status"],
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getKeywordRankingStatus();
+      // The page renders its own quiet omission for this passive status line;
+      // a toast per failed poll would outweigh the information.
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    // Fast while the answer is about to change, slow but never off once it
+    // settles: "ready" is not terminal — a sync that indexes a new language
+    // drops ranking back to the fallback, and a page left open would otherwise
+    // keep claiming Ready.
+    refetchInterval: (query) => {
+      const status = query.state.data;
+      if (!status) return false;
+      return status.refreshing ||
+        status.status === "pending" ||
+        status.lastRefreshFailed
+        ? 30_000
+        : 300_000;
+    },
+  });
+}
+
+/**
+ * Test an OCR pair by having the backend send a synthetic PDF page to the
+ * model. Same contract as the embedding/reranker tests.
+ */
+export function useTestOcrConnection() {
+  return useMutation({
+    mutationFn: async (
+      params: NonNullable<archestraApiTypes.TestOcrConnectionData["body"]>,
+    ) => {
+      const { data, error } = await archestraApiSdk.testOcrConnection({
+        body: params,
+      });
+
+      if (error) {
+        handleApiError(error);
+        return { success: false, error: "Request failed" };
+      }
+
+      return data ?? { success: false, error: "No response" };
+    },
+  });
+}
+
+export type PendingSignupMember = {
+  userId: string;
+  name: string | null;
+  email: string;
+  image: string | null;
+  role: string;
+  provider: string | null;
+  invitationId: string | null;
+  scimProvisioned: boolean;
+};
+
+/**
+ * Which members have not completed signup. Pass the user IDs on screen so
+ * the request stays the size of one page instead of every pending member.
+ */
+export function useMemberSignupStatus(options?: {
+  userIds?: string[];
+  enabled?: boolean;
+}) {
+  const userIds = options?.userIds ? [...options.userIds].sort() : undefined;
+  return useQuery({
+    queryKey: organizationKeys.memberSignupStatus(userIds),
+    enabled: options?.enabled ?? true,
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getMemberSignupStatus(
+        userIds ? { query: { userIds } } : undefined,
+      );
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? { pendingSignupMembers: [] as PendingSignupMember[] };
+    },
+  });
+}
+
+/**
+ * Delete a pending signup member (auto-provisioned, hasn't completed signup)
+ */
+export function useDeletePendingSignupMember() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (userId: string) => {
+      const { data, error } = await archestraApiSdk.deletePendingSignupMember({
+        path: { userId },
+      });
+      if (error) {
+        handleApiError(error);
+        return null;
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.memberSignupStatus(),
+      });
+      toast.success("Pending member removed");
+    },
+  });
+}
+
+/** MCP tiers are independent from Agent Runtime tiers. */
+export function useMcpRuntimeTiers(enabled = true) {
+  return useQuery({
+    queryKey: organizationKeys.mcpRuntimeTiers(),
+    queryFn: async () => {
+      const { data, error } = await archestraApiSdk.getMcpRuntimeTiers();
+      throwOnApiError(error);
+      return data ?? null;
+    },
+    enabled,
+  });
+}
+export function useSaveMcpRuntimeTiers() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      body: archestraApiTypes.UpdateMcpRuntimeTiersData["body"],
+    ) => {
+      const { data, error } = await archestraApiSdk.updateMcpRuntimeTiers({
+        body,
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: organizationKeys.mcpRuntimeTiers(),
+      });
+      // Renames update catalog selections; size changes mark installations for reinstall.
+      for (const key of ["mcp-catalog", "mcp-servers", "mcp-registry"]) {
+        queryClient.invalidateQueries({ queryKey: [key] });
+      }
+      toast.success("MCP runtime tiers saved");
+    },
+  });
+}

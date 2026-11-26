@@ -1,0 +1,154 @@
+import {
+  ClientFilterSchema,
+  ResourceVisibilityScopeSchema,
+  TOOL_SEARCH_MAX_LENGTH,
+} from "@archestra/shared";
+import {
+  createInsertSchema,
+  createSelectSchema,
+  createUpdateSchema,
+} from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database/schema";
+import { CredentialResolutionModeSchema } from "@/types/enterprise-managed-credentials";
+
+import { OpenAi } from "./llm-providers";
+
+/**
+ * As we support more llm provider types, this type will expand and should be updated
+ */
+export const ToolParametersContentSchema = z.union([
+  OpenAi.Tools.FunctionDefinitionParametersSchema,
+]);
+
+export const SelectToolSchema = createSelectSchema(schema.toolsTable, {
+  parameters: ToolParametersContentSchema,
+});
+
+export const AssignedToolSchema = SelectToolSchema.extend({
+  mcpServerId: z.string().uuid().nullable(),
+  credentialResolutionMode: CredentialResolutionModeSchema,
+});
+
+export const ExtendedSelectToolSchema = SelectToolSchema.omit({
+  agentId: true,
+}).extend({
+  // Nullable for MCP tools
+  agent: z
+    .object({
+      id: z.string(),
+      name: z.string(),
+    })
+    .nullable(),
+  // Nullable for tools "sniffed" from LLM proxy requests
+  catalog: z
+    .object({
+      id: z.string(),
+      name: z.string(),
+    })
+    .nullable(),
+});
+
+export const InsertToolSchema = createInsertSchema(schema.toolsTable, {
+  parameters: ToolParametersContentSchema,
+}).omit({
+  // Soft-delete bookkeeping, written only by delete/restore, never from input.
+  deletedAt: true,
+});
+export const UpdateToolSchema = createUpdateSchema(schema.toolsTable, {
+  parameters: ToolParametersContentSchema.optional(),
+}).omit({
+  deletedAt: true,
+});
+
+export type Tool = z.infer<typeof SelectToolSchema>;
+export type AssignedTool = z.infer<typeof AssignedToolSchema>;
+export type ExtendedTool = z.infer<typeof ExtendedSelectToolSchema>;
+export type InsertTool = z.infer<typeof InsertToolSchema>;
+export type UpdateTool = z.infer<typeof UpdateToolSchema>;
+
+export type ToolParametersContent = z.infer<typeof ToolParametersContentSchema>;
+
+// Tool assignment schema (for embedding in ToolWithAssignments)
+export const ToolAssignmentSchema = z.object({
+  agentToolId: z.string(),
+  agent: z.object({
+    id: z.string(),
+    name: z.string(),
+  }),
+  mcpServerId: z.string().nullable(),
+  credentialOwnerEmail: z.string().nullable(),
+  executionOwnerEmail: z.string().nullable(),
+  credentialResolutionMode: CredentialResolutionModeSchema,
+});
+
+/**
+ * The agent a delegation tool hands work to.
+ *
+ * A delegation tool is named after its target agent (`agent__<slug>`), so
+ * personal agents — seeded one per member, all called "My Assistant" — mint
+ * tools whose names collide. `scope` and `ownerEmail` are what tell those
+ * apart; without them the listing shows several identical rows.
+ */
+const ToolDelegationTargetSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  scope: ResourceVisibilityScopeSchema,
+  ownerEmail: z.string().nullable(),
+});
+
+// Tool with embedded assignments schema
+export const ToolWithAssignmentsSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().nullable(),
+  parameters: ToolParametersContentSchema,
+  /** MCP tool annotations (readOnlyHint, destructiveHint, …) from discovery. */
+  annotations: z.record(z.string(), z.unknown()).nullable(),
+  catalogId: z.string().nullable(),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+  assignmentCount: z.number(),
+  assignments: z.array(ToolAssignmentSchema),
+  /** Set only for agent delegation tools; null for catalog and observed tools. */
+  delegateToAgent: ToolDelegationTargetSchema.nullable(),
+});
+
+// Filter schema for tools with assignments
+export const ToolFilterSchema = z.object({
+  search: z.string().max(TOOL_SEARCH_MAX_LENGTH).optional(),
+  origin: z
+    .string()
+    .optional()
+    .describe("Can be 'llm-proxy', 'agent', 'app', or a catalogId"),
+  observedByUserId: z
+    .string()
+    .optional()
+    .describe("Only tools observed in this user's LLM proxy traffic"),
+  observedByClient: ClientFilterSchema.optional().describe(
+    "Only tools observed from this client app family (e.g. claude, codex)",
+  ),
+  excludeArchestraTools: z.coerce
+    .boolean()
+    .optional()
+    // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+    .describe("Hide built-in Archestra tools"),
+  includeKnowledgeSourcesTool: z.coerce
+    .boolean()
+    .optional()
+    .describe(
+      "Include the built-in query_knowledge_sources tool in global listings (default: hidden)",
+    ),
+});
+
+export const ToolSortBy = [
+  "name",
+  "origin",
+  "createdAt",
+  "assignmentCount",
+] as const;
+export type ToolSortBy = (typeof ToolSortBy)[number];
+
+export type ToolAssignment = z.infer<typeof ToolAssignmentSchema>;
+export type ToolWithAssignments = z.infer<typeof ToolWithAssignmentsSchema>;
+export type ToolFilters = z.infer<typeof ToolFilterSchema>;

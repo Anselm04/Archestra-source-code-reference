@@ -1,0 +1,436 @@
+import fs from "node:fs";
+import path from "node:path";
+import { type ArchestraApi, items } from "./api";
+import {
+  AGENT_HOOKS,
+  AGENTS,
+  ENVIRONMENTS,
+  GUARDRAILS_POLICY_RULES,
+  KNOWLEDGE_BASES,
+  KNOWLEDGE_DIRECTORIES,
+  KNOWLEDGE_FILES,
+  LIMITS,
+  MCP_CATALOG_ICONS,
+  MCP_GATEWAYS,
+  PLUGINS,
+  PROJECTS,
+  REMOTE_MCP_SERVERS,
+  SKILLS,
+  TEAMS,
+  VALIDATIONS,
+  PROVIDER_KEYS,
+  SHARED_PROVIDER_KEYS,
+  AUTO_ROUTER,
+} from "./dataset";
+import { SEED_STATE_FILE, STATE_DIR } from "./env";
+import { textPdf } from "./pdf";
+
+type Named = { id: string; name: string };
+type Listed = Named[] | { data: Named[] } | Record<string, unknown>;
+
+/** Ids of everything seeded, by kind and name, so shots can link to a specific record. */
+export type SeedState = Record<string, Record<string, string>>;
+
+/**
+ * Seeds the demo organization through the API as an admin. Additive and
+ * idempotent: existing records (matched by name) are reused, nothing is deleted.
+ */
+export async function seedDemoData(
+  api: ArchestraApi,
+): Promise<SeedState> {
+  await api.post("/api/organization/complete-onboarding", {
+    onboardingComplete: true,
+  });
+
+  const state: SeedState = {};
+  const record = (kind: string, name: string, id: string) => {
+    state[kind] ??= {};
+    state[kind][name] = id;
+  };
+
+  // Records an earlier run created as someone else move to the persona.
+  const session = await api.get<{
+    user: { id: string };
+    session: { activeOrganizationId: string };
+  }>("/api/auth/get-session");
+  const ownerId = session.user.id;
+  record("organization", "id", session.session.activeOrganizationId);
+  record("users", "persona", ownerId);
+  const own = (path: string) =>
+    api.tryPost(`${path}/transfer-ownership`, { ownerId });
+
+  for (const team of TEAMS) {
+    const created = await api.ensureNamed({
+      name: team.name,
+      list: async () => items(await api.get<Listed>("/api/teams?limit=100")),
+      create: () => api.post<Named>("/api/teams", team),
+    });
+    record("teams", team.name, created.id);
+  }
+
+  for (const environment of ENVIRONMENTS) {
+    const created = await api.ensureNamed({
+      name: environment.name,
+      list: async () => items(await api.get<Listed>("/api/environments")),
+      create: () => api.post<Named>("/api/environments", environment),
+    });
+    record("environments", environment.name, created.id);
+  }
+
+  const agents = async () => items(await api.get<Listed>("/api/agents?limit=100"));
+  for (const agent of AGENTS) {
+    const created = await api.ensureNamed({
+      name: agent.name,
+      list: agents,
+      create: () => api.post<Named>("/api/agents", { ...agent, agentType: "agent" }),
+    });
+    record("agents", agent.name, created.id);
+    await own(`/api/agents/${created.id}`);
+  }
+
+  for (const hook of AGENT_HOOKS) {
+    const agentId = state.agents?.[hook.agentName];
+    if (!agentId) continue;
+    const existingHooks = items(
+      await api.get<Listed>(`/api/hooks?agentId=${agentId}`),
+    ) as unknown as { id: string; fileName: string; event: string }[];
+    const existing = existingHooks.find(
+      (h) => h.fileName === hook.fileName && h.event === hook.event,
+    );
+    if (!existing) {
+      const created = await api.post<{ id: string }>("/api/hooks", {
+        agentId,
+        event: hook.event,
+        fileName: hook.fileName,
+        content: hook.content,
+        requirements: hook.requirements,
+        enabled: hook.enabled,
+      });
+      record("hooks", `${hook.agentName}:${hook.fileName}`, created.id);
+    } else {
+      await api.put(`/api/hooks/${existing.id}`, {
+        event: hook.event,
+        fileName: hook.fileName,
+        content: hook.content,
+        requirements: hook.requirements,
+        enabled: hook.enabled,
+      });
+      record("hooks", `${hook.agentName}:${hook.fileName}`, existing.id);
+    }
+  }
+
+  for (const gateway of MCP_GATEWAYS) {
+    const created = await api.ensureNamed({
+      name: gateway.name,
+      list: agents,
+      create: () =>
+        api.post<Named>("/api/agents", { ...gateway, agentType: "mcp_gateway" }),
+    });
+    record("gateways", gateway.name, created.id);
+    await own(`/api/agents/${created.id}`);
+  }
+
+  for (const server of REMOTE_MCP_SERVERS) {
+    const created = await api.ensureNamed({
+      name: server.name,
+      list: async () => items(await api.get<Listed>("/api/internal_mcp_catalog")),
+      create: () =>
+        api.post<Named>("/api/internal_mcp_catalog", {
+          ...server,
+          serverType: "remote",
+          icon: catalogIcon(server.name),
+        }),
+    });
+    record("catalog", server.name, created.id);
+    await own(`/api/internal_mcp_catalog/${created.id}`);
+  }
+
+  await addGuardrailsRules(api);
+  await saveValidations(api);
+
+  await seedProviderKeys(api, record);
+  await seedAutoRouter(api, state, record);
+
+  for (const knowledgeBase of KNOWLEDGE_BASES) {
+    const created = await api.ensureNamed({
+      name: knowledgeBase.name,
+      list: async () => items(await api.get<Listed>("/api/knowledge-bases?limit=100")),
+      create: () => api.post<Named>("/api/knowledge-bases", knowledgeBase),
+    });
+    record("knowledgeBases", knowledgeBase.name, created.id);
+  }
+
+  for (const project of PROJECTS) {
+    const created = await api.ensureNamed({
+      name: project.name,
+      list: async () => items(await api.get<Listed>("/api/projects")),
+      create: () => api.post<Named>("/api/projects", project),
+    });
+    record("projects", project.name, created.id);
+    await own(`/api/projects/${created.id}`);
+  }
+
+  for (const skill of SKILLS) {
+    const created = await api.ensureNamed({
+      name: skill.name,
+      list: async () => items(await api.get<Listed>("/api/skills?limit=100")),
+      create: () => api.post<Named>("/api/skills", { content: skill.content }),
+    });
+    record("skills", skill.name, created.id);
+    await own(`/api/skills/${created.id}`);
+  }
+
+  // Plugins are keyed by displayName rather than name.
+  const plugins = async () =>
+    items(await api.get<Listed>("/api/plugins")).map((item) => {
+      const { id, displayName } = item as unknown as { id: string; displayName: string };
+      return { id, name: displayName };
+    });
+  for (const plugin of PLUGINS) {
+    const created = await api.ensureNamed({
+      name: plugin.displayName,
+      list: plugins,
+      create: async () => {
+        const { id } = await api.post<{ id: string }>("/api/plugins", plugin);
+        return { id, name: plugin.displayName };
+      },
+    });
+    record("plugins", plugin.displayName, created.id);
+    await own(`/api/plugins/${created.id}`);
+  }
+
+  const limitEntityType = {
+    organization: "organization",
+    teams: "team",
+    environments: "environment",
+  } as const;
+  const existingLimits = items(
+    await api.get<Listed>("/api/limits"),
+  ) as unknown as { entityType: string; entityId: string }[];
+  for (const limit of LIMITS) {
+    const entityType = limitEntityType[limit.entity];
+    const entityId = state[limit.entity][limit.name];
+    if (existingLimits.some((l) => l.entityType === entityType && l.entityId === entityId)) {
+      continue;
+    }
+    await api.post("/api/limits", {
+      entityType,
+      entityId,
+      limitType: "token_cost",
+      limitValue: limit.dollars,
+      model: null,
+      cleanupInterval: "calendar_month",
+    });
+  }
+
+  writeSeedState(state);
+  return state;
+}
+
+function writeSeedState(state: SeedState): void {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.writeFileSync(SEED_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+async function seedProviderKeys(
+  api: ArchestraApi,
+  record: (kind: string, name: string, id: string) => void,
+): Promise<void> {
+  const existingProviderKeys = items(await api.get<Listed>("/api/llm-provider-api-keys"));
+  const sharedGrants = [{ subject: { type: "organization", id: "*" }, actions: ["read", "use"] }];
+  const providerKeys = [
+    ...PROVIDER_KEYS,
+    ...SHARED_PROVIDER_KEYS.map((key) => ({ ...key, shared: true, initialGrants: sharedGrants })),
+  ];
+  for (const providerKey of providerKeys) {
+    const created =
+      existingProviderKeys.find((key) => key.name === providerKey.name) ??
+      (await api.tryPost<Named>("/api/llm-provider-api-keys", providerKey));
+    if (created) {
+      record("providerKeys", providerKey.name, created.id);
+    } else {
+      console.warn(`Skipped provider key "${providerKey.name}": the provider rejected the fake key.`);
+    }
+  }
+}
+
+type AutoRouterResponse = Named & { status: { coldStart: { scorerVersionId: string } } };
+type AutoRouterTier = (typeof AUTO_ROUTER.tiers)[keyof typeof AUTO_ROUTER.tiers];
+type LinkedModel = { id: string; modelId: string; apiKeys: { id: string }[] };
+
+/**
+ * Turns auto routing on, prices the tier models and creates the router on the shared keys. Its plan
+ * needs scored sessions, which only SQL can add, so `planAutoRouter` fits it
+ * after the database seed.
+ */
+async function seedAutoRouter(
+  api: ArchestraApi,
+  state: SeedState,
+  record: (kind: string, name: string, id: string) => void,
+): Promise<void> {
+  const models = await api.get<LinkedModel[]>("/api/llm-models?includeAssignments=false");
+  const { tiers, decisionModel } = AUTO_ROUTER;
+  const providerKeys = state.providerKeys ?? {};
+  const linked = ({ key, model }: AutoRouterTier) =>
+    models.find(
+      (candidate) => candidate.modelId === model && candidate.apiKeys.some((apiKey) => apiKey.id === providerKeys[key]),
+    );
+  const [fast, normal, smart] = [linked(tiers.fast), linked(tiers.normal), linked(tiers.smart)];
+  const decisionApiKeyId = providerKeys[decisionModel.key];
+  if (!fast || !normal || !smart || !decisionApiKeyId) {
+    const missing = [
+      ...Object.values(tiers)
+        .filter((tier) => !linked(tier))
+        .map(({ key, model }) => `${model} on "${key}"`),
+      ...(decisionApiKeyId ? [] : [`the key "${decisionModel.key}"`]),
+    ];
+    console.warn(`Skipped the auto router, so its shots will fail: missing ${missing.join(", ")}.`);
+    return;
+  }
+  const priced = async ({ key, pricePerMillion }: AutoRouterTier, model: LinkedModel) => {
+    await api.patch(`/api/llm-models/${model.id}`, {
+      customPricePerMillionInput: pricePerMillion.input,
+      customPricePerMillionOutput: pricePerMillion.output,
+    });
+    return { modelId: model.id, providerApiKeyId: providerKeys[key] };
+  };
+  await api.put("/api/auto-routing/state", { enabled: true });
+  const tierModels = {
+    fast: await priced(tiers.fast, fast),
+    normal: await priced(tiers.normal, normal),
+    smart: await priced(tiers.smart, smart),
+  };
+  let router = (await api.get<AutoRouterResponse[]>("/api/auto-routing/routers")).find(
+    (existing) => existing.name === AUTO_ROUTER.name,
+  );
+  if (!router) {
+    router = await api.post<AutoRouterResponse>("/api/auto-routing/routers", {
+      name: AUTO_ROUTER.name,
+      budgetPreset: AUTO_ROUTER.budgetPreset,
+      tiers: tierModels,
+      decisionModel: { apiKeyId: decisionApiKeyId, model: decisionModel.model },
+    });
+  }
+  record("autoRouters", AUTO_ROUTER.name, router.id);
+  record("autoRouterScorers", AUTO_ROUTER.name, router.status.coldStart.scorerVersionId);
+}
+
+/** Fits the router's plan on the sessions the database seed scored. A skipped router has none. */
+export async function planAutoRouter(api: ArchestraApi, state: SeedState): Promise<void> {
+  const routerId = state.autoRouters?.[AUTO_ROUTER.name];
+  if (!routerId) return;
+  const { fit } = await api.post<{ fit: { status: string; error?: string } | null }>(
+    `/api/auto-routing/routers/${routerId}/replan`,
+  );
+  if (fit?.status !== "active" && fit?.status !== "unchanged") {
+    throw new Error(`The auto router's plan did not fit: ${JSON.stringify(fit)}`);
+  }
+}
+
+/**
+ * Uploads the Knowledge Files and indexes them into their Knowledge Bases.
+ * Runs after the database seed, because indexing needs the embedding model it
+ * sets. A file that already exists is left as it is.
+ */
+export async function seedKnowledgeFiles(api: ArchestraApi, state: SeedState): Promise<void> {
+  const directories: Record<string, string> = {};
+  for (const name of KNOWLEDGE_DIRECTORIES) {
+    const created = await api.ensureNamed({
+      name,
+      list: async () => items(await api.get<Listed>("/api/knowledge-directories")),
+      create: () => api.post<Named>("/api/knowledge-directories", { name }),
+    });
+    directories[name] = created.id;
+  }
+
+  type Stored = { id: string; filename: string; knowledgeBases?: { id: string }[] };
+  const stored = async () => items(await api.get<Listed>("/api/knowledge-files?limit=100")) as unknown as Stored[];
+  const existing = new Set((await stored()).map((file) => file.filename));
+  for (const file of KNOWLEDGE_FILES) {
+    if (existing.has(file.filename)) continue;
+    const pdf = file.filename.endsWith(".pdf");
+    const mimeType = pdf ? "application/pdf" : file.filename.endsWith(".csv") ? "text/csv" : "text/markdown";
+    const bytes = pdf ? textPdf(file.text) : Buffer.from(file.text);
+    const upload = {
+      filename: file.filename,
+      mimeType,
+      content: bytes.toString("base64"),
+      directoryId: file.directory ? directories[file.directory] : null,
+    };
+    // The server's PDF parser sometimes rejects a valid file, so retry it.
+    let created: { id: string } | null = null;
+    for (let attempt = 0; attempt < 8 && !created; attempt++) {
+      created = await api.tryPost<{ id: string }>("/api/knowledge-files", upload);
+    }
+    if (!created) throw new Error(`Could not upload ${file.filename}`);
+  }
+
+  // Index every file that is not yet in its Knowledge Base, new or left by an
+  // earlier run. Indexing parses each PDF again, so retry what the parser rejects.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const byName = new Map((await storedEverywhere()).map((file) => [file.filename, file]));
+    const toIndex: Record<string, string[]> = {};
+    for (const file of KNOWLEDGE_FILES) {
+      const row = byName.get(file.filename);
+      const baseId = file.knowledgeBase && state.knowledgeBases[file.knowledgeBase];
+      if (!row || !baseId || row.knowledgeBases?.some((base) => base.id === baseId)) continue;
+      toIndex[baseId] ??= [];
+      toIndex[baseId].push(row.id);
+    }
+    if (Object.keys(toIndex).length === 0) return;
+    for (const [knowledgeBaseId, fileIds] of Object.entries(toIndex)) {
+      await api.post("/api/knowledge-files/index", { fileIds, knowledgeBaseId });
+    }
+  }
+  console.warn("Some Knowledge Files could not be indexed.");
+
+  // The listing shows one directory at a time, so read each directory too.
+  async function storedEverywhere(): Promise<Stored[]> {
+    const lists = await Promise.all(
+      Object.values(directories).map(
+        async (id) => items(await api.get<Listed>(`/api/knowledge-files?limit=100&directoryId=${id}`)) as unknown as Stored[],
+      ),
+    );
+    return [...(await stored()), ...lists.flat()];
+  }
+}
+
+export function readSeedState(): SeedState {
+  return JSON.parse(fs.readFileSync(SEED_STATE_FILE, "utf8")) as SeedState;
+}
+
+/** The icon of a server's public MCP catalog entry, as a data URI, or null without one. */
+function catalogIcon(name: string): string | null {
+  const entry = MCP_CATALOG_ICONS[name];
+  if (!entry) return null;
+  const file = path.resolve(__dirname, "../../../../mcp-catalog/data/mcp-evaluations", entry);
+  return (JSON.parse(fs.readFileSync(file, "utf8")) as { icon?: string }).icon ?? null;
+}
+
+/** Adds the docs' rules to the Guardrails policy, once. Saving the first policy also turns enforcement on. */
+async function addGuardrailsRules(api: ArchestraApi): Promise<void> {
+  const policy = await api.get<{ content: string; revision: number }>("/api/guardrails-policy");
+  const rules = GUARDRAILS_POLICY_RULES.trim();
+  if (policy.content.includes(rules)) return;
+  await api.put("/api/guardrails-policy", {
+    content: `${policy.content.trimEnd()}\n\n${rules}\n`,
+    expectedRevision: policy.revision,
+  });
+}
+
+/** Saves the docs' validation files and runs them, so each row shows a result. Reruns only after the files change. */
+async function saveValidations(api: ArchestraApi): Promise<void> {
+  const suite = await api.get<{ version: string; files: { path: string; content: string }[] }>(
+    "/api/openappa/policy-tests",
+  );
+  const files = VALIDATIONS.map(({ path, content }) => ({ path, content }));
+  const same =
+    suite.files.length === files.length &&
+    files.every((file) => suite.files.some((saved) => saved.path === file.path && saved.content === file.content));
+  if (same) return;
+  const saved = await api.put<{ version: string }>("/api/openappa/policy-tests", {
+    files,
+    expectedVersion: suite.version,
+  });
+  await api.post("/api/openappa/policy-tests/run", { files, sourceVersion: saved.version });
+}

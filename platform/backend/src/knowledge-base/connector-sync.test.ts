@@ -1,0 +1,2102 @@
+import { vi } from "vitest";
+
+const mockGetConnector = vi.hoisted(() => vi.fn());
+vi.mock("./connectors/registry", () => ({
+  getConnector: mockGetConnector,
+}));
+
+const mockGetSecret = vi.hoisted(() => vi.fn());
+const mockDeleteSecret = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+vi.mock("@/secrets-manager", () => ({
+  secretManager: () => ({
+    getSecret: mockGetSecret,
+    deleteSecret: mockDeleteSecret,
+  }),
+}));
+
+const mockEnqueue = vi.hoisted(() => vi.fn().mockResolvedValue("task-id-123"));
+vi.mock("@/task-queue", () => ({
+  taskQueueService: {
+    enqueue: mockEnqueue,
+  },
+}));
+
+const mockChunkDocument = vi.hoisted(() =>
+  vi.fn().mockResolvedValue([
+    {
+      content: "chunk 1",
+      chunkIndex: 0,
+      metadataSuffixSemantic: null,
+      metadataSuffixKeyword: null,
+    },
+    {
+      content: "chunk 2",
+      chunkIndex: 1,
+      metadataSuffixSemantic: null,
+      metadataSuffixKeyword: null,
+    },
+  ]),
+);
+vi.mock("./chunker", () => ({
+  chunkDocument: mockChunkDocument,
+}));
+
+import { createHash } from "node:crypto";
+import { sql } from "drizzle-orm";
+import db, { schema } from "@/database";
+import {
+  ConnectorRunModel,
+  KbChunkModel,
+  KbConnectorDocumentCountModel,
+  KbDocumentModel,
+  KnowledgeBaseConnectorModel,
+} from "@/models";
+import LlmProviderApiKeyModel from "@/models/llm-provider-api-key";
+import OrganizationModel from "@/models/organization";
+import { describe, expect, test } from "@/test";
+import * as connectorCredentials from "./connector-credentials";
+import { connectorSyncService } from "./connector-sync";
+import { deleteConnector } from "./knowledge-source-deletion";
+
+async function createSecret(): Promise<string> {
+  const [secret] = await db
+    .insert(schema.secretsTable)
+    .values({ secret: { access_token: "test-secret" } })
+    .returning();
+  return secret.id;
+}
+
+function makeMockConnector(
+  documents: Array<{
+    id: string;
+    title: string;
+    content: string;
+    sourceUrl?: string;
+    metadata?: Record<string, unknown>;
+    operationalMetadataKeys?: string[];
+    contentTruncation?: {
+      originalCharacterCount: number;
+      indexedCharacterCount: number;
+      originalContentHash: string;
+    };
+  }>,
+  options?: { hasMore?: boolean },
+) {
+  return {
+    estimateTotalItems: vi.fn().mockResolvedValue(documents.length),
+    sync: vi.fn().mockImplementation(() =>
+      (async function* () {
+        yield {
+          documents,
+          checkpoint: { page: 1 },
+          hasMore: options?.hasMore ?? false,
+        };
+      })(),
+    ),
+  };
+}
+
+function setupSecret(
+  credentials = { email: "user@test.com", apiToken: "tok-123" },
+) {
+  mockGetSecret.mockResolvedValue({
+    id: "secret-1",
+    secret: credentials,
+  });
+}
+
+describe("ConnectorSyncService", () => {
+  test("skips queued upload syncs before resolving credentials or creating a run", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id, {
+      connectorType: "file_upload",
+      config: {} as never,
+    });
+    const resolveCredentials = vi.spyOn(
+      connectorCredentials,
+      "resolveConnectorCredentials",
+    );
+    try {
+      const result = await connectorSyncService.executeSync(connector.id);
+
+      const runs = await ConnectorRunModel.findByConnector({
+        connectorId: connector.id,
+      });
+      expect(result, runs[0]?.error ?? undefined).toEqual({
+        runId: "",
+        status: "skipped",
+      });
+      expect(resolveCredentials).not.toHaveBeenCalled();
+      expect(mockGetConnector).not.toHaveBeenCalled();
+      expect(runs).toEqual([]);
+      expect(await KnowledgeBaseConnectorModel.findById(connector.id)).toEqual(
+        connector,
+      );
+    } finally {
+      resolveCredentials.mockRestore();
+    }
+  });
+
+  test("executeSync processes documents from connector", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    const mockImpl = makeMockConnector([
+      { id: "ext-1", title: "Doc 1", content: "Content of doc 1" },
+      { id: "ext-2", title: "Doc 2", content: "Content of doc 2" },
+    ]);
+    mockGetConnector.mockReturnValue(mockImpl);
+    // Stores 0 before the run, so only the run's own write can show 2.
+    await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+    expect(
+      await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]),
+    ).toEqual(new Map([[connector.id, 2]]));
+
+    // Run stays "running" until batch_embedding tasks finalize it
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.status).toBe("running");
+    expect(run?.documentsProcessed).toBe(2);
+    expect(run?.documentsIngested).toBe(2);
+    expect(run?.totalBatches).toBe(1);
+
+    // Connector stays "running" — the last batch_embedding task sets "success"
+    const updated = await KnowledgeBaseConnectorModel.findById(connector.id);
+    expect(updated?.lastSyncStatus).toBe("running");
+  });
+
+  test("persists and logs a connector content-truncation marker", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    const contentTruncation = {
+      originalCharacterCount: 600_000,
+      indexedCharacterCount: 500_000,
+      originalContentHash: "full-source-hash",
+    };
+    mockGetConnector.mockReturnValue(
+      makeMockConnector([
+        {
+          id: "long-doc",
+          title: "Long handbook",
+          content: "retained prefix",
+          contentTruncation,
+        },
+      ]),
+    );
+
+    const warn = vi.fn();
+    const stubLogger = {
+      info: vi.fn(),
+      warn,
+      debug: vi.fn(),
+      error: vi.fn(),
+      child: () => stubLogger,
+    };
+    const firstRun = await connectorSyncService.executeSync(connector.id, {
+      logger: stubLogger as never,
+    });
+
+    const firstStored = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "long-doc",
+    });
+    expect(firstStored?.metadata).toMatchObject({ contentTruncation });
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        documentId: "long-doc",
+        name: "Long handbook",
+        ...contentTruncation,
+      }),
+      "Document content exceeded the indexing limit and was truncated",
+    );
+
+    // A tail-only source change retains the exact same indexed prefix. The
+    // full-source fingerprint must still invalidate the stored content hash.
+    await ConnectorRunModel.update(firstRun.runId, {
+      status: "success",
+      completedAt: new Date(),
+    });
+    mockGetConnector.mockReturnValue(
+      makeMockConnector([
+        {
+          id: "long-doc",
+          title: "Long handbook",
+          content: "retained prefix",
+          contentTruncation: {
+            ...contentTruncation,
+            originalContentHash: "changed-tail-hash",
+          },
+        },
+      ]),
+    );
+    await connectorSyncService.executeSync(connector.id, {
+      logger: stubLogger as never,
+    });
+    const secondStored = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "long-doc",
+    });
+    expect(secondStored?.id).toBe(firstStored?.id);
+    expect(secondStored?.contentHash).not.toBe(firstStored?.contentHash);
+  });
+
+  test("an unresolvable OCR configuration degrades to syncing without OCR", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    // Configured but unusable: a keyless native-Ollama credential resolves,
+    // but its transport cannot carry PDF input, so resolveOcrConfig throws —
+    // the sync must proceed OCR-less, not fail.
+    const badKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Native Ollama",
+      provider: "ollama-native",
+      secretId: null,
+      scope: "org",
+      userId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      ocrChatApiKeyId: badKey.id,
+      ocrModel: "llava",
+    });
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue(
+      makeMockConnector([{ id: "ext-1", title: "Doc 1", content: "Text" }]),
+    );
+
+    // The shared test setup silences pino, so capture through a stub logger
+    // rather than the capturing stream the task handler uses.
+    const warn = vi.fn();
+    const stubLogger = {
+      info: vi.fn(),
+      warn,
+      debug: vi.fn(),
+      error: vi.fn(),
+      child: () => stubLogger,
+    };
+    const result = await connectorSyncService.executeSync(connector.id, {
+      logger: stubLogger as never,
+    });
+    expect(result.status).toBe("success");
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.stringContaining("PDF input") }),
+      "OCR is configured but unusable — syncing without it",
+    );
+  });
+
+  test("sub-resource fallbacks stay warnings: a run that ingested every document is a success", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    // A connector that degraded gracefully mid-fetch (safeItemFetch fallback,
+    // e.g. one issue's comments couldn't load) but still produced and ingested
+    // every document. An admin has nothing to fix — the run must NOT read
+    // "completed with errors"; the details live in the run logs.
+    const mockImpl = {
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [{ id: "ext-1", title: "Doc 1", content: "Content" }],
+            failures: [
+              { itemId: "ext-1", resource: "comments", error: "HTTP 403" },
+            ],
+            checkpoint: { page: 1 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    };
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.itemErrors).toBe(0);
+    expect(run?.documentsIngested).toBe(1);
+  });
+
+  test("skipped items with no extractable text are counted separately on the run", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    // One digital document that ingests fine, one scanned PDF the connector
+    // skipped for having no text layer, and one unrelated skip (unsupported
+    // type). Only the no-text skip must land in documentsWithoutText.
+    const mockImpl = {
+      estimateTotalItems: vi.fn().mockResolvedValue(3),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [
+              { id: "ext-1", title: "Digital", content: "Readable text" },
+            ],
+            skipped: [
+              {
+                itemId: "scan-1",
+                name: "scanned-contract.pdf",
+                reason:
+                  "PDF has 12 page(s) but no extractable text layer (likely scanned or image-only)",
+                category: "no_extractable_text",
+              },
+              {
+                itemId: "old-1",
+                name: "notes.xyz",
+                reason: "unsupported_file_type",
+              },
+            ],
+            checkpoint: { page: 1 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    };
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.itemsSkipped).toBe(2);
+    expect(run?.documentsWithoutText).toBe(1);
+    // Skipped items still count as processed
+    expect(run?.documentsProcessed).toBe(3);
+  });
+
+  test("a definitive no-text skip retires stale indexed text for the same source", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    const staleDocument = await KbDocumentModel.create({
+      connectorId: connector.id,
+      organizationId: org.id,
+      sourceId: "page-contract-1",
+      title: "Draft contract",
+      content: "The obsolete draft terms remain searchable",
+      contentHash: "stale-hash",
+    });
+    await KbChunkModel.insertMany([
+      {
+        documentId: staleDocument.id,
+        content: "The obsolete draft terms remain searchable",
+        chunkIndex: 0,
+      },
+    ]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            skipped: [
+              {
+                itemId: "contract-1",
+                sourceId: "page-contract-1",
+                name: "signed-contract.pdf",
+                reason: "PDF has no text layer",
+                category: "no_extractable_text" as const,
+              },
+            ],
+            checkpoint: { page: 1 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    await connectorSyncService.executeSync(connector.id);
+
+    expect(
+      await KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "page-contract-1",
+      }),
+    ).toBeNull();
+    expect(await KbChunkModel.findByDocument(staleDocument.id)).toEqual([]);
+  });
+
+  test("a transient fetch failure preserves the last indexed document", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    const lastGoodDocument = await KbDocumentModel.create({
+      connectorId: connector.id,
+      organizationId: org.id,
+      sourceId: "gdoc-1",
+      title: "Last good export",
+      content: "Previously indexed text",
+      contentHash: "last-good-hash",
+    });
+    await KbChunkModel.insertMany([
+      {
+        documentId: lastGoodDocument.id,
+        content: "Previously indexed text",
+        chunkIndex: 0,
+      },
+    ]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            failures: [
+              {
+                itemId: "gdoc-1",
+                resource: "driveFile",
+                error: "HTTP 503",
+                itemUnavailable: true,
+              },
+            ],
+            checkpoint: { page: 1 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.status).toBe("completed_with_errors");
+    expect(run?.itemErrors).toBe(1);
+    expect(run?.documentsProcessed).toBe(1);
+
+    expect(
+      await KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "gdoc-1",
+      }),
+    ).toMatchObject({ id: lastGoodDocument.id });
+    expect(await KbChunkModel.findByDocument(lastGoodDocument.id)).toHaveLength(
+      1,
+    );
+  });
+
+  test("a later document resolves a provisional cross-identity fetch failure", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            failures: [
+              {
+                itemId: "shared-file-1",
+                resource: "driveFile",
+                error: "first viewer could not download",
+                itemUnavailable: true,
+                recoverySourceId: "shared-file-1",
+              },
+            ],
+            checkpoint: { page: 1 },
+            hasMore: true,
+          };
+          yield {
+            documents: [
+              {
+                id: "shared-file-1",
+                title: "Recovered through another viewer",
+                content: "The ultimately available content",
+              },
+            ],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+    const run = await ConnectorRunModel.findById(result.runId);
+
+    expect(result.status).toBe("success");
+    expect(run?.itemErrors).toBe(0);
+    expect(run?.documentsProcessed).toBe(1);
+    expect(run?.totalBatches).toBe(1);
+  });
+
+  test("a later definitive skip resolves a provisional cross-identity fetch failure", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            failures: [
+              {
+                itemId: "shared-scan-1",
+                resource: "driveFile",
+                error: "first viewer could not download",
+                itemUnavailable: true,
+                recoverySourceId: "shared-scan-1",
+              },
+            ],
+            checkpoint: { page: 1 },
+            hasMore: true,
+          };
+          yield {
+            documents: [],
+            skipped: [
+              {
+                itemId: "shared-scan-1",
+                name: "signed-contract.pdf",
+                reason: "PDF has no extractable text layer",
+                category: "no_extractable_text" as const,
+              },
+            ],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+    const run = await ConnectorRunModel.findById(result.runId);
+
+    expect(run?.status).toBe("no_documents");
+    expect(run?.itemErrors).toBe(0);
+    expect(run?.documentsProcessed).toBe(1);
+    expect(run?.itemsSkipped).toBe(1);
+    expect(run?.documentsWithoutText).toBe(1);
+    expect(run?.error).toContain(
+      "all 1 item found contained no extractable text",
+    );
+    expect(run?.error).not.toContain("could not be fetched");
+  });
+
+  test("an earlier post-cap recovery resolves a later provisional failure", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [
+              {
+                id: "post-cap-shared-file",
+                title: "Recovered before a later failed viewer",
+                content: "The source was successfully fetched",
+              },
+            ],
+            recoveredSourceIds: ["post-cap-shared-file"],
+            checkpoint: { page: 1 },
+            hasMore: true,
+          };
+          yield {
+            documents: [],
+            failures: [
+              {
+                itemId: "post-cap-shared-file",
+                resource: "driveFile",
+                error: "later viewer could not download",
+                itemUnavailable: true,
+                recoverySourceId: "post-cap-shared-file",
+              },
+            ],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+    const run = await ConnectorRunModel.findById(result.runId);
+
+    expect(result.status).toBe("success");
+    expect(run?.itemErrors).toBe(0);
+    expect(run?.documentsProcessed).toBe(1);
+  });
+
+  test("deduplicates unresolved provisional failures by source", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          for (const page of [1, 2]) {
+            yield {
+              documents: [],
+              failures: [
+                {
+                  itemId: "shared-file-1",
+                  resource: "driveFile",
+                  error: `viewer ${page} could not download`,
+                  itemUnavailable: true,
+                  recoverySourceId: "shared-file-1",
+                },
+              ],
+              checkpoint: { page },
+              hasMore: page === 1,
+            };
+          }
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+    const run = await ConnectorRunModel.findById(result.runId);
+
+    expect(run?.status).toBe("completed_with_errors");
+    expect(run?.itemErrors).toBe(1);
+    expect(run?.documentsProcessed).toBe(1);
+  });
+
+  test("a drive-scoped no-text skip retires only the matching drive's document", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    const siblingDocument = await KbDocumentModel.create({
+      connectorId: connector.id,
+      organizationId: org.id,
+      sourceId: "drive-local-id",
+      title: "User A contract",
+      content: "User A's indexed content",
+      contentHash: "user-a-hash",
+      metadata: { userId: "user-a" },
+    });
+    await KbChunkModel.insertMany([
+      {
+        documentId: siblingDocument.id,
+        content: "User A's indexed content",
+        chunkIndex: 0,
+      },
+    ]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            skipped: [
+              {
+                itemId: "drive-local-id",
+                name: "User B scan.pdf",
+                reason: "PDF has no text layer",
+                category: "no_extractable_text" as const,
+                sourceScope: {
+                  metadataField: "userId" as const,
+                  value: "user-b",
+                },
+              },
+            ],
+            checkpoint: { page: 1 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    await connectorSyncService.executeSync(connector.id);
+
+    expect(
+      await KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "drive-local-id",
+      }),
+    ).toMatchObject({ id: siblingDocument.id });
+    expect(await KbChunkModel.findByDocument(siblingDocument.id)).toHaveLength(
+      1,
+    );
+
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(1),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            skipped: [
+              {
+                itemId: "drive-local-id",
+                name: "User A scan.pdf",
+                reason: "PDF has no text layer",
+                category: "no_extractable_text" as const,
+                sourceScope: {
+                  metadataField: "userId" as const,
+                  value: "user-a",
+                },
+              },
+            ],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    await connectorSyncService.executeSync(connector.id);
+
+    expect(
+      await KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "drive-local-id",
+      }),
+    ).toBeNull();
+    expect(await KbChunkModel.findByDocument(siblingDocument.id)).toEqual([]);
+  });
+
+  test("deleting the connector mid-run stops the sync before the next batch", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(2),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [{ id: "ext-1", title: "Doc 1", content: "Content 1" }],
+            checkpoint: { page: 1 },
+            hasMore: true,
+          };
+          // The user deletes the connector while the run is between batches.
+          await deleteConnector(connector.id);
+          yield {
+            documents: [{ id: "ext-2", title: "Doc 2", content: "Content 2" }],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    // The delete fails the run's lease, which is what the loop checks at each
+    // batch boundary — the second batch is never ingested.
+    expect(result.status).toBe("superseded");
+    expect((await ConnectorRunModel.findById(result.runId))?.status).toBe(
+      "superseded",
+    );
+    const docs = await db
+      .select({ sourceId: schema.kbDocumentsTable.sourceId })
+      .from(schema.kbDocumentsTable)
+      .where(sql`connector_id = ${connector.id}`);
+    expect(docs.map((d) => d.sourceId)).toEqual(["ext-1"]);
+  });
+
+  test("a soft-deleted connector stops the sync even if its run keeps the lease", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(2),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [{ id: "ext-1", title: "Doc 1", content: "Content 1" }],
+            checkpoint: { page: 1 },
+            hasMore: true,
+          };
+          // Bare model soft-delete: the stamp lands but the run row is left
+          // untouched, so the lease still renews. The per-batch connector
+          // re-read is the guard that has to stop the run here — it must not
+          // fall back to the start-of-run snapshot and keep writing.
+          await KnowledgeBaseConnectorModel.delete(connector.id);
+          yield {
+            documents: [{ id: "ext-2", title: "Doc 2", content: "Content 2" }],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("superseded");
+    const docs = await db
+      .select({ sourceId: schema.kbDocumentsTable.sourceId })
+      .from(schema.kbDocumentsTable)
+      .where(sql`connector_id = ${connector.id}`);
+    expect(docs.map((d) => d.sourceId)).toEqual(["ext-1"]);
+  });
+
+  test("executeSync throws when connector not found", async () => {
+    await expect(
+      connectorSyncService.executeSync("00000000-0000-0000-0000-000000000000"),
+    ).rejects.toThrow("Connector not found");
+  });
+
+  test("executeSync skips unchanged documents (same content hash)", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    // Pre-create a document with same content
+    const content = "Content of doc 1";
+    const contentHash = createHash("sha256").update(content).digest("hex");
+
+    await KbDocumentModel.create({
+      organizationId: org.id,
+      sourceId: "ext-1",
+      connectorId: connector.id,
+      title: "Doc 1",
+      content,
+      contentHash,
+    });
+    const existingDoc = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "ext-1",
+    });
+
+    if (!existingDoc) {
+      expect.fail("Existing document not found");
+      return;
+    }
+
+    await KbChunkModel.insertMany([
+      { documentId: existingDoc.id, content: "chunk 1", chunkIndex: 0 },
+    ]);
+
+    setupSecret();
+    const mockImpl = makeMockConnector([
+      { id: "ext-1", title: "Doc 1", content },
+    ]);
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.documentsProcessed).toBe(1);
+    expect(run?.documentsIngested).toBe(0); // Skipped because unchanged
+  });
+
+  test("rotating completion-generation metadata does not re-chunk unchanged content", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    const content = "Stable content";
+    const stableMetadata = { mfilesObjectKey: "0:123" };
+    const contentHash = createHash("sha256")
+      .update(`${content}\n${JSON.stringify(stableMetadata)}`)
+      .digest("hex");
+    const existing = await KbDocumentModel.create({
+      organizationId: org.id,
+      sourceId: "ext-1",
+      connectorId: connector.id,
+      title: "Doc",
+      content,
+      contentHash,
+      metadata: { ...stableMetadata, mfilesBaselineGeneration: "old" },
+    });
+    await KbChunkModel.insertMany([
+      { documentId: existing.id, content: "original chunk", chunkIndex: 0 },
+    ]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue(
+      makeMockConnector([
+        {
+          id: "ext-1",
+          title: "Doc",
+          content,
+          metadata: { ...stableMetadata, mfilesBaselineGeneration: "new" },
+          operationalMetadataKeys: ["mfilesBaselineGeneration"],
+        },
+      ]),
+    );
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.documentsIngested).toBe(0);
+    const updated = await KbDocumentModel.findById(existing.id);
+    expect(updated?.metadata).toMatchObject({
+      mfilesBaselineGeneration: "new",
+    });
+    const chunks = await KbChunkModel.findByDocument(existing.id);
+    expect(chunks.map((chunk) => chunk.content)).toEqual(["original chunk"]);
+  });
+
+  test("authoritative source-scope reconciliation removes only missing documents in that scope", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+    await Promise.all([
+      KbDocumentModel.create({
+        organizationId: org.id,
+        connectorId: connector.id,
+        sourceId: "keep",
+        title: "Keep",
+        content: "keep",
+        contentHash: "keep",
+        metadata: { mfilesObjectKey: "0:123" },
+      }),
+      KbDocumentModel.create({
+        organizationId: org.id,
+        connectorId: connector.id,
+        sourceId: "stale",
+        title: "Stale",
+        content: "stale",
+        contentHash: "stale",
+        metadata: { mfilesObjectKey: "0:123" },
+      }),
+      KbDocumentModel.create({
+        organizationId: org.id,
+        connectorId: connector.id,
+        sourceId: "other-scope",
+        title: "Other",
+        content: "other",
+        contentHash: "other",
+        metadata: { mfilesObjectKey: "0:999" },
+      }),
+    ]);
+    await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(0),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            reconcileScopes: [
+              {
+                metadataFilter: { mfilesObjectKey: "0:123" },
+                seenSourceIds: ["keep"],
+              },
+            ],
+            checkpoint: { cursor: "2" },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    await connectorSyncService.executeSync(connector.id);
+
+    expect(
+      await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]),
+    ).toEqual(new Map([[connector.id, 2]]));
+
+    await expect(
+      KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "keep",
+      }),
+    ).resolves.not.toBeNull();
+    await expect(
+      KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "stale",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "other-scope",
+      }),
+    ).resolves.not.toBeNull();
+  });
+
+  test("completion sweep deletes only documents outside the completed baseline generation", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+    await Promise.all([
+      KbDocumentModel.create({
+        organizationId: org.id,
+        connectorId: connector.id,
+        sourceId: "current",
+        title: "Current",
+        content: "current",
+        contentHash: "current",
+        metadata: { mfilesBaselineGeneration: "generation-2" },
+      }),
+      KbDocumentModel.create({
+        organizationId: org.id,
+        connectorId: connector.id,
+        sourceId: "stale",
+        title: "Stale",
+        content: "stale",
+        contentHash: "stale",
+        metadata: { mfilesBaselineGeneration: "generation-1" },
+      }),
+    ]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(0),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [],
+            completionSweep: {
+              metadataKey: "mfilesBaselineGeneration",
+              generation: "generation-2",
+            },
+            checkpoint: { cursor: "baseline-head" },
+            hasMore: false,
+          };
+        })(),
+      ),
+    });
+
+    await connectorSyncService.executeSync(connector.id);
+
+    await expect(
+      KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "current",
+      }),
+    ).resolves.not.toBeNull();
+    await expect(
+      KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "stale",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  test("executeSync updates document when content hash changes", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    // Pre-create a document with OLD content
+    const existingDoc = await KbDocumentModel.create({
+      organizationId: org.id,
+      sourceId: "ext-1",
+      connectorId: connector.id,
+      title: "Doc 1",
+      content: "Old content",
+      contentHash: "old-hash",
+    });
+
+    // Create some old chunks that should be replaced
+    await KbChunkModel.insertMany([
+      { documentId: existingDoc.id, content: "old chunk", chunkIndex: 0 },
+    ]);
+
+    setupSecret();
+    const mockImpl = makeMockConnector([
+      { id: "ext-1", title: "Doc 1 Updated", content: "New content" },
+    ]);
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.documentsIngested).toBe(1);
+
+    // Verify document was updated
+    const doc = await KbDocumentModel.findById(existingDoc.id);
+    expect(doc?.title).toBe("Doc 1 Updated");
+    expect(doc?.content).toBe("New content");
+    expect(doc?.embeddingStatus).toBe("pending");
+    expect(doc?.acl).toEqual(["org:*"]);
+
+    const chunks = await KbChunkModel.findByDocument(existingDoc.id);
+    expect(chunks).toHaveLength(2);
+    expect(chunks.every((chunk) => chunk.acl.includes("org:*"))).toBe(true);
+  });
+
+  test("auto-sync connector: content-sync creates documents fail-closed (acl=[])", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id, {
+      syncPermissionsFromSource: true,
+    });
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    mockGetConnector.mockReturnValue(
+      makeMockConnector([{ id: "ext-1", title: "Doc 1", content: "content" }]),
+    );
+
+    await connectorSyncService.executeSync(connector.id);
+
+    const doc = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "ext-1",
+    });
+    // The permission-sync pass owns ACLs; content-sync must fail-close on create.
+    expect(doc?.acl).toEqual([]);
+    const chunks = await KbChunkModel.findByDocument(doc?.id ?? "");
+    expect(chunks.every((chunk) => chunk.acl.length === 0)).toBe(true);
+  });
+
+  test("auto-sync connector: changed content locks the revision until permissions refresh", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id, {
+      syncPermissionsFromSource: true,
+    });
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    // A document the permission-sync pass already tagged with a per-doc ACL.
+    const existingDoc = await KbDocumentModel.create({
+      organizationId: org.id,
+      sourceId: "ext-1",
+      connectorId: connector.id,
+      title: "Doc 1",
+      content: "Old content",
+      contentHash: "old-hash",
+      acl: ["user_email:alice@example.com"],
+    });
+    await KbChunkModel.insertMany([
+      {
+        documentId: existingDoc.id,
+        content: "old chunk",
+        chunkIndex: 0,
+        acl: ["user_email:alice@example.com"],
+      },
+    ]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue(
+      makeMockConnector([
+        { id: "ext-1", title: "Doc 1 Updated", content: "New content" },
+      ]),
+    );
+
+    await connectorSyncService.executeSync(connector.id);
+
+    // The old ACL was evaluated for the old source revision. Changed content
+    // is unavailable until the permission pass evaluates the new revision.
+    const doc = await KbDocumentModel.findById(existingDoc.id);
+    expect(doc?.content).toBe("New content");
+    expect(doc?.acl).toEqual([]);
+    const chunks = await KbChunkModel.findByDocument(existingDoc.id);
+    expect(chunks.every((chunk) => chunk.acl.length === 0)).toBe(true);
+  });
+
+  test("executeSync repairs unchanged documents that have no chunks", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    const content = "Content of doc 1";
+    const contentHash = createHash("sha256").update(content).digest("hex");
+
+    const existingDoc = await KbDocumentModel.create({
+      organizationId: org.id,
+      sourceId: "ext-1",
+      connectorId: connector.id,
+      title: "Doc 1",
+      content,
+      contentHash,
+      embeddingStatus: "pending",
+    });
+
+    setupSecret();
+    const mockImpl = makeMockConnector([
+      { id: "ext-1", title: "Doc 1", content },
+    ]);
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.documentsProcessed).toBe(1);
+    expect(run?.documentsIngested).toBe(1);
+
+    const repairedChunks = await KbChunkModel.findByDocument(existingDoc.id);
+    expect(repairedChunks).toHaveLength(2);
+
+    const repairedDoc = await KbDocumentModel.findById(existingDoc.id);
+    expect(repairedDoc?.embeddingStatus).toBe("pending");
+  });
+
+  test("executeSync re-queues unchanged documents whose embedding failed", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    const content = "Content of doc 1";
+    const contentHash = createHash("sha256").update(content).digest("hex");
+    const existingDoc = await KbDocumentModel.create({
+      organizationId: org.id,
+      sourceId: "ext-1",
+      connectorId: connector.id,
+      title: "Doc 1",
+      content,
+      contentHash,
+      embeddingStatus: "failed",
+    });
+    await KbChunkModel.insertMany([
+      { documentId: existingDoc.id, content: "chunk 1", chunkIndex: 0 },
+      { documentId: existingDoc.id, content: "chunk 2", chunkIndex: 1 },
+    ]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue(
+      makeMockConnector([{ id: "ext-1", title: "Doc 1", content }]),
+    );
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.documentsIngested).toBe(1);
+    expect(await KbChunkModel.findByDocument(existingDoc.id)).toHaveLength(2);
+    expect(
+      (await KbDocumentModel.findById(existingDoc.id))?.embeddingStatus,
+    ).toBe("pending");
+  });
+
+  test("executeSync marks run as failed when sync generator throws", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    const mockImpl = {
+      estimateTotalItems: vi.fn().mockResolvedValue(0),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield* []; // biome: generator must contain yield
+          throw new Error("Connection failed");
+        })(),
+      ),
+    };
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("failed");
+
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.error).toContain("Connection failed");
+
+    const updated = await KnowledgeBaseConnectorModel.findById(connector.id);
+    expect(updated?.lastSyncStatus).toBe("failed");
+    expect(updated?.lastSyncError).toContain("Connection failed");
+  });
+
+  test("a run that fails after ingesting a batch still stores the connector's total", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+    await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]);
+
+    setupSecret();
+    mockGetConnector.mockReturnValue({
+      estimateTotalItems: vi.fn().mockResolvedValue(0),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [
+              { id: "ext-1", title: "Doc 1", content: "Content of doc 1" },
+            ],
+            checkpoint: { cursor: "1" },
+            hasMore: true,
+          };
+          throw new Error("Connection failed");
+        })(),
+      ),
+    });
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("failed");
+    expect(
+      await KbConnectorDocumentCountModel.findByConnectorIds([connector.id]),
+    ).toEqual(new Map([[connector.id, 1]]));
+  });
+
+  test("executeSync enqueues embedding tasks for ingested documents", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    const mockImpl = makeMockConnector([
+      { id: "ext-1", title: "Doc 1", content: "Content" },
+    ]);
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+
+    // Verify embedding was enqueued as a task
+    expect(mockEnqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskType: "batch_embedding",
+        payload: expect.objectContaining({
+          connectorRunId: result.runId,
+        }),
+      }),
+    );
+
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.documentsIngested).toBe(1);
+    expect(run?.totalBatches).toBe(1);
+  });
+
+  test("executeSync stops early when time budget exceeded", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    // Connector reports hasMore=true
+    const mockImpl = makeMockConnector(
+      [{ id: "ext-1", title: "Doc 1", content: "Content" }],
+      { hasMore: true },
+    );
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id, {
+      maxDurationMs: 1, // Very short timeout — elapsed will exceed 0.9ms after DB ops
+    });
+
+    expect(result.status).toBe("partial");
+
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.status).toBe("partial");
+
+    const updatedConnector = await KnowledgeBaseConnectorModel.findById(
+      connector.id,
+    );
+    expect(updatedConnector?.checkpoint).toEqual({ page: 1 });
+  });
+
+  test("executeSync strips NUL bytes from extracted text before persisting", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    // Binary text extraction (e.g. PDFs) can emit NUL bytes, which Postgres text
+    // columns reject — without sanitization the whole document insert fails and
+    // the document is lost as an item error.
+    const mockImpl = makeMockConnector([
+      {
+        id: "ext-1",
+        title: "Title\u0000With\u0000Nuls",
+        content: "Before\u0000After\u0000End",
+      },
+    ]);
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("success");
+
+    // Ingest succeeded (would be 0 ingested / 1 item error if the insert threw).
+    const run = await ConnectorRunModel.findById(result.runId);
+    expect(run?.documentsIngested).toBe(1);
+    expect(run?.itemErrors).toBe(0);
+
+    const doc = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "ext-1",
+    });
+    expect(doc?.content).toBe("BeforeAfterEnd");
+    expect(doc?.title).toBe("TitleWithNuls");
+    expect(doc?.content).not.toContain("\u0000");
+  });
+
+  test("executeSync creates chunks for new documents", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+    makeTeam,
+    makeUser,
+  }) => {
+    const org = await makeOrganization();
+    const teamOwner = await makeUser();
+    const connectorTeam = await makeTeam(org.id, teamOwner.id, {
+      name: "Connector Team",
+    });
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    // The document ACL is still built from the connector's retired
+    // visibility columns, so the seed writes them.
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id, {
+      legacy: { visibility: "team-scoped", teamIds: [connectorTeam.id] },
+    });
+
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+    setupSecret();
+    const mockImpl = makeMockConnector([
+      { id: "ext-1", title: "Doc 1", content: "Content for chunking" },
+    ]);
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    await connectorSyncService.executeSync(connector.id);
+
+    // Verify chunkDocument was called with document metadata (no connectorType)
+    expect(mockChunkDocument).toHaveBeenCalledWith({
+      title: "Doc 1",
+      content: "Content for chunking",
+      metadata: undefined,
+    });
+
+    // Verify chunks were stored
+    const doc = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "ext-1",
+    });
+
+    if (!doc) {
+      expect.fail("Document not found");
+      return;
+    }
+
+    const chunks = await KbChunkModel.findByDocument(doc.id);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0].content).toBe("chunk 1");
+    expect(chunks[1].content).toBe("chunk 2");
+    expect(doc.acl).toEqual([`team:${connectorTeam.id}`]);
+    expect(chunks[0].acl).toEqual([`team:${connectorTeam.id}`]);
+    expect(chunks[1].acl).toEqual([`team:${connectorTeam.id}`]);
+  });
+
+  test("stops before ingesting the next batch when the run is reclaimed mid-sync", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+    setupSecret();
+
+    // A connector that yields two batches; between them a reaper reclaims the run
+    // (status -> partial, epoch bumped), simulating a lost lease mid-sync. The
+    // batch-boundary lease check must then fence the second batch's writes.
+    const mockImpl = {
+      estimateTotalItems: vi.fn().mockResolvedValue(2),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [{ id: "doc-a", title: "A", content: "Body A" }],
+            checkpoint: { page: 1 },
+            hasMore: true,
+          };
+          await db.execute(sql`
+            UPDATE connector_runs
+            SET status = 'partial', lease_epoch = lease_epoch + 1
+            WHERE connector_id = ${connector.id} AND status = 'running'
+          `);
+          yield {
+            documents: [{ id: "doc-b", title: "B", content: "Body B" }],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    };
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+
+    expect(result.status).toBe("superseded");
+    // Batch 1's document was ingested before the reclaim; batch 2's was fenced out.
+    expect(
+      await KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "doc-a",
+      }),
+    ).not.toBeNull();
+    expect(
+      await KbDocumentModel.findBySourceId({
+        connectorId: connector.id,
+        sourceId: "doc-b",
+      }),
+    ).toBeNull();
+  });
+
+  test("re-reads visibility at ACL-write time: a mid-run flip to auto-sync fail-closes later docs", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    // Starts org-wide, so content-sync authors ["org:*"].
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id, {
+      legacy: { visibility: "org-wide", teamIds: [] },
+    });
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+    setupSecret();
+
+    // Two batches; the connector's visibility flips to auto-sync between them
+    // (an admin change mid-run). No ACL writer may trust a start-of-run snapshot,
+    // so the second batch must be authored under the CURRENT (auto-sync) mode.
+    const mockImpl = {
+      supportsPermissionSync: false,
+      estimateTotalItems: vi.fn().mockResolvedValue(2),
+      sync: vi.fn().mockImplementation(() =>
+        (async function* () {
+          yield {
+            documents: [{ id: "ext-1", title: "Doc 1", content: "c1" }],
+            checkpoint: { page: 1 },
+            hasMore: true,
+          };
+          await KnowledgeBaseConnectorModel.update(connector.id, {
+            visibility: "auto-sync-permissions",
+          });
+          yield {
+            documents: [{ id: "ext-2", title: "Doc 2", content: "c2" }],
+            checkpoint: { page: 2 },
+            hasMore: false,
+          };
+        })(),
+      ),
+    };
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    await connectorSyncService.executeSync(connector.id);
+
+    const doc1 = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "ext-1",
+    });
+    const doc2 = await KbDocumentModel.findBySourceId({
+      connectorId: connector.id,
+      sourceId: "ext-2",
+    });
+    // Batch 1 authored under org-wide; batch 2's write-time re-read saw auto-sync
+    // and became a no-op author → the doc is fail-closed ([]) for the permission
+    // pass to tag, not left over-granted with ["org:*"].
+    expect(doc1?.acl).toEqual(["org:*"]);
+    expect(doc2?.acl).toEqual([]);
+  });
+
+  test("an ingest-free auto-sync sync (zero batches) still enqueues a permission pass on finalize", async ({
+    makeOrganization,
+    makeKnowledgeBase,
+    makeKnowledgeBaseConnector,
+  }) => {
+    const org = await makeOrganization();
+    const kb = await makeKnowledgeBase(org.id);
+    const secretId = await createSecret();
+    const connector = await makeKnowledgeBaseConnector(kb.id, org.id, {
+      syncPermissionsFromSource: true,
+    });
+    await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+    setupSecret();
+    // Nothing to ingest: the run finalizes immediately (no embedding batches),
+    // the path that previously skipped the trigger and stranded fail-closed
+    // docs from an earlier interrupted sync until the next scheduled tick.
+    const mockImpl = makeMockConnector([]);
+    (mockImpl as { supportsPermissionSync?: boolean }).supportsPermissionSync =
+      true;
+    mockGetConnector.mockReturnValue(mockImpl);
+
+    const result = await connectorSyncService.executeSync(connector.id);
+    expect(result.status).toBe("success");
+
+    expect(mockEnqueue).toHaveBeenCalledWith({
+      taskType: "permission_sync",
+      payload: { connectorId: connector.id },
+    });
+  });
+
+  describe("a run that indexes nothing", () => {
+    function makeEmptyConnector(
+      skipped?: Array<{
+        itemId: string;
+        sourceId?: string;
+        name: string;
+        reason: string;
+        category?: "no_extractable_text" | "unsupported_type";
+      }>,
+      failures?: Array<{ itemId: string; resource: string; error: string }>,
+    ) {
+      return {
+        estimateTotalItems: vi.fn().mockResolvedValue(0),
+        sync: vi.fn().mockImplementation(() =>
+          (async function* () {
+            yield {
+              documents: [],
+              ...(skipped ? { skipped } : {}),
+              ...(failures ? { failures } : {}),
+              checkpoint: { page: 1 },
+              hasMore: false,
+            };
+          })(),
+        ),
+      };
+    }
+
+    test("reports no_documents, with the likely cause, when the connector holds nothing", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const secretId = await createSecret();
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+      setupSecret();
+      mockGetConnector.mockReturnValue(makeEmptyConnector());
+
+      const result = await connectorSyncService.executeSync(connector.id);
+
+      // A green tick here is how a misconfigured connector indexes nothing
+      // for weeks without anyone noticing.
+      const run = await ConnectorRunModel.findById(result.runId);
+      expect(run?.status).toBe("no_documents");
+      expect(run?.error).toContain("Indexed nothing");
+
+      const updated = await KnowledgeBaseConnectorModel.findById(connector.id);
+      expect(updated?.lastSyncStatus).toBe("no_documents");
+      expect(updated?.lastSyncError).toContain("shared with the identity");
+    });
+
+    test("names the file-type filter when every item found was skipped", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const secretId = await createSecret();
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+      setupSecret();
+      mockGetConnector.mockReturnValue(
+        makeEmptyConnector([
+          {
+            itemId: "f-1",
+            name: "diagram.psd",
+            reason: "unsupported_file_type",
+            category: "unsupported_type",
+          },
+          {
+            itemId: "f-2",
+            name: "archive.zip",
+            reason: "unsupported_file_type",
+            category: "unsupported_type",
+          },
+        ]),
+      );
+
+      const result = await connectorSyncService.executeSync(connector.id);
+
+      const run = await ConnectorRunModel.findById(result.runId);
+      expect(run?.status).toBe("no_documents");
+      expect(run?.error).toContain("all 2 items found were skipped");
+      expect(run?.error).toContain("file-type filter");
+    });
+
+    test("names the no-text cause, not the file-type filter, when every skip was a document without text", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const secretId = await createSecret();
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+      setupSecret();
+      // A folder of only scanned PDFs: readable types, nothing to extract.
+      // Blaming the file-type filter here sends someone to the wrong setting.
+      mockGetConnector.mockReturnValue(
+        makeEmptyConnector([
+          {
+            itemId: "f-1",
+            name: "scan-a.pdf",
+            reason: "PDF has no text layer",
+            category: "no_extractable_text",
+          },
+          {
+            itemId: "f-2",
+            name: "scan-b.pdf",
+            reason: "PDF has no text layer",
+            category: "no_extractable_text",
+          },
+        ]),
+      );
+
+      const result = await connectorSyncService.executeSync(connector.id);
+
+      const run = await ConnectorRunModel.findById(result.runId);
+      expect(run?.status).toBe("no_documents");
+      expect(run?.error).toContain(
+        "all 2 items found contained no extractable text",
+      );
+      expect(run?.error).not.toContain("file-type filter");
+    });
+
+    test("names both causes when no-text documents account for only some of the skips", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const secretId = await createSecret();
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+      setupSecret();
+      mockGetConnector.mockReturnValue(
+        makeEmptyConnector([
+          {
+            itemId: "f-1",
+            name: "scan.pdf",
+            reason: "PDF has no text layer",
+            category: "no_extractable_text",
+          },
+          {
+            itemId: "f-2",
+            name: "archive.zip",
+            reason: "unsupported_file_type",
+            category: "unsupported_type",
+          },
+        ]),
+      );
+
+      const result = await connectorSyncService.executeSync(connector.id);
+
+      const run = await ConnectorRunModel.findById(result.runId);
+      expect(run?.status).toBe("no_documents");
+      expect(run?.error).toContain("all 2 items found were skipped");
+      expect(run?.error).toContain("1 contained no extractable text");
+      expect(run?.error).toContain("unsupported types");
+    });
+
+    test("reports fetch failures alongside simultaneous no-text skips", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const secretId = await createSecret();
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+      setupSecret();
+      mockGetConnector.mockReturnValue(
+        makeEmptyConnector(
+          [
+            {
+              itemId: "scan-1",
+              name: "scan.pdf",
+              reason: "PDF has no text layer",
+              category: "no_extractable_text",
+            },
+          ],
+          [{ itemId: "locked-1", resource: "content", error: "HTTP 403" }],
+        ),
+      );
+
+      const result = await connectorSyncService.executeSync(connector.id);
+      const run = await ConnectorRunModel.findById(result.runId);
+      expect(run?.error).toContain("1 item could not be fetched");
+      expect(run?.error).toContain("1 contained no extractable text");
+    });
+
+    test("does not call an uncategorized skip an unsupported type", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const secretId = await createSecret();
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+      setupSecret();
+      mockGetConnector.mockReturnValue(
+        makeEmptyConnector([
+          {
+            itemId: "scan-1",
+            name: "scan.pdf",
+            reason: "PDF has no text layer",
+            category: "no_extractable_text",
+          },
+          {
+            itemId: "drive-1",
+            name: "Shared drive drive-1",
+            reason: "unreachable_target",
+          },
+        ]),
+      );
+
+      const result = await connectorSyncService.executeSync(connector.id);
+      const run = await ConnectorRunModel.findById(result.runId);
+      expect(run?.error).toContain("1 was skipped for other reasons");
+      expect(run?.error).not.toContain("unsupported types");
+    });
+
+    test("stays a plain success when an incremental run simply found no changes", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const secretId = await createSecret();
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      await KnowledgeBaseConnectorModel.update(connector.id, { secretId });
+
+      // Documents from an earlier run: nothing new is the steady state here,
+      // not a misconfiguration, and flagging it would cry wolf on every
+      // healthy connector between changes.
+      await KbDocumentModel.create({
+        connectorId: connector.id,
+        organizationId: org.id,
+        title: "Indexed earlier",
+        content: "Still here",
+        contentHash: "hash-existing",
+      });
+
+      setupSecret();
+      mockGetConnector.mockReturnValue(makeEmptyConnector());
+
+      const result = await connectorSyncService.executeSync(connector.id);
+
+      const run = await ConnectorRunModel.findById(result.runId);
+      expect(run?.status).toBe("success");
+      expect(run?.error).toBeNull();
+
+      const updated = await KnowledgeBaseConnectorModel.findById(connector.id);
+      expect(updated?.lastSyncStatus).toBe("success");
+      expect(updated?.lastSyncError).toBeNull();
+    });
+  });
+});

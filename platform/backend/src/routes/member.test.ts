@@ -1,0 +1,301 @@
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+
+describe("member routes", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+
+  beforeEach(
+    async ({ makeAccount, makeAdmin, makeMember, makeOrganization }) => {
+      user = await makeAdmin();
+      await makeAccount(user.id);
+      const organization = await makeOrganization();
+      organizationId = organization.id;
+      await makeMember(user.id, organizationId, { role: "admin" });
+
+      app = createFastifyInstance();
+      app.addHook("onRequest", async (request) => {
+        (
+          request as typeof request & {
+            user: unknown;
+            organizationId: string;
+          }
+        ).user = user;
+        (
+          request as typeof request & {
+            user: { id: string };
+            organizationId: string;
+          }
+        ).organizationId = organizationId;
+      });
+
+      const { default: memberRoutes } = await import("./member");
+      await app.register(memberRoutes);
+    },
+  );
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("returns paginated members for the current organization", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const alpha = await makeUser({ name: "Alpha Example" });
+    const beta = await makeUser({ name: "Beta Example" });
+    await makeMember(alpha.id, organizationId, { role: "member" });
+    await makeMember(beta.id, organizationId, { role: "editor" });
+    await makeAccount(alpha.id);
+    await makeAccount(beta.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=2&offset=0",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload).toMatchObject({
+      pagination: {
+        currentPage: 1,
+        limit: 2,
+        total: 3,
+        totalPages: 2,
+        hasNext: true,
+        hasPrev: false,
+      },
+    });
+    expect(payload.data).toHaveLength(2);
+    expect(payload.data[0]?.name).toContain("Admin User");
+    expect(payload.data[1]?.name).toBe("Alpha Example");
+  });
+
+  test("filters members by name or email and role", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const targetUser = await makeUser({
+      name: "Gamma Searchable",
+      email: "gamma@example.com",
+    });
+    const otherUser = await makeUser({
+      name: "Delta Searchable",
+      email: "delta@example.com",
+    });
+    await makeMember(targetUser.id, organizationId, { role: "member" });
+    await makeMember(otherUser.id, organizationId, { role: "editor" });
+    await makeAccount(targetUser.id);
+    await makeAccount(otherUser.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=gamma&role=member",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload).toMatchObject({
+      data: [
+        {
+          name: "Gamma Searchable",
+          email: "gamma@example.com",
+          role: "member",
+        },
+      ],
+      pagination: {
+        total: 1,
+        hasNext: false,
+        hasPrev: false,
+      },
+    });
+  });
+
+  test("matches search tokens regardless of the order they are stored in", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    // Directory syncs commonly store "Last, First M." while people search
+    // "First Last".
+    const targetUser = await makeUser({
+      name: "Lovelace, Ada M.",
+      email: "ada.lovelace@example.com",
+    });
+    await makeMember(targetUser.id, organizationId, { role: "member" });
+    await makeAccount(targetUser.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=Ada%20Lovelace",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toMatchObject([{ name: "Lovelace, Ada M." }]);
+  });
+
+  test("matches when tokens are spread across name and email", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const targetUser = await makeUser({
+      name: "Ada Lovelace",
+      email: "analytical.engine@example.com",
+    });
+    await makeMember(targetUser.id, organizationId, { role: "member" });
+    await makeAccount(targetUser.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=Lovelace%20analytical",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toMatchObject([{ name: "Ada Lovelace" }]);
+  });
+
+  test("requires every token to match, so extra words still narrow results", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const ada = await makeUser({
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+    });
+    const charles = await makeUser({
+      name: "Charles Babbage",
+      email: "charles@example.com",
+    });
+    await makeMember(ada.id, organizationId, { role: "member" });
+    await makeMember(charles.id, organizationId, { role: "member" });
+    await makeAccount(ada.id);
+    await makeAccount(charles.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=Ada%20Babbage",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toEqual([]);
+    expect(payload.pagination.total).toBe(0);
+  });
+
+  test("treats LIKE wildcards in the query as literal characters", async ({
+    makeAccount,
+    makeMember,
+    makeUser,
+  }) => {
+    const targetUser = await makeUser({
+      name: "Ada Lovelace",
+      email: "ada@example.com",
+    });
+    await makeMember(targetUser.id, organizationId, { role: "member" });
+    await makeAccount(targetUser.id);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/members?limit=10&offset=0&name=%25",
+    });
+    const payload = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(payload.data).toEqual([]);
+  });
+});
+
+describe("GET /api/organization/members/:idOrEmail", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeAdmin, makeMember, makeOrganization }) => {
+    user = await makeAdmin();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    await makeMember(user.id, organizationId, { role: "admin" });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: unknown }).user = user;
+      (request as typeof request & { organizationId: string }).organizationId =
+        organizationId;
+    });
+
+    const { default: organizationRoutes } = await import("./organization");
+    await app.register(organizationRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("gets member by user ID", async ({ makeUser, makeMember }) => {
+    const member = await makeUser({
+      name: "Jane Doe",
+      email: "jane@example.com",
+    });
+    await makeMember(member.id, organizationId, { role: "member" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/organization/members/${member.id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.id).toBe(member.id);
+    expect(body.email).toBe("jane@example.com");
+    expect(body.name).toBe("Jane Doe");
+    expect(body.role).toBeDefined();
+  });
+
+  test("gets member by email", async ({ makeUser, makeMember }) => {
+    const member = await makeUser({
+      name: "John Smith",
+      email: "john@example.com",
+    });
+    await makeMember(member.id, organizationId, { role: "member" });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/organization/members/${encodeURIComponent("john@example.com")}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.id).toBe(member.id);
+    expect(body.email).toBe("john@example.com");
+    expect(body.role).toBeDefined();
+  });
+
+  test("returns 404 for non-existent user ID", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/organization/members/non-existent-id",
+    });
+
+    expect(response.statusCode).toBe(404);
+    const body = response.json();
+    expect(body.error.message).toBe("Member not found");
+  });
+
+  test("returns 404 for non-existent email", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/organization/members/${encodeURIComponent("nobody@nowhere.com")}`,
+    });
+
+    expect(response.statusCode).toBe(404);
+  });
+});

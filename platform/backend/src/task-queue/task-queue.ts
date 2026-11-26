@@ -1,0 +1,512 @@
+import config from "@/config";
+import logger from "@/logging";
+import { port } from "@/models/ports";
+import TaskModel from "@/models/task";
+import * as metrics from "@/observability/metrics";
+import type { InsertTask, Task, TaskHandler, TaskLane } from "@/types";
+import { TASK_LANES } from "@/types";
+import PERIODIC_TASK_DEFINITIONS from "./periodic-tasks";
+
+export class TaskQueueService {
+  private handlers = new Map<string, TaskHandler>();
+  private pollIntervalId: ReturnType<typeof setInterval> | null = null;
+  // Global in-flight set (used for shutdown drain, lane-agnostic).
+  private activeTaskIds = new Set<string>();
+  // Per-lane accounting so each lane's concurrency cap is independent — a
+  // saturated content lane cannot consume permission-lane slots, or vice-versa.
+  private laneCounts: Record<TaskLane, number> = {
+    content: 0,
+    permission: 0,
+    system: 0,
+  };
+  private taskLane = new Map<string, TaskLane>();
+  private stopping = false;
+  private pollInFlight: Promise<void> | null = null;
+  private lastStuckSweepAt = 0;
+  private drainResolve: (() => void) | null = null;
+
+  registerHandler(taskType: string, handler: TaskHandler): void {
+    this.handlers.set(taskType, handler);
+    logger.debug({ taskType }, "[TaskQueue] Handler registered");
+  }
+
+  async enqueue(params: {
+    taskType: InsertTask["taskType"];
+    payload: Record<string, unknown>;
+    maxAttempts?: number;
+    scheduledFor?: Date;
+    periodic?: boolean;
+  }): Promise<string> {
+    const task = await TaskModel.create({
+      taskType: params.taskType,
+      payload: params.payload,
+      maxAttempts: params.maxAttempts ?? 5,
+      ...(params.scheduledFor && { scheduledFor: params.scheduledFor }),
+      ...(params.periodic && { periodic: params.periodic }),
+    });
+    metrics.taskQueue.reportTaskEnqueued(params.taskType);
+    logger.debug(
+      { taskId: task.id, taskType: params.taskType },
+      "[TaskQueue] Task enqueued",
+    );
+    return task.id;
+  }
+
+  async seedPeriodicTasks(): Promise<void> {
+    // Before seeding, not after: a row for a type this build retired has no
+    // handler, so leaving it queued means the first upgraded worker picks it
+    // up and reports an error for work nobody asked for.
+    try {
+      const removed = await TaskModel.deleteRetiredPeriodicTasks(
+        PERIODIC_TASK_DEFINITIONS.map((def) => def.taskType),
+      );
+      if (removed > 0) {
+        logger.info(
+          { removed },
+          "[TaskQueue] Removed periodic tasks this build no longer defines",
+        );
+      }
+    } catch (error) {
+      // Never fatal to boot: the worst case is the error log this prevents.
+      logger.warn(
+        { err: error },
+        "[TaskQueue] Could not sweep retired periodic tasks",
+      );
+    }
+
+    for (const def of PERIODIC_TASK_DEFINITIONS) {
+      try {
+        const exists = await TaskModel.hasPendingOrProcessingByType(
+          def.taskType,
+        );
+        if (exists) {
+          logger.debug(
+            { taskType: def.taskType },
+            "[TaskQueue] Periodic task already exists, skipping seed",
+          );
+          continue;
+        }
+
+        await this.enqueue({
+          taskType: def.taskType,
+          payload: def.payload,
+          maxAttempts: 1,
+          periodic: true,
+        });
+        logger.debug(
+          { taskType: def.taskType },
+          "[TaskQueue] Seeded periodic task",
+        );
+      } catch (error) {
+        // Unique constraint violation means another replica seeded it — safe to ignore
+        if (isUniqueViolation(error)) {
+          logger.debug(
+            { taskType: def.taskType },
+            "[TaskQueue] Periodic task already seeded by another replica",
+          );
+        } else {
+          logger.error(
+            {
+              taskType: def.taskType,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "[TaskQueue] Failed to seed periodic task",
+          );
+        }
+      }
+    }
+  }
+
+  startWorker(): void {
+    const pollIntervalMs = config.kb.taskWorkerPollIntervalSeconds * 1000;
+
+    this.stopping = false;
+    // Sweep on the first poll of a fresh worker, then at most once per minute.
+    this.lastStuckSweepAt = 0;
+
+    this.pollIntervalId = setInterval(() => {
+      this.poll().catch((error) => {
+        logger.error(
+          { error: error instanceof Error ? error.message : String(error) },
+          "[TaskQueue] Poll error",
+        );
+      });
+    }, pollIntervalMs);
+
+    logger.info(
+      {
+        pollIntervalMs,
+        contentLaneMaxConcurrent: config.kb.taskWorkerMaxConcurrent,
+        permissionLaneMaxConcurrent:
+          config.kb.permissionSyncWorkerMaxConcurrent,
+        systemLaneMaxConcurrent: SYSTEM_LANE_MAX_CONCURRENT,
+      },
+      "[TaskQueue] Worker started",
+    );
+  }
+
+  async stopWorker(): Promise<void> {
+    this.stopping = true;
+    if (this.pollIntervalId) {
+      clearInterval(this.pollIntervalId);
+      this.pollIntervalId = null;
+    }
+
+    // Everything below shares one deadline: callers (server shutdown) only
+    // budget taskWorkerShutdownTimeoutSeconds plus a small buffer before
+    // force-exiting, so an unbounded pre-drain wait would let the process
+    // die before the drain/release ran.
+    const timeoutMs = config.kb.taskWorkerShutdownTimeoutSeconds * 1000;
+    const deadline = Date.now() + timeoutMs;
+
+    // A poll may be mid-dequeue with its task not yet tracked; wait for it so
+    // the drain below sees the full in-flight set and the process cannot exit
+    // before a just-dequeued task is released back to the queue.
+    if (this.pollInFlight) {
+      await this.raceWithDeadline(
+        this.pollInFlight.catch(() => {}),
+        deadline,
+      );
+    }
+
+    if (this.activeTaskIds.size === 0) {
+      logger.info("[TaskQueue] Worker stopped (no in-flight tasks)");
+      return;
+    }
+
+    const taskIds = [...this.activeTaskIds];
+    logger.info(
+      { taskIds, timeoutMs },
+      "[TaskQueue] Draining in-flight tasks...",
+    );
+
+    const result = await this.raceWithDeadline(this.waitForDrain(), deadline);
+
+    if (result === "timeout") {
+      const remainingIds = [...this.activeTaskIds];
+      // Fully untrack (not just clear the id set): the abandoned tasks'
+      // processTask callbacks never run their untrack, so their lane slots
+      // would stay occupied forever and starve the lanes after a restart.
+      for (const id of remainingIds) {
+        this.untrackTask(id);
+      }
+      logger.warn(
+        { taskIds: remainingIds },
+        "[TaskQueue] Drain timed out, releasing tasks back to queue",
+      );
+      const released = await TaskModel.releaseToQueue(remainingIds);
+      logger.info(
+        { released, total: remainingIds.length },
+        "[TaskQueue] Released tasks back to pending",
+      );
+    } else {
+      logger.info("[TaskQueue] All in-flight tasks drained successfully");
+    }
+  }
+
+  // ===== Private methods =====
+
+  private poll(): Promise<void> {
+    // The interval fires regardless of whether the previous poll finished;
+    // reusing the in-flight promise prevents overlapping polls from racing on
+    // shared state and lets stopWorker await the critical section.
+    if (this.pollInFlight) {
+      return this.pollInFlight;
+    }
+    const run = this.doPoll().finally(() => {
+      this.pollInFlight = null;
+    });
+    this.pollInFlight = run;
+    return run;
+  }
+
+  private async doPoll(): Promise<void> {
+    if (this.stopping) return;
+
+    // Renew this worker's in-flight heartbeats BEFORE the stuck sweep so its
+    // own healthy tasks can never look stale to its own sweep.
+    await TaskModel.renewHeartbeats([...this.activeTaskIds]);
+
+    if (Date.now() - this.lastStuckSweepAt >= STUCK_SWEEP_INTERVAL_MS) {
+      this.lastStuckSweepAt = Date.now();
+      // Reset tasks whose worker stopped heartbeating
+      const swept = await TaskModel.resetStuckTasks(STUCK_TASK_TIMEOUT_MS);
+      if (swept.length > 0) {
+        metrics.taskQueue.reportStuckTasksReset(swept.length);
+        logger.warn(
+          { resetCount: swept.length },
+          "[TaskQueue] Reset stuck tasks",
+        );
+      }
+      // A stuck periodic task that went straight to dead would silently end
+      // its chain — resurrect it here.
+      for (const transition of swept) {
+        if (transition.periodic && transition.status === "dead") {
+          await this.rescheduleIfPeriodic(transition.taskType);
+        }
+      }
+      if (this.stopping) return;
+    }
+
+    // Fill each lane up to its own concurrency cap. Lanes are drained
+    // independently so no lane can head-of-line-block or starve another.
+    for (const lane of LANES) {
+      const cap = this.laneCap(lane);
+      while (!this.stopping && this.laneCounts[lane] < cap) {
+        const task = await TaskModel.dequeue(TASK_LANES[lane]);
+        if (!task) break; // lane empty — move on to the next lane
+
+        // Track immediately so a concurrent stopWorker sees this task.
+        this.trackTask(task.id, lane);
+
+        if (this.stopping) {
+          // stopWorker may have snapshotted an empty set while the dequeue
+          // was in flight; hand the task back instead of processing it
+          // outside the drain. Release before untracking so shutdown cannot
+          // proceed past the drain while the row is still marked processing.
+          await TaskModel.releaseToQueue([task.id]);
+          this.untrackTask(task.id);
+          return;
+        }
+
+        this.processTask(task)
+          .catch((error) => {
+            logger.error(
+              {
+                taskId: task.id,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "[TaskQueue] Unhandled error in processTask",
+            );
+          })
+          .finally(() => {
+            this.untrackTask(task.id);
+          });
+      }
+    }
+  }
+
+  private laneCap(lane: TaskLane): number {
+    switch (lane) {
+      case "content":
+        return config.kb.taskWorkerMaxConcurrent;
+      case "permission":
+        return config.kb.permissionSyncWorkerMaxConcurrent;
+      case "system":
+        return SYSTEM_LANE_MAX_CONCURRENT;
+    }
+  }
+
+  private trackTask(taskId: string, lane: TaskLane): void {
+    this.activeTaskIds.add(taskId);
+    this.taskLane.set(taskId, lane);
+    this.laneCounts[lane] += 1;
+  }
+
+  private async raceWithDeadline<T>(
+    promise: Promise<T>,
+    deadline: number,
+  ): Promise<T | "timeout"> {
+    const remainingMs = Math.max(deadline - Date.now(), 0);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), remainingMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private untrackTask(taskId: string): void {
+    this.activeTaskIds.delete(taskId);
+    const lane = this.taskLane.get(taskId);
+    if (lane) {
+      this.taskLane.delete(taskId);
+      this.laneCounts[lane] = Math.max(this.laneCounts[lane] - 1, 0);
+    }
+    if (this.activeTaskIds.size === 0 && this.drainResolve) {
+      this.drainResolve();
+      this.drainResolve = null;
+    }
+  }
+
+  private waitForDrain(): Promise<void> {
+    if (this.activeTaskIds.size === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.drainResolve = resolve;
+    });
+  }
+
+  private async processTask(task: Task): Promise<void> {
+    const handler = this.handlers.get(task.taskType);
+    if (!handler) {
+      logger.error(
+        { taskType: task.taskType, taskId: task.id },
+        "[TaskQueue] No handler registered for task type",
+      );
+      await TaskModel.fail({
+        id: task.id,
+        error: `No handler registered for task type: ${task.taskType}`,
+        attempt: task.attempt,
+        maxAttempts: task.maxAttempts,
+      });
+      return;
+    }
+
+    metrics.taskQueue.reportActiveTaskChange(task.taskType, 1);
+    const startTime = Date.now();
+
+    try {
+      await handler(task.payload as Record<string, unknown>, {
+        taskId: task.id,
+      });
+      await TaskModel.complete(task.id);
+      const durationSeconds = (Date.now() - startTime) / 1000;
+      metrics.taskQueue.reportTaskCompleted(task.taskType, durationSeconds);
+      logger.debug(
+        { taskId: task.id, taskType: task.taskType },
+        "[TaskQueue] Task completed",
+      );
+      await this.rescheduleIfPeriodic(task.taskType);
+    } catch (error) {
+      metrics.taskQueue.reportTaskFailed(task.taskType);
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      logger.warn(
+        { taskId: task.id, taskType: task.taskType, error: errorMessage },
+        "[TaskQueue] Task failed",
+      );
+
+      // A terminal embedding failure must advance its connector run exactly
+      // once. Record the outcome before marking the task dead; completeBatch
+      // stamps the task payload and updates the run in one transaction, so a
+      // crash on either side is safe to retry without double-counting.
+      if (
+        task.taskType === "batch_embedding" &&
+        task.attempt >= task.maxAttempts
+      ) {
+        const payload = task.payload as Record<string, unknown>;
+        const connectorRunId = payload.connectorRunId as string | undefined;
+        if (connectorRunId) {
+          try {
+            const { default: ConnectorRunModel } = await import(
+              "@/models/connector-run"
+            );
+            const documentIds =
+              (payload.documentIds as string[] | undefined) ?? [];
+            const updatedRun = await ConnectorRunModel.completeBatch(
+              connectorRunId,
+              {
+                failedItems: documentIds.length,
+                error:
+                  errorMessage ||
+                  "Embedding task failed after exhausting retries.",
+              },
+              task.id,
+            );
+            const { finalizeConnectorAfterEmbeddingDrain } = await port(
+              "embeddingFinalization",
+            );
+            await finalizeConnectorAfterEmbeddingDrain(updatedRun);
+          } catch (batchError) {
+            // Leave the task processing. The stuck-task sweep will retry it;
+            // marking it dead here would strand the connector run forever.
+            logger.error(
+              {
+                taskId: task.id,
+                connectorRunId,
+                error:
+                  batchError instanceof Error
+                    ? batchError.message
+                    : String(batchError),
+              },
+              "[TaskQueue] Failed to atomically complete dead embedding batch",
+            );
+            return;
+          }
+        }
+      }
+
+      const result = await TaskModel.fail({
+        id: task.id,
+        error: errorMessage,
+        attempt: task.attempt,
+        maxAttempts: task.maxAttempts,
+      });
+
+      if (result?.status === "dead") {
+        metrics.taskQueue.reportTaskDead(task.taskType);
+        // Reschedule periodic tasks that are dead
+        await this.rescheduleIfPeriodic(task.taskType);
+      }
+    } finally {
+      metrics.taskQueue.reportActiveTaskChange(task.taskType, -1);
+    }
+  }
+
+  private async rescheduleIfPeriodic(taskType: string): Promise<void> {
+    const def = PERIODIC_TASK_DEFINITIONS.find((d) => d.taskType === taskType);
+    if (!def) return;
+
+    try {
+      await this.enqueue({
+        taskType: def.taskType,
+        payload: def.payload,
+        maxAttempts: 1,
+        scheduledFor: new Date(Date.now() + def.intervalSeconds * 1000),
+        periodic: true,
+      });
+      logger.debug(
+        { taskType: def.taskType, intervalSeconds: def.intervalSeconds },
+        "[TaskQueue] Rescheduled periodic task",
+      );
+    } catch (error) {
+      // Unique constraint violation means another replica already rescheduled — safe to ignore
+      if (isUniqueViolation(error)) {
+        logger.debug(
+          { taskType: def.taskType },
+          "[TaskQueue] Periodic task already rescheduled by another replica",
+        );
+      } else {
+        logger.error(
+          {
+            taskType: def.taskType,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "[TaskQueue] Failed to reschedule periodic task",
+        );
+      }
+    }
+  }
+}
+
+export const taskQueueService = new TaskQueueService();
+
+// ===== Internal helpers =====
+
+const STUCK_SWEEP_INTERVAL_MS = 60_000;
+// A task is stuck when its worker has not heartbeated for this long. Workers
+// renew every poll tick (seconds), so 5 minutes is dozens of missed beats —
+// a dead worker, not a long task (a healthy multi-hour task stays fresh
+// forever). Before heartbeats this was 60 minutes to over-approximate the
+// longest legitimate task; that meant a crashed worker's tasks blocked
+// dependents (e.g. the connector-run reaper waits on live batch_embedding
+// tasks) for up to an hour.
+const STUCK_TASK_TIMEOUT_MS = 5 * 60 * 1000;
+// Concurrency cap for the `system` lane (periodic check/cleanup tasks). These
+// are lightweight and infrequent; content and permission ingestion have their
+// own configurable caps (config.kb.*).
+const SYSTEM_LANE_MAX_CONCURRENT = 4;
+const LANES = Object.keys(TASK_LANES) as TaskLane[];
+
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as { code: string }).code === "23505"
+  );
+}

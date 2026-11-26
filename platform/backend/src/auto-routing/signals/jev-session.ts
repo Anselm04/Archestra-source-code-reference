@@ -1,0 +1,387 @@
+import { randomBytes, scrypt } from "node:crypto";
+import { z } from "zod";
+import config from "@/config";
+import { registerProcessLocalCache } from "@/process-local-cache-registry";
+import type { AutoRoutingScorerState } from "@/types/auto-routing-api";
+import { DecisionsResponseSchema } from "@/types/llm-providers/jev/api";
+import { resolveProviderApiKey } from "@/utils/llm-api-key-resolution";
+import { type CircuitPermit, ScorerCircuitBreaker } from "./circuit-breaker";
+import { JEV_SESSION_SPEC, type JevSessionSpec, type ScorerSpec } from "./spec";
+import {
+  type PreRunInput,
+  type PreRunSignalSource,
+  type SignalSourceContext,
+  SignalSourceError,
+} from "./types";
+
+export const JEV_SESSION_SOURCE_ID = "jev-session";
+
+export interface JevSessionReading {
+  /** Distribution of the weakest adequate tier: (fast, normal, smart), sums to 1. */
+  tierNeeded: [number, number, number];
+  /** Probability that the session's context grows past the long-context threshold. */
+  pLong: number;
+  /** Reported cost, or token-priced cost on the first-party endpoint; null if unknown. */
+  costUsd: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+}
+
+// State template v5: full sorted tool names, without descriptions or a first-N cutoff.
+const PROMPT_HEAD = 3000;
+const PROMPT_TAIL = 1000;
+const SYSTEM_HEAD = 1500;
+const SYSTEM_TAIL = 500;
+const MAX_TOOL_NAMES_BYTES = 64 * 1024;
+const CREDENTIAL =
+  /(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[abp]-[A-Za-z0-9-]{10,}|[Bb][Ee][Aa][Rr][Ee][Rr]\s+[A-Za-z0-9._-]{20,})/g;
+const SECRET = new RegExp(`${CREDENTIAL.source}|[A-Za-z0-9+/=_-]{40,}`, "g");
+/** Jev's probabilities are rounded; anything further from 1 is a broken answer. */
+const PROBABILITY_SUM_TOLERANCE = 0.01;
+
+interface DecisionsRequest {
+  model: string;
+  state: Record<string, string>;
+  questions: ScorerSpec["questions"];
+}
+
+const SessionAnswersSchema = DecisionsResponseSchema.extend({
+  answers: z.object({
+    tier_needed: z.object({
+      type: z.literal("score"),
+      probabilities: z.record(z.string(), z.number().nonnegative()),
+    }),
+    long_context: z.object({
+      type: z.literal("noul"),
+      noul: z.number().min(0).max(1),
+    }),
+  }),
+});
+
+/** Whether sessions can be scored: the given key, else the organization's Jev key, resolves. */
+export async function scorerState(
+  organizationId: string,
+  apiKeyId?: string | null,
+): Promise<AutoRoutingScorerState> {
+  const { apiKey } = await resolveProviderApiKey({
+    organizationId,
+    provider: "jev",
+    agentLlmApiKeyId: apiKeyId,
+  });
+  return apiKey ? "ready" : "no_jev_key";
+}
+
+export class JevSessionSource
+  implements PreRunSignalSource<typeof JEV_SESSION_SOURCE_ID, JevSessionReading>
+{
+  readonly id = JEV_SESSION_SOURCE_ID;
+  readonly spec: JevSessionSpec;
+
+  constructor(spec: JevSessionSpec = JEV_SESSION_SPEC) {
+    this.spec = spec;
+  }
+
+  async read(
+    input: PreRunInput,
+    ctx: SignalSourceContext,
+  ): Promise<JevSessionReading> {
+    const { apiKey, baseUrl, chatApiKeyId, source } =
+      await resolveProviderApiKey({
+        organizationId: ctx.organizationId,
+        provider: "jev",
+        agentLlmApiKeyId: ctx.apiKeyId,
+      });
+    if (!apiKey) {
+      throw new SignalSourceError(
+        "no_credentials",
+        "No Jev API key is configured for the organization",
+      );
+    }
+    const url = baseUrl ?? config.llm.jev.baseUrl;
+    assertHttpUrl(url);
+    const normalizedApiKey = apiKey.replace(/^Bearer\s+/i, "");
+    let permit: CircuitPermit | null = null;
+    if (ctx.useCircuitBreaker) {
+      const breakerKey = await hashBreakerKey({
+        credentialScope: chatApiKeyId
+          ? `key:${chatApiKeyId}`
+          : `source:${source}`,
+        apiKey: normalizedApiKey,
+        url,
+        model: this.spec.model,
+      });
+      permit = jevCircuitBreaker.acquire(breakerKey);
+      if (!permit) {
+        throw new SignalSourceError(
+          "circuit_open",
+          "Jev scorer circuit breaker is open",
+        );
+      }
+    }
+    let request: DecisionsRequest;
+    try {
+      request = {
+        model: this.spec.model,
+        state: sessionState(input),
+        questions: this.spec.questions,
+      };
+    } catch (error) {
+      if (permit) jevCircuitBreaker.release(permit);
+      throw error;
+    }
+    try {
+      const timeout = AbortSignal.timeout(
+        ctx.timeoutMs ?? config.autoRouting.scorerTimeoutMs,
+      );
+      const body = await postDecisions({
+        url,
+        apiKey: normalizedApiKey,
+        request,
+        signal: timeout,
+      }).catch((error: unknown) => {
+        throw transportFailure(error, timeout);
+      });
+      const parsed = SessionAnswersSchema.safeParse(body);
+      if (!parsed.success) {
+        throw new SignalSourceError(
+          "invalid_response",
+          "Jev answers do not match",
+          {
+            cause: parsed.error,
+          },
+        );
+      }
+      const { tier_needed, long_context } = parsed.data.answers;
+      const inputTokens = parsed.data.usage?.input_tokens ?? null;
+      const outputTokens = parsed.data.usage?.output_tokens ?? null;
+      // A custom endpoint may charge a different rate. Only the first-party
+      // endpoint can use TypeSafe's published rate when no cost is reported.
+      // TypeSafe: https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost
+      // Output tokens are free. Keep this rate out of endpoint-agnostic model sync.
+      const inputPricePerMillion =
+        url === "https://api.typesafe.ai/v1/systemone" &&
+        this.spec.model === "jev-1.13.0"
+          ? 0.042
+          : null;
+      const calculatedCost =
+        inputTokens !== null && inputPricePerMillion !== null
+          ? (inputTokens * inputPricePerMillion) / 1_000_000
+          : null;
+      const reading: JevSessionReading = {
+        tierNeeded: tierDistribution(tier_needed.probabilities),
+        pLong: long_context.noul,
+        costUsd: parsed.data.usage?.cost ?? calculatedCost,
+        inputTokens,
+        outputTokens,
+      };
+      if (permit) jevCircuitBreaker.recordSuccess(permit);
+      return reading;
+    } catch (error) {
+      if (permit) {
+        if (error instanceof SignalSourceError) {
+          if (isTransientScorerError(error)) {
+            jevCircuitBreaker.recordTransientFailure(
+              permit,
+              error.retryAfterMs !== undefined
+                ? { cooldownMs: error.retryAfterMs }
+                : undefined,
+            );
+          } else {
+            jevCircuitBreaker.recordNeutral(permit);
+          }
+        } else {
+          jevCircuitBreaker.release(permit);
+        }
+      }
+      throw error;
+    }
+  }
+}
+
+// === Internal ===
+
+const BREAKER_KEY_SALT = randomBytes(32);
+const MAX_RETRY_AFTER_MS = 30_000;
+const jevCircuitBreaker = registerProcessLocalCache(new ScorerCircuitBreaker());
+
+function assertHttpUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch (error) {
+    throw new SignalSourceError("http", "Jev endpoint URL is invalid", {
+      cause: error,
+    });
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    parsed.username.length > 0 ||
+    parsed.password.length > 0
+  ) {
+    throw new SignalSourceError("http", "Jev endpoint URL is invalid");
+  }
+}
+
+function parseRetryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (trimmed.length === 0) return undefined;
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    if (!Number.isFinite(seconds)) return undefined;
+    return Math.max(0, Math.min(seconds * 1_000, MAX_RETRY_AFTER_MS));
+  }
+  const timestamp = Date.parse(trimmed);
+  if (!Number.isFinite(timestamp)) return undefined;
+  return Math.max(0, Math.min(timestamp - Date.now(), MAX_RETRY_AFTER_MS));
+}
+
+function hashBreakerKey(params: {
+  credentialScope: string;
+  apiKey: string;
+  url: string;
+  model: string;
+}): Promise<string> {
+  const payload = `${params.credentialScope}\u0000${params.apiKey}\u0000${params.url}\u0000${params.model}`;
+  return new Promise((resolve, reject) => {
+    scrypt(payload, BREAKER_KEY_SALT, 16, (error, derived) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(derived.toString("hex"));
+    });
+  });
+}
+
+function isTransientScorerError(error: SignalSourceError): boolean {
+  return (
+    error.reason === "timeout" ||
+    (error.reason === "http" &&
+      (error.status === undefined ||
+        error.status === 429 ||
+        error.status >= 500))
+  );
+}
+
+async function postDecisions(params: {
+  url: string;
+  apiKey: string;
+  request: DecisionsRequest;
+  signal: AbortSignal;
+}): Promise<unknown> {
+  const response = await fetch(params.url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${params.apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(params.request),
+    signal: params.signal,
+  });
+  if (!response.ok) {
+    const retryAfterMs =
+      response.status === 429
+        ? parseRetryAfterMs(response.headers.get("retry-after"))
+        : undefined;
+    throw new SignalSourceError(
+      "http",
+      `Jev answered HTTP ${response.status}`,
+      {
+        status: response.status,
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      },
+    );
+  }
+  return response.json();
+}
+
+function transportFailure(error: unknown, timeout: AbortSignal): unknown {
+  switch (true) {
+    case error instanceof SignalSourceError:
+      return error;
+    case timeout.aborted:
+      return new SignalSourceError("timeout", "Jev did not answer in time", {
+        cause: error,
+      });
+    case error instanceof SyntaxError:
+      return new SignalSourceError(
+        "invalid_response",
+        "Jev answered non-JSON",
+        {
+          cause: error,
+        },
+      );
+    default:
+      return new SignalSourceError("http", "Jev request failed", {
+        cause: error,
+      });
+  }
+}
+
+function tierDistribution(
+  probabilities: Record<string, number>,
+): [number, number, number] {
+  const level = (key: string) => probabilities[key] ?? Number.NaN;
+  const [fast, normal, smart] = [level("0"), level("1"), level("2")];
+  const sum = fast + normal + smart;
+  // NaN (a missing level) fails this comparison too.
+  if (!(Math.abs(sum - 1) <= PROBABILITY_SUM_TOLERANCE)) {
+    throw new SignalSourceError(
+      "invalid_response",
+      "Jev tier_needed probabilities are not a distribution over three levels",
+    );
+  }
+  return [fast / sum, normal / sum, smart / sum];
+}
+
+function sessionState(input: PreRunInput): Record<string, string> {
+  const state: Record<string, string> = {
+    prompt: clip(redact(input.firstUserText), {
+      head: PROMPT_HEAD,
+      tail: PROMPT_TAIL,
+    }),
+  };
+  if (input.systemPrompt?.trim()) {
+    state.system_prompt = clip(redact(input.systemPrompt), {
+      head: SYSTEM_HEAD,
+      tail: SYSTEM_TAIL,
+    });
+  }
+  if (input.tools?.length) {
+    const names = input.tools
+      .map((tool) => redactToolName(tool.name))
+      .sort()
+      .join("\n");
+    // Reject pathological input rather than silently hide capabilities from the scorer.
+    if (Buffer.byteLength(names, "utf8") > MAX_TOOL_NAMES_BYTES) {
+      throw new SignalSourceError(
+        "input_too_large",
+        "Tool names exceed the scorer's 64 KiB context limit",
+      );
+    }
+    state.tools = `Available tools: ${input.tools.length}\n${names}`;
+  }
+  return state;
+}
+
+function redact(text: string): string {
+  return text.replace(SECRET, "<redacted>");
+}
+
+function redactToolName(name: string): string {
+  // Recognized MCP identifiers often exceed 40 characters; opaque names still need redaction.
+  return /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/.test(name)
+    ? name.replace(CREDENTIAL, "<redacted>")
+    : redact(name);
+}
+
+function clip(
+  text: string,
+  { head, tail }: { head: number; tail: number },
+): string {
+  const chars = Array.from(text);
+  if (chars.length <= head + tail) return text;
+  const omitted = chars.length - head - tail;
+  return `${chars.slice(0, head).join("")}\n…[${omitted} chars omitted]…\n${tail ? chars.slice(-tail).join("") : ""}`;
+}

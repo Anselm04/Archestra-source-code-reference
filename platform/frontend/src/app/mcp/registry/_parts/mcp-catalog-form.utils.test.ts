@@ -1,0 +1,1710 @@
+// @vitest-environment node
+import type { McpCatalogFormValues } from "./mcp-catalog-form.types";
+import {
+  buildCloneFormValues,
+  transformCatalogItemToFormValues,
+  transformExternalCatalogToFormValues,
+  transformFormToApiData,
+} from "./mcp-catalog-form.utils";
+
+describe("transformFormToApiData", () => {
+  it("maps custom auth and additional headers into userConfig", () => {
+    const values: McpCatalogFormValues = {
+      name: "Header MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "bearer",
+      includeBearerPrefix: true,
+      authHeaderName: "x-api-key",
+      additionalHeaders: [
+        {
+          headerName: "x-tenant-id",
+          promptOnInstallation: false,
+          required: false,
+          value: "tenant-42",
+          description: "Tenant header",
+        },
+      ],
+      oauthConfig: undefined,
+      enterpriseManagedConfig: null,
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    expect(transformFormToApiData(values).userConfig).toEqual({
+      access_token: expect.objectContaining({
+        headerName: "x-api-key",
+      }),
+      header_x_tenant_id: expect.objectContaining({
+        headerName: "x-tenant-id",
+        promptOnInstallation: false,
+        required: false,
+        default: "tenant-42",
+        description: "Tenant header",
+        sensitive: false,
+      }),
+    });
+  });
+
+  it("saves AWS IAM sign-in for a remote server, and loads it back", () => {
+    const awsIamConfig = {
+      roleArn: "arn:aws:iam::123456789012:role/archestra-agents",
+      region: "us-east-1",
+      service: "bedrock-agentcore",
+    };
+    const data = transformFormToApiData({
+      name: "AgentCore Gateway",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://gateway.example.com/mcp",
+      authMethod: "aws_iam",
+      includeBearerPrefix: true,
+      additionalHeaders: [],
+      awsIamConfig: { ...awsIamConfig, audience: " " },
+      enterpriseManagedConfig: null,
+      labels: [],
+      scope: "org",
+      teams: [],
+    });
+
+    expect(data.awsIamConfig).toEqual(awsIamConfig);
+    expect(data.oauthConfig).toBeNull();
+    expect(data.enterpriseManagedConfig).toBeNull();
+
+    const loaded = transformCatalogItemToFormValues({
+      id: "catalog-aws",
+      name: "AgentCore Gateway",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://gateway.example.com/mcp",
+      oauthConfig: null,
+      enterpriseManagedConfig: null,
+      awsIamConfig,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {},
+      scope: "org",
+      teams: [],
+      labels: [],
+    } as never);
+    expect(loaded.authMethod).toBe("aws_iam");
+    expect(loaded.awsIamConfig).toEqual(awsIamConfig);
+  });
+
+  it("clears AWS IAM sign-in when another method is chosen", () => {
+    const data = transformFormToApiData({
+      name: "AgentCore Gateway",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://gateway.example.com/mcp",
+      authMethod: "none",
+      includeBearerPrefix: true,
+      additionalHeaders: [],
+      awsIamConfig: {
+        roleArn: "arn:aws:iam::123456789012:role/archestra-agents",
+        region: "us-east-1",
+        service: "bedrock-agentcore",
+      },
+      enterpriseManagedConfig: null,
+      labels: [],
+      scope: "org",
+      teams: [],
+    });
+
+    expect(data.awsIamConfig).toBeNull();
+  });
+
+  it("includes OAuth discovery overrides in the API payload", () => {
+    const values: McpCatalogFormValues = {
+      name: "Direct OAuth MCP",
+      description: "",
+      icon: null,
+      serverType: "local",
+      serverUrl: "",
+      authMethod: "oauth",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: {
+        client_id: "client-id",
+        client_secret: "client-secret",
+        audience: "",
+        resource: "https://mcp.example.com",
+        redirect_uris: "https://app.example.com/oauth-callback",
+        scopes: "read:jira-work",
+        supports_resource_metadata: true,
+        grantType: "authorization_code",
+        oauthServerUrl: "https://mcp.example.com",
+        authServerUrl: "https://auth.example.com",
+        authorizationEndpoint: "https://legacy-idp.example.com/oauth/authorize",
+        wellKnownUrl:
+          "https://auth.example.com/.well-known/openid-configuration",
+        resourceMetadataUrl:
+          "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+        tokenEndpoint: "https://legacy-idp.example.com/oauth/token",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: {
+        command: "node",
+        arguments: "server.js",
+        environment: [],
+        envFrom: [],
+        dockerImage: "",
+        transportType: "streamable-http",
+        httpPort: "8080",
+        httpPath: "/mcp",
+        serviceAccount: "",
+        imagePullSecrets: [],
+      },
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    expect(transformFormToApiData(values).oauthConfig).toMatchObject({
+      server_url: "https://mcp.example.com",
+      auth_server_url: "https://auth.example.com",
+      authorization_endpoint: "https://legacy-idp.example.com/oauth/authorize",
+      resource: "https://mcp.example.com",
+      well_known_url:
+        "https://auth.example.com/.well-known/openid-configuration",
+      resource_metadata_url:
+        "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+      token_endpoint: "https://legacy-idp.example.com/oauth/token",
+      scopes: ["read:jira-work"],
+      default_scopes: ["read:jira-work"],
+    });
+  });
+
+  it("uses the remote server URL as the OAuth server URL for remote servers", () => {
+    const values: McpCatalogFormValues = {
+      name: "Remote Direct OAuth MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "oauth",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: {
+        client_id: "client-id",
+        client_secret: "client-secret",
+        audience: "",
+        redirect_uris: "https://app.example.com/oauth-callback",
+        scopes: "read:jira-work",
+        supports_resource_metadata: true,
+        grantType: "authorization_code",
+        oauthServerUrl: "",
+        authServerUrl: "https://auth.example.com",
+        authorizationEndpoint: "https://legacy-idp.example.com/oauth/authorize",
+        wellKnownUrl:
+          "https://auth.example.com/.well-known/openid-configuration",
+        resourceMetadataUrl:
+          "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+        tokenEndpoint: "https://legacy-idp.example.com/oauth/token",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    expect(transformFormToApiData(values).oauthConfig).toMatchObject({
+      server_url: "https://mcp.example.com",
+      auth_server_url: "https://auth.example.com",
+      authorization_endpoint: "https://legacy-idp.example.com/oauth/authorize",
+      well_known_url:
+        "https://auth.example.com/.well-known/openid-configuration",
+      resource_metadata_url:
+        "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+      token_endpoint: "https://legacy-idp.example.com/oauth/token",
+      scopes: ["read:jira-work"],
+      default_scopes: ["read:jira-work"],
+    });
+  });
+
+  it("persists a blank scopes field as empty scopes and an empty default_scopes fallback", () => {
+    const values: McpCatalogFormValues = {
+      name: "Default Scope OAuth MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "oauth",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: {
+        client_id: "client-id",
+        client_secret: "client-secret",
+        audience: "",
+        redirect_uris: "https://app.example.com/oauth-callback",
+        scopes: "",
+        supports_resource_metadata: false,
+        grantType: "authorization_code",
+        oauthServerUrl: "",
+        authServerUrl: "",
+        authorizationEndpoint: "",
+        wellKnownUrl: "",
+        resourceMetadataUrl: "",
+        tokenEndpoint: "",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    expect(transformFormToApiData(values).oauthConfig).toMatchObject({
+      scopes: [],
+      default_scopes: [],
+    });
+  });
+
+  it("parses the additional scopes field into an array", () => {
+    const values: McpCatalogFormValues = {
+      name: "Additional Scopes OAuth MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "oauth",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: {
+        client_id: "client-id",
+        client_secret: "client-secret",
+        audience: "",
+        redirect_uris: "https://app.example.com/oauth-callback",
+        scopes: "read",
+        additional_scopes: "offline_access, custom:scope",
+        supports_resource_metadata: false,
+        grantType: "authorization_code",
+        oauthServerUrl: "",
+        authServerUrl: "",
+        authorizationEndpoint: "",
+        wellKnownUrl: "",
+        resourceMetadataUrl: "",
+        tokenEndpoint: "",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    expect(transformFormToApiData(values).oauthConfig).toMatchObject({
+      scopes: ["read"],
+      additional_scopes: ["offline_access", "custom:scope"],
+    });
+  });
+
+  it("treats comma-only scopes input as blank", () => {
+    const values: McpCatalogFormValues = {
+      name: "Comma Scope OAuth MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "oauth",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: {
+        client_id: "client-id",
+        client_secret: "client-secret",
+        audience: "",
+        redirect_uris: "https://app.example.com/oauth-callback",
+        scopes: " , ",
+        supports_resource_metadata: false,
+        grantType: "authorization_code",
+        oauthServerUrl: "",
+        authServerUrl: "",
+        authorizationEndpoint: "",
+        wellKnownUrl: "",
+        resourceMetadataUrl: "",
+        tokenEndpoint: "",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    expect(transformFormToApiData(values).oauthConfig).toMatchObject({
+      scopes: [],
+      default_scopes: [],
+    });
+  });
+
+  it("hydrates explicit OAuth endpoints from internal catalog items", () => {
+    const values = transformCatalogItemToFormValues({
+      id: "catalog-1",
+      name: "Direct OAuth MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      oauthConfig: {
+        client_id: "client-id",
+        requires_client_credentials: true,
+        client_secret: "client-secret",
+        audience: "",
+        redirect_uris: ["https://app.example.com/oauth-callback"],
+        scopes: ["read"],
+        default_scopes: ["read", "write"],
+        supports_resource_metadata: false,
+        grant_type: "authorization_code",
+        server_url: "https://mcp.example.com",
+        auth_server_url: "https://auth.example.com",
+        authorization_endpoint:
+          "https://legacy-idp.example.com/oauth/authorize",
+        well_known_url:
+          "https://auth.example.com/.well-known/openid-configuration",
+        resource_metadata_url:
+          "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+        token_endpoint: "https://legacy-idp.example.com/oauth/token",
+        name: "Direct OAuth MCP",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {},
+      scope: "personal",
+      teams: [],
+      labels: [],
+    } as never);
+
+    expect(
+      transformFormToApiData(values).oauthConfig?.requires_client_credentials,
+    ).toBe(true);
+    expect(values.oauthConfig?.authorizationEndpoint).toBe(
+      "https://legacy-idp.example.com/oauth/authorize",
+    );
+    expect(values.oauthConfig?.tokenEndpoint).toBe(
+      "https://legacy-idp.example.com/oauth/token",
+    );
+  });
+
+  it("maps OAuth client credentials auth into install-time shared fields", () => {
+    const values: McpCatalogFormValues = {
+      name: "Shared OAuth MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "oauth_client_credentials",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: {
+        client_id: "",
+        client_secret: "",
+        audience: "https://api.example.com",
+        redirect_uris: "",
+        scopes: "read, write",
+        supports_resource_metadata: false,
+        grantType: "client_credentials",
+        oauthServerUrl: "",
+        authServerUrl: "",
+        authorizationEndpoint: "",
+        wellKnownUrl: "",
+        resourceMetadataUrl: "",
+        tokenEndpoint: "https://auth.example.com/oauth/token",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "team",
+      teams: [{ id: "team-1", level: "use" }],
+    };
+
+    const result = transformFormToApiData(values);
+
+    expect(result.oauthConfig).toMatchObject({
+      grant_type: "client_credentials",
+      token_endpoint: "https://auth.example.com/oauth/token",
+      audience: "https://api.example.com",
+      redirect_uris: [],
+      scopes: ["read", "write"],
+      default_scopes: ["read", "write"],
+    });
+    expect(result.userConfig).toMatchObject({
+      client_id: expect.objectContaining({ required: true }),
+      client_secret: expect.objectContaining({ sensitive: true }),
+      audience: expect.objectContaining({
+        required: false,
+        default: "https://api.example.com",
+      }),
+    });
+  });
+
+  it("preserves the external catalog credential requirement and OAuth endpoints on save", () => {
+    const values = transformExternalCatalogToFormValues({
+      name: "direct-oauth-mcp",
+      display_name: "Direct OAuth MCP",
+      description: "",
+      icon: null,
+      server: {
+        type: "remote",
+        url: "https://mcp.example.com",
+      },
+      oauth_config: {
+        client_id: "client-id",
+        requires_client_credentials: true,
+        client_secret: "client-secret",
+        redirect_uris: ["https://app.example.com/oauth-callback"],
+        scopes: ["read"],
+        default_scopes: ["read", "write"],
+        supports_resource_metadata: false,
+        grant_type: "authorization_code",
+        server_url: "https://mcp.example.com",
+        auth_server_url: "https://auth.example.com",
+        authorization_endpoint:
+          "https://legacy-idp.example.com/oauth/authorize",
+        well_known_url:
+          "https://auth.example.com/.well-known/openid-configuration",
+        resource_metadata_url:
+          "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+        token_endpoint: "https://legacy-idp.example.com/oauth/token",
+        name: "Direct OAuth MCP",
+      },
+    } as never);
+
+    expect(
+      transformFormToApiData(values).oauthConfig?.requires_client_credentials,
+    ).toBe(true);
+    expect(values.oauthConfig?.authorizationEndpoint).toBe(
+      "https://legacy-idp.example.com/oauth/authorize",
+    );
+    expect(values.oauthConfig?.tokenEndpoint).toBe(
+      "https://legacy-idp.example.com/oauth/token",
+    );
+  });
+
+  it("hydrates custom auth and additional headers from internal catalog items", () => {
+    const values = transformCatalogItemToFormValues({
+      id: "catalog-headers",
+      name: "Header MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      oauthConfig: null,
+      enterpriseManagedConfig: null,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {
+        access_token: {
+          type: "string",
+          title: "Access Token",
+          description: "Bearer token",
+          required: true,
+          sensitive: true,
+          headerName: "x-api-key",
+        },
+        header_x_tenant_id: {
+          type: "string",
+          title: "x-tenant-id",
+          description: "Tenant ID",
+          promptOnInstallation: false,
+          required: false,
+          sensitive: false,
+          headerName: "x-tenant-id",
+          default: "tenant-42",
+        },
+      },
+      scope: "personal",
+      teams: [],
+      labels: [],
+    } as never);
+
+    expect(values.authMethod).toBe("bearer");
+    expect(values.includeBearerPrefix).toBe(true);
+    expect(values.authHeaderName).toBe("x-api-key");
+    expect(values.additionalHeaders).toEqual([
+      {
+        fieldName: "header_x_tenant_id",
+        headerName: "x-tenant-id",
+        promptOnInstallation: false,
+        required: false,
+        value: "tenant-42",
+        description: "Tenant ID",
+        includeBearerPrefix: false,
+        sensitive: false,
+      },
+    ]);
+  });
+
+  it("leaves the scopes field empty when external catalog oauth_config has no scopes", () => {
+    const values = transformExternalCatalogToFormValues({
+      name: "empty-scopes-server",
+      display_name: "Empty Scopes Server",
+      description: "",
+      icon: null,
+      server: {
+        type: "remote",
+        url: "https://mcp.example.com",
+      },
+      oauth_config: {
+        client_id: "client-id",
+        client_secret: "client-secret",
+        redirect_uris: ["https://app.example.com/oauth-callback"],
+        scopes: [],
+        default_scopes: ["read", "write"],
+        supports_resource_metadata: true,
+        grant_type: "authorization_code",
+        server_url: "https://mcp.example.com",
+      },
+    } as never);
+
+    expect(values.oauthConfig?.scopes).toBe("");
+  });
+
+  it("detects default bearer auth from external catalog manifests without an explicit headerName", () => {
+    const values = transformExternalCatalogToFormValues({
+      name: "github",
+      display_name: "GitHub",
+      description: "",
+      icon: null,
+      server: {
+        type: "remote",
+        url: "https://api.githubcopilot.com/mcp",
+      },
+      user_config: {
+        access_token: {
+          type: "string",
+          title: "Access Token",
+          description: "GitHub personal access token",
+          required: true,
+          sensitive: true,
+        },
+      },
+    } as never);
+
+    expect(values.authMethod).toBe("bearer");
+    expect(values.includeBearerPrefix).toBe(true);
+    expect(values.authHeaderName).toBe("");
+  });
+
+  it("detects default raw token auth from external catalog manifests without an explicit headerName", () => {
+    const values = transformExternalCatalogToFormValues({
+      name: "raw-token-server",
+      display_name: "Raw Token Server",
+      description: "",
+      icon: null,
+      server: {
+        type: "remote",
+        url: "https://mcp.example.com",
+      },
+      user_config: {
+        raw_access_token: {
+          type: "string",
+          title: "Raw Access Token",
+          description: "Token sent without the Bearer prefix",
+          required: true,
+          sensitive: true,
+        },
+      },
+    } as never);
+
+    expect(values.authMethod).toBe("bearer");
+    expect(values.includeBearerPrefix).toBe(false);
+    expect(values.authHeaderName).toBe("");
+  });
+
+  it("persists IdP JWT / JWKS passthrough auth as enterprise-managed passthrough config", () => {
+    const values: McpCatalogFormValues = {
+      name: "JWT MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "idp_jwt",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: undefined,
+      enterpriseManagedConfig: {
+        identityProviderId: "idp-1",
+        assertionMode: "passthrough",
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "authorization_bearer",
+      },
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    expect(transformFormToApiData(values).enterpriseManagedConfig).toEqual({
+      identityProviderId: "idp-1",
+      assertionMode: "passthrough",
+      requestedCredentialType: "bearer_token",
+      tokenInjectionMode: "authorization_bearer",
+      headerName: undefined,
+    });
+  });
+
+  it("hydrates IdP JWT / JWKS passthrough auth from internal catalog items", () => {
+    const values = transformCatalogItemToFormValues({
+      id: "catalog-jwt",
+      name: "JWT MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      oauthConfig: null,
+      enterpriseManagedConfig: {
+        identityProviderId: "idp-1",
+        assertionMode: "passthrough",
+        requestedCredentialType: "bearer_token",
+        tokenInjectionMode: "authorization_bearer",
+      },
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {},
+      scope: "personal",
+      teams: [],
+      labels: [],
+    } as never);
+
+    expect(values.authMethod).toBe("idp_jwt");
+    expect(values.includeBearerPrefix).toBe(true);
+    expect(values.enterpriseManagedConfig?.identityProviderId).toBe("idp-1");
+    expect(values.enterpriseManagedConfig?.assertionMode).toBe("passthrough");
+  });
+
+  it("treats authorization header names case-insensitively when hydrating form values", () => {
+    const values = transformCatalogItemToFormValues({
+      id: "catalog-auth-header",
+      name: "Header MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      oauthConfig: null,
+      enterpriseManagedConfig: null,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {
+        access_token: {
+          type: "string",
+          title: "Access Token",
+          description: "Bearer token",
+          required: true,
+          sensitive: true,
+          headerName: "authorization",
+        },
+      },
+      scope: "personal",
+      teams: [],
+      labels: [],
+    } as never);
+
+    expect(values.authMethod).toBe("bearer");
+    expect(values.includeBearerPrefix).toBe(true);
+    expect(values.authHeaderName).toBe("");
+  });
+
+  it("hydrates legacy raw token auth into bearer mode without the bearer prefix", () => {
+    const values = transformCatalogItemToFormValues({
+      id: "catalog-raw-token",
+      name: "Raw Token MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      oauthConfig: null,
+      enterpriseManagedConfig: null,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {
+        raw_access_token: {
+          type: "string",
+          title: "Access Token",
+          description: "Token without Bearer prefix",
+          required: true,
+          sensitive: true,
+          headerName: "Authorization",
+        },
+      },
+      scope: "personal",
+      teams: [],
+      labels: [],
+    } as never);
+
+    expect(values.authMethod).toBe("bearer");
+    expect(values.includeBearerPrefix).toBe(false);
+    expect(values.authHeaderName).toBe("");
+  });
+
+  describe("entries that declare auth through requiresAuth and authFields", () => {
+    const authFieldsItem = {
+      id: "catalog-auth-fields",
+      name: "Auth Fields MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      requiresAuth: true,
+      authFields: [
+        {
+          name: "X-API-Key",
+          label: "API key",
+          type: "header",
+          required: false,
+        },
+        {
+          name: "token",
+          label: "Query token",
+          type: "query",
+          required: false,
+        },
+      ],
+      oauthConfig: null,
+      enterpriseManagedConfig: null,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: null,
+      scope: "personal",
+      teams: [],
+      labels: [],
+    };
+
+    it("uses explicit auth settings before the GitHub name fallback", () => {
+      const item = { ...authFieldsItem, name: "github-internal" };
+      expect(transformCatalogItemToFormValues(item as never).authMethod).toBe(
+        "auth_header",
+      );
+      expect(
+        transformCatalogItemToFormValues({
+          ...item,
+          requiresAuth: false,
+          authFields: [],
+        } as never).authMethod,
+      ).toBe("none");
+    });
+
+    it("hydrates header auth fields as a prompted token header", () => {
+      const values = transformCatalogItemToFormValues(authFieldsItem as never);
+
+      expect(values.authMethod).toBe("auth_header");
+      expect(values.requiresAuth).toBe(true);
+      expect(values.additionalHeaders).toEqual([
+        {
+          fieldName: undefined,
+          headerName: "X-API-Key",
+          sourceAuthFieldName: "x-api-key",
+          promptOnInstallation: true,
+          required: false,
+          value: undefined,
+          description: "API key",
+          includeBearerPrefix: false,
+          sensitive: true,
+        },
+      ]);
+    });
+
+    it("keeps the token header mode and its headers after a save", () => {
+      const saved = transformFormToApiData(
+        transformCatalogItemToFormValues(authFieldsItem as never),
+        authFieldsItem.authFields,
+      );
+
+      expect(saved.requiresAuth).toBe(true);
+      expect(saved.authFields).toEqual([
+        authFieldsItem.authFields[1],
+        expect.objectContaining({
+          name: "X-API-Key",
+          type: "header",
+          required: false,
+        }),
+      ]);
+      expect(saved.userConfig).toEqual({
+        header_x_api_key: expect.objectContaining({
+          headerName: "X-API-Key",
+          promptOnInstallation: true,
+          required: false,
+          sensitive: true,
+        }),
+      });
+
+      const reloaded = transformCatalogItemToFormValues({
+        ...authFieldsItem,
+        ...saved,
+      } as never);
+      expect(reloaded.authMethod).toBe("auth_header");
+      expect(reloaded.additionalHeaders).toEqual([
+        expect.objectContaining({
+          fieldName: "header_x_api_key",
+          headerName: "X-API-Key",
+          promptOnInstallation: true,
+          required: false,
+          sensitive: true,
+        }),
+      ]);
+    });
+
+    it.each([
+      "rename",
+      "delete",
+    ])("does not resurrect an imported header after %s and reload", (action) => {
+      const values = transformCatalogItemToFormValues(authFieldsItem as never);
+      values.additionalHeaders =
+        action === "delete"
+          ? []
+          : values.additionalHeaders?.map((header) => ({
+              ...header,
+              headerName: "X-Renamed-Key",
+            }));
+      const saved = transformFormToApiData(values, authFieldsItem.authFields);
+      const reloaded = transformCatalogItemToFormValues({
+        ...authFieldsItem,
+        ...saved,
+      } as never);
+      expect(
+        reloaded.additionalHeaders?.map((header) => header.headerName),
+      ).toEqual(action === "delete" ? [] : ["X-Renamed-Key"]);
+      expect(saved.authFields).toContainEqual(authFieldsItem.authFields[1]);
+      expect(
+        saved.authFields?.some((field) => field.name === "X-API-Key"),
+      ).toBe(false);
+    });
+
+    it("preserves required and optional auth fields independently", () => {
+      const values = transformCatalogItemToFormValues({
+        ...authFieldsItem,
+        authFields: [
+          {
+            name: "X-API-Key",
+            label: "API key",
+            type: "header",
+            required: true,
+          },
+          {
+            name: "X-Tenant",
+            label: "Optional tenant",
+            type: "header",
+            required: false,
+          },
+        ],
+      } as never);
+      expect(values.additionalHeaders?.map(({ required }) => required)).toEqual(
+        [true, false],
+      );
+    });
+
+    it("shows no auth once the entry no longer requires it", () => {
+      const values = transformCatalogItemToFormValues({
+        ...authFieldsItem,
+        requiresAuth: false,
+      } as never);
+
+      expect(values.authMethod).toBe("none");
+      expect(values.additionalHeaders).toEqual([]);
+    });
+
+    it("adds missing auth headers alongside static headers and preserves matching configuration", () => {
+      const item = {
+        ...authFieldsItem,
+        userConfig: {
+          tenant: {
+            type: "string",
+            headerName: "X-Tenant-ID",
+            default: "local-control",
+            promptOnInstallation: false,
+            required: false,
+            sensitive: false,
+          },
+        },
+      };
+      const values = transformCatalogItemToFormValues(item as never);
+      expect(values.authMethod).toBe("auth_header");
+      expect(
+        values.additionalHeaders?.map(({ headerName }) => headerName),
+      ).toEqual(["X-Tenant-ID", "X-API-Key"]);
+      const reloaded = transformCatalogItemToFormValues({
+        ...item,
+        userConfig: {
+          ...item.userConfig,
+          apiKey: {
+            type: "string",
+            headerName: "x-api-key",
+            promptOnInstallation: true,
+            required: false,
+            sensitive: false,
+            description: "Existing configuration",
+          },
+        },
+      } as never);
+      expect(reloaded.additionalHeaders).toHaveLength(2);
+      expect(reloaded.additionalHeaders?.[1]).toMatchObject({
+        fieldName: "apiKey",
+        headerName: "x-api-key",
+        required: false,
+        sensitive: false,
+        description: "Existing configuration",
+      });
+    });
+  });
+
+  describe("preserves additionalHeaders across all auth methods", () => {
+    const additionalHeaders: McpCatalogFormValues["additionalHeaders"] = [
+      {
+        headerName: "x-api-key",
+        promptOnInstallation: true,
+        required: true,
+        value: "",
+        description: "",
+        includeBearerPrefix: false,
+      },
+    ];
+
+    const baseValues: McpCatalogFormValues = {
+      name: "Headers MCP",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      authMethod: "none",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders,
+      oauthConfig: {
+        client_id: "id",
+        client_secret: "secret",
+        audience: "",
+        resource: "",
+        redirect_uris: "https://app.example.com/oauth-callback",
+        scopes: "",
+        supports_resource_metadata: true,
+        grantType: "authorization_code",
+        oauthServerUrl: "",
+        authServerUrl: "",
+        authorizationEndpoint: "https://auth.example.com/authorize",
+        wellKnownUrl: "",
+        resourceMetadataUrl: "",
+        tokenEndpoint: "https://auth.example.com/token",
+      },
+      enterpriseManagedConfig: {
+        identityProviderId: "idp-1",
+        assertionMode: "exchange",
+      },
+      localConfig: undefined,
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+
+    const cases: McpCatalogFormValues["authMethod"][] = [
+      "oauth",
+      "oauth_client_credentials",
+      "enterprise_managed",
+      "idp_jwt",
+    ];
+
+    for (const authMethod of cases) {
+      it(`keeps additional headers when authMethod is ${authMethod}`, () => {
+        const result = transformFormToApiData({ ...baseValues, authMethod });
+        expect(result.userConfig).toMatchObject({
+          header_x_api_key: expect.objectContaining({
+            headerName: "x-api-key",
+            promptOnInstallation: true,
+          }),
+        });
+      });
+    }
+  });
+
+  describe("round-trips the `sensitive` flag on additional headers", () => {
+    // form → API → form preserves the `sensitive` flag on installation-scoped
+    // headers (where the flag controls input masking but doesn't change
+    // storage).
+    type AdditionalHeader = NonNullable<
+      McpCatalogFormValues["additionalHeaders"]
+    >[number];
+
+    function makeBaseValues(header: AdditionalHeader): McpCatalogFormValues {
+      return {
+        name: "Sensitive Headers MCP",
+        description: "",
+        icon: null,
+        serverType: "remote",
+        serverUrl: "https://mcp.example.com",
+        authMethod: "none",
+        includeBearerPrefix: false,
+        authHeaderName: "",
+        additionalHeaders: [header],
+        oauthConfig: undefined,
+        enterpriseManagedConfig: null,
+        localConfig: undefined,
+        deploymentSpecYaml: "",
+        originalDeploymentSpecYaml: "",
+
+        labels: [],
+        scope: "personal",
+        teams: [],
+      };
+    }
+
+    function roundTrip(header: AdditionalHeader): AdditionalHeader {
+      const values = makeBaseValues(header);
+      const apiData = transformFormToApiData(values);
+      const rehydrated = transformCatalogItemToFormValues({
+        id: "round-trip",
+        name: values.name,
+        description: null,
+        icon: null,
+        serverType: "remote",
+        serverUrl: values.serverUrl,
+        oauthConfig: null,
+        enterpriseManagedConfig: null,
+        localConfig: null,
+        deploymentSpecYaml: null,
+        userConfig: apiData.userConfig ?? null,
+        scope: "personal",
+        teams: [],
+        labels: [],
+      } as never);
+      expect(rehydrated.additionalHeaders).toHaveLength(1);
+      const [first] = rehydrated.additionalHeaders ?? [];
+      if (!first) {
+        throw new Error("expected hydrated header row");
+      }
+      return first;
+    }
+
+    it("preserves sensitive=true on an installation-scoped header", () => {
+      const result = roundTrip({
+        headerName: "x-tenant-token",
+        promptOnInstallation: true,
+        required: true,
+        value: "",
+        description: "",
+        includeBearerPrefix: false,
+        sensitive: true,
+      });
+      expect(result).toMatchObject({
+        headerName: "x-tenant-token",
+        promptOnInstallation: true,
+        sensitive: true,
+      });
+    });
+
+    it("forces sensitive=false on a static header regardless of incoming flag", () => {
+      // Server-side validator rejects sensitive + static; the form save
+      // path mirrors that so the API never sees the illegal combination.
+      const result = roundTrip({
+        headerName: "x-static",
+        promptOnInstallation: false,
+        required: false,
+        value: "fixed-value",
+        description: "",
+        includeBearerPrefix: false,
+        sensitive: true, // ← should be coerced to false by the save path
+      });
+      expect(result).toMatchObject({
+        headerName: "x-static",
+        promptOnInstallation: false,
+        value: "fixed-value",
+        sensitive: false,
+      });
+    });
+  });
+});
+
+describe("transformFormToApiData - secret env var preservation", () => {
+  type LocalEnvironment = NonNullable<
+    McpCatalogFormValues["localConfig"]
+  >["environment"];
+
+  function buildLocalFormValues(
+    environment: LocalEnvironment,
+  ): McpCatalogFormValues {
+    return {
+      name: "secret-preservation-mcp",
+      description: "",
+      icon: null,
+      serverType: "local",
+      serverUrl: "",
+      authMethod: "none",
+      includeBearerPrefix: true,
+      authHeaderName: "",
+      additionalHeaders: [],
+      oauthConfig: undefined,
+      enterpriseManagedConfig: null,
+      localConfig: {
+        command: "node",
+        arguments: "server.js",
+        environment,
+        envFrom: [],
+        dockerImage: "",
+        transportType: "stdio",
+        httpPort: "",
+        httpPath: "",
+        serviceAccount: "",
+        imagePullSecrets: [],
+      },
+      deploymentSpecYaml: "",
+      originalDeploymentSpecYaml: "",
+
+      labels: [],
+      scope: "personal",
+      teams: [],
+    };
+  }
+
+  it("emits empty value (not a mask sentinel) for an unedited secret row", () => {
+    const result = transformFormToApiData(
+      buildLocalFormValues([
+        {
+          key: "API_KEY",
+          type: "secret",
+          value: "",
+          promptOnInstallation: false,
+          required: false,
+          description: "",
+        },
+      ]),
+    );
+
+    const envVar = result.localConfig?.environment?.[0];
+    expect(envVar?.key).toBe("API_KEY");
+    expect(envVar?.type).toBe("secret");
+    // The form must NOT round-trip the masked placeholder back to the API.
+    // Backend preserves stored value when value is empty/undefined.
+    const value = envVar?.value ?? "";
+    expect(value).toBe("");
+    expect(value).not.toMatch(/[•*]/);
+  });
+
+  it("emits the typed value when the user edited the secret row", () => {
+    const result = transformFormToApiData(
+      buildLocalFormValues([
+        {
+          key: "API_KEY",
+          type: "secret",
+          value: "newly-typed-secret",
+          promptOnInstallation: false,
+          required: false,
+          description: "",
+        },
+      ]),
+    );
+
+    expect(result.localConfig?.environment?.[0]?.value).toBe(
+      "newly-typed-secret",
+    );
+  });
+
+  it("preserves mixed edited / unedited secret rows independently", () => {
+    const result = transformFormToApiData(
+      buildLocalFormValues([
+        {
+          key: "EDITED",
+          type: "secret",
+          value: "fresh",
+          promptOnInstallation: false,
+          required: false,
+          description: "",
+        },
+        {
+          key: "UNTOUCHED",
+          type: "secret",
+          value: "",
+          promptOnInstallation: false,
+          required: false,
+          description: "",
+        },
+      ]),
+    );
+
+    const env = result.localConfig?.environment ?? [];
+    expect(env).toHaveLength(2);
+    expect(env[0]).toMatchObject({ key: "EDITED", value: "fresh" });
+    expect(env[1]?.key).toBe("UNTOUCHED");
+    expect(env[1]?.value ?? "").toBe("");
+  });
+});
+
+describe("desktop MCP servers", () => {
+  const desktopItem = {
+    id: "catalog-desktop",
+    name: "matlab",
+    description: "Runs on the user's own computer",
+    icon: null,
+    serverType: "desktop_mcp",
+    serverUrl: null,
+    requiresAuth: false,
+    multitenant: false,
+    oauthConfig: null,
+    enterpriseManagedConfig: null,
+    localConfig: null,
+    deploymentSpecYaml: null,
+    userConfig: null,
+    scope: "org",
+    teams: [],
+    labels: [{ key: "team", value: "hardware" }],
+    environmentId: null,
+  };
+
+  it("submits no connection field, whatever else the form holds", () => {
+    // The drafts of a remote and a self-hosted server the user tried first.
+    const values: McpCatalogFormValues = {
+      name: "matlab",
+      description: "Runs on the user's own computer",
+      icon: null,
+      serverType: "desktop_mcp",
+      multitenant: true,
+      serverUrl: "https://mcp.example.com",
+      requiresAuth: true,
+      authMethod: "oauth",
+      includeBearerPrefix: true,
+      authHeaderName: "x-api-key",
+      additionalHeaders: [
+        {
+          headerName: "x-tenant-id",
+          promptOnInstallation: false,
+          required: false,
+          value: "tenant-42",
+        },
+      ],
+      oauthConfig: {
+        client_id: "client-id",
+        client_secret: "secret",
+        redirect_uris: "https://app.example.com/oauth-callback",
+        scopes: "read",
+        supports_resource_metadata: true,
+        grantType: "authorization_code",
+      },
+      enterpriseManagedConfig: { identityProviderId: "idp-1" },
+      localConfig: {
+        command: "node",
+        arguments: "server.js",
+        environment: [],
+        dockerImage: "registry.example.com/mcp:1",
+        transportType: "streamable-http",
+      },
+      labels: [{ key: "team", value: "hardware" }],
+      scope: "personal",
+      teams: [],
+      environmentId: null,
+    };
+
+    expect(transformFormToApiData(values)).toEqual({
+      name: "matlab",
+      description: "Runs on the user's own computer",
+      serverType: "desktop_mcp",
+      icon: null,
+      labels: [{ key: "team", value: "hardware" }],
+      environmentId: null,
+      desktopConfig: { command: null, url: null },
+    });
+  });
+
+  const desktopValues: McpCatalogFormValues = {
+    name: "peekaboo",
+    description: "",
+    serverType: "desktop_mcp",
+    authMethod: "none",
+    includeBearerPrefix: true,
+  };
+
+  it("submits the command", () => {
+    const data = transformFormToApiData({
+      ...desktopValues,
+      desktopConfig: {
+        kind: "command",
+        value: " /Users/$USER/bins/peekaboo mcp serve ",
+      },
+    });
+
+    expect(data.desktopConfig).toEqual({
+      command: "/Users/$USER/bins/peekaboo mcp serve",
+      url: null,
+    });
+  });
+
+  it("submits the URL and never a command with it", () => {
+    const data = transformFormToApiData({
+      ...desktopValues,
+      desktopConfig: {
+        kind: "url",
+        value: "http://127.0.0.1:8080/mcp",
+      },
+    });
+
+    expect(data.desktopConfig).toEqual({
+      command: null,
+      url: "http://127.0.0.1:8080/mcp",
+    });
+  });
+
+  it("does not submit a command for devices with another server type", () => {
+    const data = transformFormToApiData({
+      ...desktopValues,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      desktopConfig: {
+        kind: "command",
+        value: "/Users/$USER/bins/mcp",
+      },
+    });
+
+    expect(data).not.toHaveProperty("desktopConfig");
+  });
+
+  it("opens the command of an existing item", () => {
+    const values = transformCatalogItemToFormValues({
+      ...desktopItem,
+      desktopConfig: {
+        command: "/Users/$USER/bins/peekaboo mcp serve",
+        url: null,
+      },
+    } as never);
+
+    expect(values.desktopConfig).toEqual({
+      kind: "command",
+      value: "/Users/$USER/bins/peekaboo mcp serve",
+    });
+  });
+
+  it("opens the URL of an existing item", () => {
+    const values = transformCatalogItemToFormValues({
+      ...desktopItem,
+      desktopConfig: {
+        url: "http://127.0.0.1:8080/mcp",
+      },
+    } as never);
+
+    expect(values.desktopConfig).toEqual({
+      kind: "url",
+      value: "http://127.0.0.1:8080/mcp",
+    });
+  });
+
+  it("opens an item that has no command as an empty command", () => {
+    expect(
+      transformCatalogItemToFormValues({
+        ...desktopItem,
+        desktopConfig: null,
+      } as never).desktopConfig,
+    ).toEqual({ kind: "command", value: "" });
+  });
+
+  it("gives no desktop config to another server type", () => {
+    expect(
+      transformCatalogItemToFormValues({
+        ...desktopItem,
+        serverType: "remote",
+        serverUrl: "https://mcp.example.com",
+      } as never).desktopConfig,
+    ).toBeUndefined();
+  });
+
+  it("opens an existing item as a desktop MCP server, not as a remote one", () => {
+    const values = transformCatalogItemToFormValues(desktopItem as never);
+
+    expect(values).toMatchObject({
+      name: "matlab",
+      serverType: "desktop_mcp",
+      serverUrl: "",
+      multitenant: false,
+      authMethod: "none",
+      additionalHeaders: [],
+    });
+    expect(values.localConfig).toBeUndefined();
+    expect(values.oauthConfig).toBeUndefined();
+  });
+
+  it("round-trips an edit without changing the type or adding connection fields", () => {
+    const values = transformCatalogItemToFormValues(desktopItem as never);
+    const data = transformFormToApiData({ ...values, name: "matlab-2026" });
+
+    expect(data).toEqual({
+      name: "matlab-2026",
+      description: "Runs on the user's own computer",
+      serverType: "desktop_mcp",
+      icon: null,
+      labels: [{ key: "team", value: "hardware" }],
+      environmentId: null,
+      desktopConfig: { command: null, url: null },
+    });
+  });
+
+  it("round-trips the command through an edit", () => {
+    const desktopConfig = {
+      command: "/Users/$USER/bins/peekaboo mcp serve",
+      url: null,
+    };
+    const values = transformCatalogItemToFormValues({
+      ...desktopItem,
+      desktopConfig,
+    } as never);
+
+    expect(transformFormToApiData(values).desktopConfig).toEqual(desktopConfig);
+  });
+
+  it("has no authentication even when its name suggests a token", () => {
+    // Other types named after GitHub fall back to a bearer token.
+    expect(
+      transformCatalogItemToFormValues({
+        ...desktopItem,
+        name: "github-desktop",
+        requiresAuth: undefined,
+      } as never).authMethod,
+    ).toBe("none");
+  });
+
+  it("clones as a desktop MCP server", () => {
+    expect(buildCloneFormValues(desktopItem as never)).toMatchObject({
+      name: "matlab-copy",
+      serverType: "desktop_mcp",
+    });
+  });
+
+  it("imports a desktop catalog entry as a desktop MCP server with its command line", () => {
+    const values = transformExternalCatalogToFormValues({
+      name: "chromedevtools__chrome-devtools-mcp",
+      display_name: "Chrome DevTools",
+      description: "Drives Chrome on the user's device",
+      instructions: "You need **Node.js**.",
+      icon: null,
+      server: {
+        type: "desktop",
+        command: "npx",
+        args: [
+          "-y",
+          "chrome-devtools-mcp@latest",
+          "--user-data-dir=$HOME/My Chrome",
+          'say "hi"',
+        ],
+      },
+    } as never);
+
+    expect(values).toMatchObject({
+      name: "Chrome DevTools",
+      serverType: "desktop_mcp",
+      instructions: "You need **Node.js**.",
+      desktopConfig: {
+        kind: "command",
+        value:
+          'npx -y chrome-devtools-mcp@latest "--user-data-dir=$HOME/My Chrome" "say \\"hi\\""',
+      },
+    });
+    expect(transformFormToApiData(values)).toMatchObject({
+      serverType: "desktop_mcp",
+      instructions: "You need **Node.js**.",
+      desktopConfig: {
+        command:
+          'npx -y chrome-devtools-mcp@latest "--user-data-dir=$HOME/My Chrome" "say \\"hi\\""',
+        url: null,
+      },
+    });
+  });
+
+  it("keeps stored instructions through an edit and sends none from a form that never held them", () => {
+    const edited = transformCatalogItemToFormValues({
+      ...desktopItem,
+      instructions: "Turn on the add-on first.",
+      desktopConfig: { command: "uvx mcp-for-blender" },
+    } as never);
+    expect(transformFormToApiData(edited).instructions).toBe(
+      "Turn on the add-on first.",
+    );
+
+    const { instructions: _, ...withoutInstructions } = edited;
+    expect(transformFormToApiData(withoutInstructions)).not.toHaveProperty(
+      "instructions",
+    );
+  });
+});
+
+describe("buildCloneFormValues", () => {
+  it("suffixes the name with -copy", () => {
+    const values = buildCloneFormValues({
+      id: "catalog-1",
+      name: "my-server",
+      description: "desc",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      oauthConfig: null,
+      enterpriseManagedConfig: null,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {},
+      scope: "personal",
+      teams: [],
+      labels: [],
+    } as never);
+
+    expect(values.name).toBe("my-server-copy");
+  });
+
+  it("keeps secret values (clone is a full copy)", () => {
+    const values = buildCloneFormValues({
+      id: "catalog-1",
+      name: "oauth-server",
+      description: "",
+      icon: null,
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      oauthConfig: {
+        client_id: "client-id",
+        client_secret: "keep-me",
+        grant_type: "authorization_code",
+        name: "oauth-server",
+      },
+      enterpriseManagedConfig: null,
+      localConfig: null,
+      deploymentSpecYaml: null,
+      userConfig: {},
+      scope: "personal",
+      teams: [],
+      labels: [],
+    } as never);
+
+    expect(values.oauthConfig?.client_secret).toBe("keep-me");
+  });
+});
+
+describe("team access levels", () => {
+  it("hydrates each team's stored level into the form", () => {
+    const values = transformCatalogItemToFormValues({
+      name: "srv",
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      scope: "team",
+      teams: [
+        { id: "t1", name: "platform", level: "write" },
+        { id: "t2", name: "data", level: "use" },
+      ],
+      labels: [],
+    } as never);
+
+    expect(values.teams).toEqual([
+      { id: "t1", level: "write" },
+      { id: "t2", level: "use" },
+    ]);
+  });
+
+  it("does not submit retired sharing fields during a configuration save", () => {
+    const data = transformFormToApiData({
+      name: "srv",
+      serverType: "remote",
+      serverUrl: "https://mcp.example.com",
+      scope: "team",
+      teams: [
+        { id: "t1", level: "write" },
+        { id: "t2", level: "use" },
+      ],
+      labels: [],
+    } as never);
+
+    expect(data).not.toHaveProperty("teams");
+    expect(data).not.toHaveProperty("scope");
+  });
+});
+
+describe("local MCP runtime tiers", () => {
+  const item = {
+    id: "resource-catalog",
+    name: "Resource server",
+    serverType: "local",
+    localConfig: {
+      dockerImage: "example/server:1",
+      runtimeTier: "Small",
+    },
+    labels: [],
+    teams: [],
+  } as unknown as Parameters<typeof transformCatalogItemToFormValues>[0];
+
+  it("retains tiers across edit and clone, and lets clearing restore defaults", () => {
+    const values = transformCatalogItemToFormValues(item);
+    expect(values.localConfig?.runtimeTier).toBe("Small");
+    expect(transformFormToApiData(values).localConfig?.runtimeTier).toBe(
+      "Small",
+    );
+    expect(
+      transformFormToApiData(buildCloneFormValues(item)).localConfig
+        ?.runtimeTier,
+    ).toBe("Small");
+
+    const cleared = transformFormToApiData({
+      ...values,
+      localConfig: {
+        arguments: "",
+        environment: [],
+        ...values.localConfig,
+        runtimeTier: undefined,
+      },
+    });
+    expect(cleared.localConfig?.runtimeTier).toBeUndefined();
+    expect(
+      transformCatalogItemToFormValues({
+        ...item,
+        localConfig: { dockerImage: "example/server:1" },
+      }).localConfig?.runtimeTier,
+    ).toBeUndefined();
+  });
+
+  it("does not send local runtime tiers for remote or desktop servers", () => {
+    const values = transformCatalogItemToFormValues(item);
+    expect(
+      transformFormToApiData({
+        ...values,
+        serverType: "remote",
+        serverUrl: "https://example.com/mcp",
+      }).localConfig,
+    ).toBeUndefined();
+    expect(
+      transformFormToApiData({
+        ...values,
+        serverType: "desktop_mcp",
+        desktopConfig: { kind: "command", value: "node server.js" },
+      }).localConfig,
+    ).toBeUndefined();
+  });
+});

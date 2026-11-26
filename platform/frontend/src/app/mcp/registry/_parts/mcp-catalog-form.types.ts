@@ -1,0 +1,495 @@
+import {
+  HEADER_NAME_REGEX,
+  HEADER_NAME_VALIDATION_MESSAGE,
+  HttpUrlSchema,
+  LocalConfigFormSchema,
+  ResourcePermissionGrantSchema,
+} from "@archestra/shared";
+import { z } from "zod";
+import { desktopMcpTargetError } from "@/lib/mcp/desktop-mcp";
+
+const SSO_CALLBACK_PATH = "/api/auth/sso/callback";
+
+const headerNameSchema = z
+  .string()
+  .trim()
+  .min(1, "Header name is required")
+  .max(128, "Header name is too long")
+  .regex(HEADER_NAME_REGEX, HEADER_NAME_VALIDATION_MESSAGE);
+
+const additionalHeaderSchema = z.object({
+  fieldName: z.string().optional(),
+  sourceAuthFieldName: z.string().optional(),
+  headerName: headerNameSchema,
+  credentialId: z.string().min(1).max(128).optional(),
+  credentialScope: z.enum(["personal", "organization"]).optional(),
+  promptOnInstallation: z.boolean(),
+  required: z.boolean(),
+  value: z.string().optional(),
+  description: z.string().optional().or(z.literal("")),
+  includeBearerPrefix: z.boolean().optional(),
+  sensitive: z.boolean().optional(),
+});
+
+// Simplified OAuth config schema
+export const oauthConfigSchema = z
+  .object({
+    client_id: z.string().optional().or(z.literal("")),
+    client_secret: z.string().optional().or(z.literal("")),
+    requires_client_credentials: z.boolean().optional(),
+    audience: z.string().optional().or(z.literal("")),
+    resource: z.string().optional().or(z.literal("")),
+    redirect_uris: z.string().optional().or(z.literal("")),
+    scopes: z.string().optional().or(z.literal("")),
+    additional_scopes: z.string().optional().or(z.literal("")),
+    supports_resource_metadata: z.boolean(),
+    authServerUrl: z
+      .string()
+      .url({ error: "Must be a valid URL" })
+      .refine(
+        (val) => val.startsWith("http://") || val.startsWith("https://"),
+        {
+          message: "Must be an HTTP or HTTPS URL",
+        },
+      )
+      .optional()
+      .or(z.literal("")),
+    authorizationEndpoint: z
+      .string()
+      .url({ error: "Must be a valid URL" })
+      .refine(
+        (val) => val.startsWith("http://") || val.startsWith("https://"),
+        {
+          message: "Must be an HTTP or HTTPS URL",
+        },
+      )
+      .optional()
+      .or(z.literal("")),
+    wellKnownUrl: z
+      .string()
+      .url({ error: "Must be a valid URL" })
+      .refine(
+        (val) => val.startsWith("http://") || val.startsWith("https://"),
+        {
+          message: "Must be an HTTP or HTTPS URL",
+        },
+      )
+      .optional()
+      .or(z.literal("")),
+    resourceMetadataUrl: z
+      .string()
+      .url({ error: "Must be a valid URL" })
+      .refine(
+        (val) => val.startsWith("http://") || val.startsWith("https://"),
+        {
+          message: "Must be an HTTP or HTTPS URL",
+        },
+      )
+      .optional()
+      .or(z.literal("")),
+    tokenEndpoint: z
+      .string()
+      .url({ error: "Must be a valid URL" })
+      .refine(
+        (val) => val.startsWith("http://") || val.startsWith("https://"),
+        {
+          message: "Must be an HTTP or HTTPS URL",
+        },
+      )
+      .optional()
+      .or(z.literal("")),
+    // OAuth Server URL for local servers (since they don't have a serverUrl field)
+    // Used for OAuth discovery/authorization, NOT for tool execution
+    oauthServerUrl: z
+      .string()
+      .url({ error: "Must be a valid URL" })
+      .refine(
+        (val) => val.startsWith("http://") || val.startsWith("https://"),
+        {
+          message: "Must be an HTTP or HTTPS URL",
+        },
+      )
+      .optional()
+      .or(z.literal("")),
+    grantType: z.enum(["authorization_code", "client_credentials"]),
+  })
+  .superRefine((value, ctx) => {
+    if (
+      value.grantType === "authorization_code" &&
+      Boolean(value.authorizationEndpoint) !== Boolean(value.tokenEndpoint)
+    ) {
+      const message = "Authorization and token endpoints must be set together";
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: ["authorizationEndpoint"],
+      });
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: ["tokenEndpoint"],
+      });
+    }
+
+    if (
+      value.grantType === "authorization_code" &&
+      !value.redirect_uris?.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "At least one redirect URI is required",
+        path: ["redirect_uris"],
+      });
+    }
+
+    if (
+      value.grantType === "authorization_code" &&
+      value.redirect_uris
+        ?.split(",")
+        .some((uri) => uri.trim().includes(SSO_CALLBACK_PATH))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "MCP OAuth redirect URIs must use /oauth-callback, not the SSO callback URL",
+        path: ["redirect_uris"],
+      });
+    }
+
+    if (
+      value.grantType === "client_credentials" &&
+      !value.tokenEndpoint?.trim() &&
+      !value.authServerUrl?.trim() &&
+      !value.wellKnownUrl?.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Provide a token endpoint, authorization server URL, or well-known URL for client credentials",
+        path: ["tokenEndpoint"],
+      });
+    }
+  });
+
+const enterpriseManagedConfigSchema = z.object({
+  identityProviderId: z.string().optional(),
+  assertionMode: z.enum(["exchange", "passthrough"]).optional(),
+  resourceIdentifier: z.string().optional(),
+  requestedIssuer: z.string().optional(),
+  requestedCredentialType: z
+    .enum([
+      "bearer_token",
+      "id_jag",
+      "secret",
+      "service_account",
+      "opaque_json",
+    ])
+    .optional(),
+  tokenInjectionMode: z
+    .enum([
+      "authorization_bearer",
+      "raw_authorization",
+      "header",
+      "env",
+      "body_field",
+    ])
+    .optional(),
+  headerName: z.string().optional(),
+  responseFieldPath: z.string().optional(),
+  clientIdOverride: z.string().optional(),
+  clientSecretOverride: z.string().optional(),
+  privateKeyPemOverride: z.string().optional(),
+  privateKeyIdOverride: z.string().optional(),
+});
+
+const activeAuthFormSchema = z
+  .object({
+    name: z.string().trim().min(1, "Name is required"),
+    description: z.string().optional().or(z.literal("")),
+    icon: z.string().nullable().optional(),
+    serverType: z.enum(["remote", "local", "desktop_mcp"]),
+    multitenant: z.boolean().optional(),
+    serverUrl: HttpUrlSchema.optional().or(z.literal("")),
+    // Carried from an existing entry so a save keeps it; choosing "None"
+    // clears it.
+    requiresAuth: z.boolean().optional(),
+    managesAuthFields: z.boolean().optional(),
+    authMethod: z.enum([
+      "none",
+      "bearer",
+      "auth_header",
+      "oauth",
+      "oauth_client_credentials",
+      "enterprise_managed",
+      "idp_jwt",
+      "aws_iam",
+    ]),
+    includeBearerPrefix: z.boolean(),
+    authHeaderName: headerNameSchema.optional().or(z.literal("")),
+    additionalHeaders: z.array(additionalHeaderSchema).optional(),
+    oauthConfig: oauthConfigSchema.optional(),
+    enterpriseManagedConfig: enterpriseManagedConfigSchema
+      .nullable()
+      .optional(),
+    // AWS IAM (SigV4) sign-in; checked below when it is the chosen method.
+    awsIamConfig: z
+      .object({
+        roleArn: z.string(),
+        region: z.string(),
+        service: z.string(),
+        audience: z.string().optional(),
+      })
+      .nullable()
+      .optional(),
+    localConfig: LocalConfigFormSchema.optional(),
+    // What a desktop MCP server tells each computer: the command that starts
+    // it or the URL where it listens (`kind` says which `value` is). With an
+    // empty value the item cannot be added to a computer yet.
+    desktopConfig: z
+      .object({
+        kind: z.enum(["command", "url"]),
+        value: z.string(),
+      })
+      .optional(),
+    // Kubernetes Deployment spec YAML (for local servers)
+    deploymentSpecYaml: z.string().optional(),
+    // Original YAML from API (used to detect if user modified the YAML)
+    originalDeploymentSpecYaml: z.string().optional(),
+
+    // Labels for categorizing catalog items
+    labels: z
+      .array(z.object({ key: z.string(), value: z.string() }))
+      .optional(),
+    // Scope for catalog item visibility
+    scope: z.enum(["personal", "team", "org"]).optional(),
+    initialGrants: z
+      .array(ResourcePermissionGrantSchema.extend({ name: z.string() }))
+      .optional(),
+    // Teams a team-scoped item is shared with, each with its access level
+    teams: z
+      .array(z.object({ id: z.string(), level: z.enum(["use", "write"]) }))
+      .optional(),
+    // Deployment environment assignment (null = the default environment)
+    environmentId: z.string().uuid().nullable().optional(),
+    // Read-only setup instructions (markdown) surfaced from the catalog item.
+    // Rendered at the top of the form; not part of the submitted payload.
+    instructions: z.string().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const normalizedHeaders = new Set<string>();
+    const authHeaderName = data.authHeaderName?.trim();
+
+    if (data.authMethod === "bearer" && authHeaderName) {
+      normalizedHeaders.add(authHeaderName.toLowerCase());
+    }
+
+    for (const [index, header] of (data.additionalHeaders ?? []).entries()) {
+      const normalizedHeaderName = header.headerName.toLowerCase();
+      if (normalizedHeaders.has(normalizedHeaderName)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Header names must be unique",
+          path: ["additionalHeaders", index, "headerName"],
+        });
+        continue;
+      }
+      normalizedHeaders.add(normalizedHeaderName);
+    }
+  })
+  .refine(
+    (data) => {
+      // For remote servers, serverUrl is required
+      if (data.serverType === "remote") {
+        return data.serverUrl && data.serverUrl.length > 0;
+      }
+      return true;
+    },
+    {
+      message: "Server URL is required for remote servers.",
+      path: ["serverUrl"],
+    },
+  )
+  .refine(
+    (data) => {
+      // For local servers with OAuth, oauthServerUrl is required
+      if (
+        data.serverType === "local" &&
+        data.authMethod === "oauth" &&
+        data.oauthConfig
+      ) {
+        return (
+          data.oauthConfig.oauthServerUrl &&
+          data.oauthConfig.oauthServerUrl.length > 0
+        );
+      }
+      return true;
+    },
+    {
+      message:
+        "OAuth Server URL is required for self-hosted servers with OAuth.",
+      path: ["oauthConfig", "oauthServerUrl"],
+    },
+  )
+  .refine(
+    (data) => {
+      // For local servers, at least command or dockerImage is required
+      if (data.serverType === "local") {
+        const hasCommand =
+          data.localConfig?.command &&
+          data.localConfig.command.trim().length > 0;
+        const hasDockerImage =
+          data.localConfig?.dockerImage &&
+          data.localConfig.dockerImage.trim().length > 0;
+        return hasCommand || hasDockerImage;
+      }
+      return true;
+    },
+    {
+      message:
+        "Either command or container image must be provided. If container image is set, command is optional.",
+      path: ["localConfig", "command"],
+    },
+  )
+  .refine(
+    (data) => {
+      if (
+        data.serverType !== "local" ||
+        (data.authMethod !== "enterprise_managed" &&
+          data.authMethod !== "idp_jwt")
+      ) {
+        return true;
+      }
+
+      return data.localConfig?.transportType === "streamable-http";
+    },
+    {
+      message:
+        "Enterprise-managed credentials require streamable-http transport for self-hosted servers.",
+      path: ["localConfig", "transportType"],
+    },
+  )
+  .superRefine((data, ctx) => {
+    if (data.authMethod !== "aws_iam") return;
+    const aws = data.awsIamConfig;
+    const checks: Array<[keyof NonNullable<typeof aws>, RegExp, string]> = [
+      [
+        "roleArn",
+        /^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]{1,512}$/,
+        "Enter an IAM role ARN, such as arn:aws:iam::123456789012:role/agents.",
+      ],
+      [
+        "region",
+        /^[a-z]{2}(-[a-z]+)+-\d{1,2}$/,
+        "Enter an AWS region, such as us-east-1.",
+      ],
+      [
+        "service",
+        /^[a-z0-9-]{1,64}$/,
+        "Enter the SigV4 service name, such as bedrock-agentcore.",
+      ],
+    ];
+    for (const [field, pattern, message] of checks) {
+      if (!pattern.test((aws?.[field] ?? "").trim())) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message,
+          path: ["awsIamConfig", field],
+        });
+      }
+    }
+  })
+  .superRefine((data, ctx) => {
+    if (
+      (data.authMethod === "enterprise_managed" ||
+        data.authMethod === "idp_jwt") &&
+      !data.enterpriseManagedConfig?.identityProviderId
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Identity Provider is required for this authorization mode.",
+        path: ["enterpriseManagedConfig", "identityProviderId"],
+      });
+    }
+  })
+  .superRefine((data, ctx) => {
+    if (data.serverType !== "desktop_mcp" || !data.desktopConfig) return;
+    const message = desktopMcpTargetError(data.desktopConfig);
+    if (message) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: ["desktopConfig", "value"],
+      });
+    }
+  });
+
+export const formSchema = z.preprocess(
+  omitInactiveFields,
+  activeAuthFormSchema,
+);
+
+export type McpCatalogFormValues = z.infer<typeof formSchema>;
+
+// RHF retains unmounted fields so switching back restores the user's draft.
+// Validate and submit only the selected hosting's and method's configuration,
+// without mutating those retained values or suppressing errors in shared
+// fields.
+function omitInactiveFields(value: unknown) {
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  if ("serverType" in value && value.serverType === "desktop_mcp") {
+    return omitConnectionFields(value);
+  }
+  if (!("authMethod" in value)) {
+    return value;
+  }
+
+  const data = { ...value } as Record<string, unknown>;
+  // Only a desktop MCP server has a command for computers.
+  delete data.desktopConfig;
+  if (
+    data.authMethod !== "oauth" &&
+    data.authMethod !== "oauth_client_credentials"
+  ) {
+    delete data.oauthConfig;
+  } else if (
+    data.authMethod === "oauth_client_credentials" &&
+    data.oauthConfig &&
+    typeof data.oauthConfig === "object"
+  ) {
+    const oauthConfig = { ...data.oauthConfig } as Record<string, unknown>;
+    delete oauthConfig.authorizationEndpoint;
+    delete oauthConfig.oauthServerUrl;
+    data.oauthConfig = oauthConfig;
+  }
+  if (data.authMethod !== "bearer") {
+    data.authHeaderName = "";
+  }
+  if (
+    data.authMethod !== "enterprise_managed" &&
+    data.authMethod !== "idp_jwt"
+  ) {
+    delete data.enterpriseManagedConfig;
+  }
+  return data;
+}
+
+// A desktop MCP server runs on each user's own computer: the gateway has no
+// server URL for it, no deployment and no authentication. Whatever the form
+// still holds for those, from a hosting the user chose first, is neither
+// validated nor submitted. Its own `desktopConfig` stays.
+function omitConnectionFields(value: object) {
+  const data = { ...value } as Record<string, unknown>;
+  data.serverUrl = "";
+  data.multitenant = false;
+  data.authMethod = "none";
+  data.authHeaderName = "";
+  data.additionalHeaders = [];
+  delete data.oauthConfig;
+  delete data.enterpriseManagedConfig;
+  delete data.localConfig;
+  delete data.deploymentSpecYaml;
+  delete data.originalDeploymentSpecYaml;
+  return data;
+}

@@ -1,0 +1,259 @@
+export const E2eTestId = {
+  AgentRuntimePicker: "agent-runtime-picker",
+  AgentsTable: "agents-table",
+  CreateAgentButton: "create-agent-button",
+  CreateAgentCloseHowToConnectButton: "create-agent-how-to-connect-button",
+  CloneAgentButton: "clone-agent-button",
+  AgentVersionHistoryButton: "agent-version-history-button",
+  DeleteAgentButton: "delete-agent-button",
+  ToggleDefaultAgentButton: "toggle-default-agent-button",
+  OnboardingNextButton: "onboarding-next-button",
+  OnboardingSkipButton: "onboarding-skip-button",
+  SignInSubmitButton: "sign-in-submit-button",
+  InviteMemberButton: "invite-member-button",
+  InviteEmailInput: "invite-email-input",
+  InviteRoleSelect: "invite-role-select",
+  GenerateInvitationButton: "generate-invitation-button",
+  InvitationLinkInput: "invitation-link-input",
+  InvitationLinkCopyButton: "invitation-link-copy-button",
+  InvitationErrorMessage: "invitation-error-message",
+  SidebarUserProfile: "sidebar-user-profile",
+  ManageCredentialsDialog: "manage-credentials-dialog",
+  ManageCredentialsDialogTable: "manage-credentials-dialog-table",
+  CredentialRow: "credential-row",
+  CredentialOwner: "credential-owner",
+  CredentialTeamSelect: "credential-team-select",
+  ManageCredentialsButton: "manage-credentials-button",
+  ConfigureIdpTeamSyncButton: "configure-idp-team-sync-button",
+  TeamSyncGroupRow: "team-sync-group-row",
+  IdentityProviderCard: "identity-provider-card",
+  IdentityProviderOpenDialogButton: "identity-provider-open-dialog-button",
+  IdentityProviderCreateButton: "identity-provider-create-button",
+  IdentityProviderUpdateButton: "identity-provider-update-button",
+  IdentityProviderDeleteButton: "identity-provider-delete-button",
+  IdentityProviderDialogNavButton: "identity-provider-dialog-nav-button",
+  IdpRoleMappingAccordionTrigger: "idp-role-mapping-accordion-trigger",
+  IdpRoleMappingDefaultRole: "idp-role-mapping-default-role",
+  IdpRoleMappingRuleRole: "idp-role-mapping-rule-role",
+  IdpRoleMappingRuleTemplate: "idp-role-mapping-rule-template",
+  IdpRoleMappingAddRule: "idp-role-mapping-add-rule",
+  McpServerError: "mcp-server-error",
+  McpServerCard: "mcp-server-card",
+  McpServerSettingsButton: "mcp-server-settings-button",
+  McpServerToolsCount: "mcp-server-tools-count",
+  McpToolsDialog: "mcp-tools-dialog",
+  TokenSelect: "token-select",
+  ProfileTokenManagerTeamsSelect: "profile-token-manager-teams-select",
+  ConnectAgentButton: "connect-agent-button",
+  /**
+   * Submit of the create wizard's form step, and of the detail page's own
+   * configuration tabs, which is where an existing record is edited.
+   */
+  AgentSetupSubmitButton: "agent-setup-submit-button",
+  /** "Next step" control of a clean (nothing to save) wizard step. */
+  AgentSetupNextButton: "agent-setup-next-button",
+  /**
+   * Create-wizard step button and detail-page configuration tab, suffixed by
+   * the step/tab id (`-tools`, `-connect`, …).
+   */
+  AgentSetupStep: "agent-setup-step",
+  ConnectCatalogItemButton: "connect-catalog-item-button",
+  SelectCredentialTypePersonal: "select-credential-type-personal",
+  CredentialsCount: "credentials-count",
+  StaticCredentialToUse: "static-credential-to-use",
+  SelectCredentialTypeTeamDropdown: "select-credential-type-team-dropdown",
+  ProfileTeamBadge: "profile-team-badge",
+  EditAgentButton: "edit-agent-button",
+  AgentToolsSection: "agent-tools-section",
+  AgentToolLoadingSection: "agent-tool-loading-section",
+  AgentToolsAddButton: "agent-tools-add-button",
+  AgentKnowledgeSources: "agent-knowledge-sources",
+  AgentKnowledgeSourcePill: "agent-knowledge-source-pill",
+  AgentKnowledgeSourcesCombobox: "agent-knowledge-sources-combobox",
+  AgentToolExclusions: "agent-tool-exclusions",
+  AgentToolAssignments: "agent-tool-assignments",
+  AgentKnowledgeSourceExclusions: "agent-knowledge-source-exclusions",
+  AgentKnowledgeSourceExclusionPill: "agent-knowledge-source-exclusion-pill",
+  AgentKnowledgeSourceExclusionsCombobox:
+    "agent-knowledge-source-exclusions-combobox",
+  AgentToolCatalogPill: "agent-tool-catalog-pill",
+  AssignmentComboboxSearchInput: "assignment-combobox-search-input",
+  AssignmentComboboxOption: "assignment-combobox-option",
+  AssignmentComboboxDisabledOption: "assignment-combobox-disabled-option",
+  RemoveTeamBadge: "remove-team-badge",
+  PromptOnInstallationCheckbox: "prompt-on-installation-checkbox",
+  RevokeCredentialButton: "revoke-credential-button",
+  SelectEnvironmentVariableType: "select-environment-variable-type",
+  SelectEnvironment: "select-environment",
+  AddCatalogItemButton: "add-catalog-item-button",
+  McpServerSettingsConnectionsNavButton:
+    "mcp-server-settings-connections-nav-button",
+  McpServerSettingsConnectionsContent:
+    "mcp-server-settings-connections-content",
+  ManageCredentialsSharedConnectionsSection:
+    "manage-credentials-shared-connections-section",
+  ManageCredentialsSharedConnectionsEmptyState:
+    "manage-credentials-shared-connections-empty-state",
+  ManageCredentialsAddToOrgButton: "manage-credentials-add-to-org-button",
+  ManageCredentialsAddToTeamButton: "manage-credentials-add-to-team-button",
+  ManageCredentialsAddToTeamOption: "manage-credentials-add-to-team-option",
+  ManageCredentialsAddServiceAccountButton:
+    "manage-credentials-add-service-account-button",
+  AddServiceAccountConfirmButton: "add-service-account-confirm-button",
+  ManageServiceAccountsTable: "manage-service-accounts-table",
+  ManageMembersButton: "manage-members-button",
+  // Chat Settings
+  ChatApiKeysTable: "chat-api-keys-table",
+  SubscriptionProviderCards: "subscription-provider-cards",
+  SubscriptionProviderCard: "subscription-provider-card",
+  AddChatApiKeyButton: "add-chat-api-key-button",
+  ChatApiKeyRow: "chat-api-key-row",
+  ChatApiKeyForm: "chat-api-key-form",
+  EditChatApiKeyButton: "edit-chat-api-key-button",
+  DeleteChatApiKeyButton: "delete-chat-api-key-button",
+  SetDefaultChatApiKeyButton: "set-default-chat-api-key-button",
+  ManageProfilesChatApiKeyButton: "manage-profiles-chat-api-key-button",
+  ChatApiKeyDefaultBadge: "chat-api-key-default-badge",
+  SkillsBulkSelectionCount: "skills-bulk-selection-count",
+  SkillDetailSection: "skill-detail-section",
+  BulkAssignChatApiKeysButton: "bulk-assign-chat-api-keys-button",
+  BulkAssignChatApiKeysDialog: "bulk-assign-chat-api-keys-dialog",
+  VirtualKeysPage: "virtual-keys-page",
+  VirtualKeysTable: "virtual-keys-table",
+  AddVirtualKeyButton: "add-virtual-key-button",
+  VirtualKeyCreateDialog: "virtual-key-create-dialog",
+  VirtualKeyDeleteDialog: "virtual-key-delete-dialog",
+  VirtualKeyProviderSelect: "virtual-key-provider-select",
+  ProviderKeyPickerAvailableProvider: "provider-key-picker-available-provider",
+  VirtualKeyValue: "virtual-key-value",
+  // Chat Prompt Input
+  ChatFileUploadButton: "chat-file-upload-button",
+  ChatDisabledFileUploadButton: "chat-disabled-file-upload-button",
+  EncryptedChatNotice: "encrypted-chat-notice",
+  EncryptedChatSetupHint: "encrypted-chat-setup-hint",
+  EncryptedChatToggle: "encrypted-chat-toggle",
+  ChatContextUsageTrigger: "chat-context-usage-trigger",
+  ChatContextUsagePanel: "chat-context-usage-panel",
+  ChatContextUsageTooltip: "chat-context-usage-tooltip",
+  ChatContextCompactButton: "chat-context-compact-button",
+  ChatApiKeySelectorTrigger: "chat-api-key-selector-trigger",
+  ChatApiKeySelectorSearchInput: "chat-api-key-selector-search-input",
+  // Chat Model Selector
+  ChatModelSelectorTrigger: "chat-model-selector-trigger",
+  /** The composer's setup menu (model, agent, and key tabs). */
+  ChatSetupMenu: "chat-setup-menu",
+  ChatPromptTextarea: "chat-prompt-textarea",
+  // Queue of messages composed while a response was in-flight
+  ChatMessageQueue: "chat-message-queue",
+  ChatMessageQueueItem: "chat-message-queue-item",
+  ChatMessageQueueRemoveButton: "chat-message-queue-remove-button",
+  // Chat sidebar item status indicators
+  ChatItemGeneratingIndicator: "chat-item-generating-indicator",
+  ChatItemUnreadIndicator: "chat-item-unread-indicator",
+  QuickstartAddApiKeyButton: "quickstart-add-api-key-button",
+  // First-run "set a default model" onboarding nudge (after the first key)
+  OnboardingDefaultModelOpen: "onboarding-default-model-open",
+  OnboardingDefaultModelSkip: "onboarding-default-model-skip",
+  OnboardingDefaultModelSubmit: "onboarding-default-model-submit",
+  ApiKeysLoadErrorRetry: "api-keys-load-error-retry",
+  // MCP Logs
+  McpLogsDialog: "mcp-logs-dialog",
+  McpLogsContent: "mcp-logs-content",
+  McpLogsError: "mcp-logs-error",
+  McpLogsViewButton: "mcp-logs-view-button",
+  McpLogsEditConfigButton: "mcp-logs-edit-config-button",
+  McpLogsTab: "mcp-logs-tab",
+  McpInspectorNoConnection: "mcp-inspector-no-connection",
+  // Connectivity / offline status bar
+  ConnectivityStatusBar: "connectivity-status-bar",
+  ConnectivityStatusBarRetry: "connectivity-status-bar-retry",
+  // Users settings
+  UsersRoleFilter: "users-role-filter",
+  // Role debugger / impersonation
+  ImpersonationBanner: "impersonation-banner",
+  ImpersonationDebugRoleButton: "impersonation-debug-role-button",
+  ImpersonationStopButton: "impersonation-stop-button",
+  ImpersonationViewAsButton: "impersonation-view-as-button",
+} as const;
+
+export type E2eTestId = (typeof E2eTestId)[keyof typeof E2eTestId];
+
+export function getIdpRoleMappingRuleRowTestId(index: number): string {
+  return `role-mapping-rule-${index}`;
+}
+
+export function getIdentityProviderDialogNavButtonTestId(
+  section: string,
+): string {
+  return `${E2eTestId.IdentityProviderDialogNavButton}-${section}`;
+}
+
+export function getChatApiKeySelectorProviderGroupTestId(
+  provider: string,
+): string {
+  return `chat-api-key-selector-provider-${provider}`;
+}
+
+export function getChatItemGeneratingIndicatorTestId(
+  conversationId: string,
+): string {
+  return `${E2eTestId.ChatItemGeneratingIndicator}-${conversationId}`;
+}
+
+export function getChatItemUnreadIndicatorTestId(
+  conversationId: string,
+): string {
+  return `${E2eTestId.ChatItemUnreadIndicator}-${conversationId}`;
+}
+
+export function getChatModelOptionTestId(modelId: string): string {
+  return `chat-model-option-${modelId}`;
+}
+
+export function getChatApiKeySelectorOptionTestId(keyId: string): string {
+  return `chat-api-key-selector-option-${keyId}`;
+}
+
+export function getVirtualKeyRowTestId(keyName: string): string {
+  return `virtual-key-row-${keyName}`;
+}
+
+export function getDeleteVirtualKeyButtonTestId(keyName: string): string {
+  return `delete-virtual-key-button-${keyName}`;
+}
+
+export function getAgentToolCatalogPillTestId(catalogItemName: string): string {
+  return `${E2eTestId.AgentToolCatalogPill}-${catalogItemName}`;
+}
+
+export function getManageCredentialsButtonTestId(
+  catalogItemName: string,
+): string {
+  return `${E2eTestId.ManageCredentialsButton}-${catalogItemName}`;
+}
+
+export function getAssignmentComboboxSearchInputTestId(
+  comboboxTestId: string,
+): string {
+  return `${E2eTestId.AssignmentComboboxSearchInput}-${comboboxTestId}`;
+}
+
+export function getAssignmentComboboxOptionTestId(
+  comboboxTestId: string,
+  itemName: string,
+): string {
+  return `${E2eTestId.AssignmentComboboxOption}-${comboboxTestId}-${itemName}`;
+}
+
+export function getAssignmentComboboxDisabledOptionTestId(
+  comboboxTestId: string,
+  itemName: string,
+): string {
+  return `${E2eTestId.AssignmentComboboxDisabledOption}-${comboboxTestId}-${itemName}`;
+}
+
+export function getManageCredentialsAddToTeamOptionTestId(
+  teamName: string,
+): string {
+  return `${E2eTestId.ManageCredentialsAddToTeamOption}-${teamName}`;
+}

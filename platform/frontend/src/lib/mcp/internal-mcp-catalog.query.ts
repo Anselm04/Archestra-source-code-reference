@@ -1,0 +1,526 @@
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import {
+  type QueryClient,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
+import { environmentKeys } from "@/lib/environment.query";
+import {
+  catalogItemQueryOptions,
+  mcpRegistryQueryKey,
+} from "@/lib/mcp/mcp-registry.query";
+import { externalMcpSkillsQueryKey } from "@/lib/skills/skill.query";
+import { throwOnApiError } from "@/lib/utils/api";
+
+const {
+  approveCatalogItemImage,
+  createInternalMcpCatalogItem,
+  deleteInternalMcpCatalogItem,
+  getDeploymentYamlPreview,
+  getInternalMcpCatalog,
+  getInternalMcpCatalogCredentialPreflight,
+  getInternalMcpCatalogLabelKeys,
+  getInternalMcpCatalogLabelValues,
+  getInternalMcpCatalogTools,
+  getInternalMcpCatalogToolsBatch,
+  getK8sImagePullSecrets,
+  refreshInternalMcpCatalogImage,
+  reinstallInternalMcpCatalogItem,
+  resetDeploymentYaml,
+  updateInternalMcpCatalogItem,
+  validateDeploymentYaml,
+} = archestraApiSdk;
+
+type InternalMcpCatalogParams = {
+  enabled?: boolean;
+};
+type McpCatalogLabelValuesQuery = NonNullable<
+  archestraApiTypes.GetInternalMcpCatalogLabelValuesData["query"]
+>;
+type UpdateInternalMcpCatalogItemParams =
+  archestraApiTypes.UpdateInternalMcpCatalogItemData["path"] & {
+    data: archestraApiTypes.UpdateInternalMcpCatalogItemData["body"];
+  };
+
+/**
+ * `internal_code` the backend sets when a remote server's URL host is rejected
+ * by its environment's network egress policy. The dialogs use it to show the
+ * message inline on the Server URL field instead of a generic toast. Keep in
+ * sync with the backend constant of the same value.
+ */
+export const REMOTE_SERVER_URL_NOT_ALLOWED_CODE =
+  "remote_server_url_not_allowed";
+
+/**
+ * `internal_code` the backend sets when a name is already used by another
+ * root catalog in the same environment (tool names embed the catalog name,
+ * so duplicates would route tool calls to the wrong server). Shown inline
+ * on the Name field. Keep in sync with the backend constant of the same value.
+ */
+export const CATALOG_NAME_CONFLICT_CODE = "catalog_name_conflict";
+
+/** Read the backend `internal_code` off an error thrown by a catalog mutation. */
+export function getCatalogMutationErrorCode(
+  error: unknown,
+): string | undefined {
+  return (error as { internalCode?: string } | null)?.internalCode;
+}
+
+/** Convert a hey-api `{ error }` body into a thrown Error carrying its code. */
+function catalogMutationError(body: {
+  message: string;
+  internal_code?: string;
+}): Error {
+  const error = new Error(body.message) as Error & { internalCode?: string };
+  error.internalCode = body.internal_code;
+  return error;
+}
+
+/**
+ * `includeApps` adds App backing catalogs (whose launch tool is assignable from
+ * the gateway capabilities picker) to the result. Apps stay out of the registry,
+ * so registry surfaces omit it. The backend only honors it for callers with
+ * `app:read`, so a caller without that permission silently gets the app-free list.
+ */
+export function useInternalMcpCatalog(
+  params?: InternalMcpCatalogParams & { includeApps?: boolean },
+) {
+  const includeApps = params?.includeApps ?? false;
+  return useQuery({
+    queryKey: includeApps ? ["mcp-catalog", "with-apps"] : ["mcp-catalog"],
+    queryFn: async () => {
+      const { data, error } = await getInternalMcpCatalog(
+        includeApps ? { query: { includeApps } } : {},
+      );
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    enabled: params?.enabled,
+  });
+}
+
+/**
+ * The saved credentials that would stop the caller installing a catalog item
+ * at this scope, so the install dialog can explain before they press Install.
+ */
+export function useMcpCatalogCredentialPreflight(params: {
+  catalogId: string | undefined;
+  scope: "personal" | "team" | "org";
+  enabled?: boolean;
+}) {
+  const { catalogId, scope } = params;
+  return useQuery({
+    queryKey: ["mcp-catalog", catalogId, "credential-preflight", scope],
+    enabled: !!catalogId && (params.enabled ?? true),
+    refetchOnMount: "always",
+    queryFn: async () => {
+      const { data, error } = await getInternalMcpCatalogCredentialPreflight({
+        path: { id: catalogId ?? "" },
+        query: { scope },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data?.blockers ?? [];
+    },
+  });
+}
+
+export function useMcpCatalogLabelKeys() {
+  return useQuery({
+    queryKey: ["mcp-catalog", "labels", "keys"],
+    queryFn: async () => {
+      const { data, error } = await getInternalMcpCatalogLabelKeys();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+  });
+}
+
+export function useMcpCatalogLabelValues(
+  params?: Partial<McpCatalogLabelValuesQuery>,
+) {
+  const { key } = params || {};
+  return useQuery({
+    queryKey: ["mcp-catalog", "labels", "values", key],
+    queryFn: async () => {
+      const { data, error } = await getInternalMcpCatalogLabelValues({
+        query: key ? { key } : {},
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    enabled: !!key,
+  });
+}
+
+export function useCreateInternalMcpCatalogItem() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (
+      data: archestraApiTypes.CreateInternalMcpCatalogItemData["body"],
+    ) => {
+      const { data: created, error } = await createInternalMcpCatalogItem({
+        body: data,
+      });
+      if (error) throw catalogMutationError(error.error);
+      return created;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+    },
+    onError: (error) => {
+      // The network-policy error is shown inline on the Server URL field, and
+      // a taken name on the Name field; everything else falls back to a toast.
+      const code = getCatalogMutationErrorCode(error);
+      if (
+        code === REMOTE_SERVER_URL_NOT_ALLOWED_CODE ||
+        code === CATALOG_NAME_CONFLICT_CODE
+      ) {
+        return;
+      }
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to create catalog item",
+      );
+    },
+  });
+}
+
+export function useApproveCatalogItemImage() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { data, error } = await approveCatalogItemImage({ path: { id } });
+      throwOnApiError(error);
+      return data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      toast.success("Image approved");
+    },
+    onError: (error) => {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to approve image",
+      );
+    },
+  });
+}
+
+export function useUpdateInternalMcpCatalogItem() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, data }: UpdateInternalMcpCatalogItemParams) => {
+      const { data: updated, error } = await updateInternalMcpCatalogItem({
+        path: { id },
+        body: data,
+      });
+      if (error) throw catalogMutationError(error.error);
+      return updated;
+    },
+    onSuccess: (updated, { id, data }) => {
+      if (updated && data.oauthConfig !== undefined) {
+        // The setup wizard may advance before the item refetch completes.
+        // Use the saved OAuth settings, leaving list-only metadata untouched.
+        const { queryKey } = catalogItemQueryOptions(id);
+        queryClient.setQueryData<
+          archestraApiTypes.GetInternalMcpCatalogItemResponses["200"] | null
+        >(
+          queryKey,
+          (item) =>
+            item && {
+              ...item,
+              oauthConfig: updated.oauthConfig,
+              clientSecretId: updated.clientSecretId,
+              awsIamConfig: updated.awsIamConfig,
+              enterpriseManagedConfig: updated.enterpriseManagedConfig,
+            },
+        );
+      }
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: externalMcpSkillsQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["chat", "agents"] });
+      queryClient.invalidateQueries({ queryKey: environmentKeys.list() });
+      // A rename re-slugs tool names without any reinstall, so the unified
+      // /tools page caches go stale on catalog updates too.
+      queryClient.invalidateQueries({ queryKey: ["tools"] });
+      queryClient.invalidateQueries({ queryKey: ["tools-with-assignments"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-tools"] });
+    },
+    onError: (error) => {
+      // The network-policy error is shown inline on the Server URL field and
+      // the rename conflict inline on the Name field by the dialog; everything
+      // else falls back to a toast.
+      const code = getCatalogMutationErrorCode(error);
+      if (
+        code === REMOTE_SERVER_URL_NOT_ALLOWED_CODE ||
+        code === CATALOG_NAME_CONFLICT_CODE
+      ) {
+        return;
+      }
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to update catalog item",
+      );
+    },
+  });
+}
+
+/**
+ * Reinstall the shared K8s Deployment for a multi-tenant local catalog.
+ * Recreates the pod with the current catalog spec and cascades tool sync
+ * to every install attached to the catalog. Only callable when
+ * `catalog.catalogReinstallRequired === true`.
+ */
+export function useReinstallInternalMcpCatalogItem() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await reinstallInternalMcpCatalogItem({
+        path: { id },
+      });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: externalMcpSkillsQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["chat", "agents"] });
+      toast.success("Catalog reinstalled successfully");
+    },
+    onError: (error) => {
+      console.error("Catalog reinstall error:", error);
+      toast.error("Failed to reinstall catalog");
+    },
+  });
+}
+
+export function useRefreshInternalMcpCatalogImage() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await refreshInternalMcpCatalogImage({
+        path: { id },
+      });
+      return response.data;
+    },
+    onMutate: () => {
+      toast.info("Starting pod restart");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+      queryClient.invalidateQueries({ queryKey: ["chat", "agents"] });
+    },
+    onError: (error) => {
+      console.error("Pod restart error:", error);
+      toast.error("Failed to start pod restart");
+    },
+  });
+}
+
+export function useDeleteInternalMcpCatalogItem() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await deleteInternalMcpCatalogItem({ path: { id } });
+      throwOnApiError(response.error, { toastOnError: false });
+      return response.data;
+    },
+    onSuccess: (_data, catalogId) => {
+      removeExternalMcpSkillsForCatalog(queryClient, catalogId);
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+      queryClient.invalidateQueries({ queryKey: externalMcpSkillsQueryKey });
+      toast.success("Catalog item deleted successfully");
+    },
+    onError: (error) => {
+      console.error("Delete error:", error);
+      toast.error("Failed to delete catalog item");
+    },
+  });
+}
+
+export type CatalogTool = Pick<
+  archestraApiTypes.GetInternalMcpCatalogToolsResponses["200"][number],
+  "id" | "name" | "description" | "createdAt" | "group"
+>;
+
+/** One `{ id, name, catalogId }` row from the batched catalog-tools route. */
+export type CatalogToolReference =
+  archestraApiTypes.GetInternalMcpCatalogToolsBatchResponses["200"][number];
+
+/**
+ * Under the `["mcp-catalog", ...]` prefix so every existing catalog
+ * invalidation (install, reinstall, rename, delete — all of which can change
+ * the discovered tool set) sweeps it, exactly as it already sweeps the
+ * per-catalog `["mcp-catalog", id, "tools"]` entries.
+ */
+export const catalogToolsBatchQueryKey = ["mcp-catalog", "tools"] as const;
+
+/**
+ * Fetch tools for a catalog item by catalog ID (raw function for use with useQueries).
+ */
+export async function fetchCatalogTools(
+  catalogId: string,
+): Promise<CatalogTool[]> {
+  try {
+    const response = await getInternalMcpCatalogTools({
+      path: { id: catalogId },
+      query: { view: "picker" },
+    });
+    return response.data ?? [];
+  } catch (error) {
+    console.error("Failed to fetch catalog tools:", error);
+    return [];
+  }
+}
+
+/**
+ * Every catalog item's tool ids/names in a single request, grouped by catalog.
+ *
+ * The tool pickers need to know which tools belong to which server across the
+ * whole registry — to count them, to group saved selections into per-server
+ * pills, and to resolve "exclude this whole server" into tool ids. Asking
+ * {@link useCatalogTools} for each catalog instead meant one request per
+ * catalog item on mount, each carrying full tool rows with their assigned-agent
+ * lists; on a registry of any size that fan-out saturated the browser's
+ * connection pool and delayed the very catalog-list request the picker's
+ * "Loading tools..." state is waiting on. This route returns just
+ * `{ id, name, catalogId }`, once.
+ */
+export function useAllCatalogTools(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: catalogToolsBatchQueryKey,
+    queryFn: async () => {
+      const { data, error } = await getInternalMcpCatalogToolsBatch();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    enabled: options?.enabled,
+  });
+}
+
+/**
+ * Grouped by catalog id, preserving the response order within each catalog.
+ */
+export function groupCatalogTools(
+  tools: readonly CatalogToolReference[] | undefined,
+): Map<string, CatalogToolReference[]> {
+  const byCatalog = new Map<string, CatalogToolReference[]>();
+  for (const tool of tools ?? []) {
+    const existing = byCatalog.get(tool.catalogId);
+    if (existing) existing.push(tool);
+    else byCatalog.set(tool.catalogId, [tool]);
+  }
+  return byCatalog;
+}
+
+/**
+ * Fetch tools for a catalog item by catalog ID.
+ * Used for builtin servers (like Archestra) that don't have a traditional MCP server installation.
+ */
+export function useCatalogTools(catalogId: string | null) {
+  return useQuery({
+    queryKey: ["mcp-catalog", catalogId, "tools", "picker"],
+    queryFn: async () => {
+      if (!catalogId) return [];
+      return fetchCatalogTools(catalogId);
+    },
+    enabled: !!catalogId,
+  });
+}
+
+/**
+ * Fetch deployment YAML template preview for a catalog item.
+ */
+export function useGetDeploymentYamlPreview(catalogId: string | null) {
+  return useQuery({
+    queryKey: ["mcp-catalog", catalogId, "deployment-yaml-preview"],
+    queryFn: async () => {
+      if (!catalogId) return null;
+      const { data, error } = await getDeploymentYamlPreview({
+        path: { id: catalogId },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data;
+    },
+    enabled: !!catalogId,
+  });
+}
+
+/**
+ * Validate deployment YAML template.
+ */
+export function useValidateDeploymentYaml() {
+  return useMutation({
+    mutationFn: async (
+      params: NonNullable<archestraApiTypes.ValidateDeploymentYamlData["body"]>,
+    ) => {
+      const response = await validateDeploymentYaml({ body: params });
+      return response.data;
+    },
+  });
+}
+
+/**
+ * Reset deployment YAML to default by clearing the custom YAML from the database.
+ * Returns the freshly generated default YAML.
+ */
+export function useResetDeploymentYaml() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (catalogId: string) => {
+      const response = await resetDeploymentYaml({ path: { id: catalogId } });
+      return response.data;
+    },
+    onSuccess: (_data, catalogId) => {
+      // Invalidate the main catalog query to refresh the form data
+      queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
+      queryClient.invalidateQueries({ queryKey: mcpRegistryQueryKey });
+      // Invalidate the preview query
+      queryClient.invalidateQueries({
+        queryKey: ["mcp-catalog", catalogId, "deployment-yaml-preview"],
+      });
+      toast.success("Deployment YAML reset to default");
+    },
+    onError: (error) => {
+      console.error("Reset deployment YAML error:", error);
+      toast.error("Failed to reset deployment YAML");
+    },
+  });
+}
+
+/**
+ * Fetch Kubernetes docker-registry secrets available for imagePullSecrets.
+ */
+export function useK8sImagePullSecrets() {
+  return useQuery({
+    queryKey: ["k8s-image-pull-secrets"],
+    queryFn: async () => {
+      const { data, error } = await getK8sImagePullSecrets();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+  });
+}
+
+function removeExternalMcpSkillsForCatalog(
+  queryClient: QueryClient,
+  catalogId: string,
+) {
+  queryClient.setQueriesData<
+    archestraApiTypes.GetExternalMcpSkillsResponses["200"]
+  >({ queryKey: externalMcpSkillsQueryKey }, (skills) =>
+    skills?.filter((skill) => skill.catalogId !== catalogId),
+  );
+}

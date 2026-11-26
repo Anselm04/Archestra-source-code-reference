@@ -1,0 +1,598 @@
+import { randomUUID } from "node:crypto";
+import type { SupportedProvider } from "@archestra/shared";
+import type {
+  ChunkProcessingResult,
+  CommonToolCall,
+  LLMProvider,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  OpenAi,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import {
+  chatCompletionToResponses,
+  type OpenaiResponsesContext,
+  responsesEndingFromFinishReason,
+} from "./openai-responses-translator";
+import {
+  carriesResponsesTerminal,
+  formatResponsesStreamErrorFrame,
+} from "./responses-stream-error-frame";
+import {
+  formatResponsesFunctionCallFrames,
+  RESPONSES_STREAM_END,
+  toSse,
+} from "./responses-tool-call-rewrite";
+import { toResponsesUsage } from "./responses-usage";
+
+type OpenAiResponse = OpenAi.Types.ChatCompletionsResponse;
+
+// The wrapped adapter keeps its own provider's stop reason, so a finished
+// answer reads "stop" from Chat Completions, "end_turn" or "stop_sequence"
+// from Claude (Anthropic, Bedrock), "STOP" from Gemini and "COMPLETE" or
+// "STOP_SEQUENCE" from Cohere.
+const COMPLETED_STOP_REASONS = new Set([
+  "stop",
+  "end_turn",
+  "stop_sequence",
+  "STOP",
+  "COMPLETE",
+  "STOP_SEQUENCE",
+]);
+
+class ResponsesFromChatAdapter<TResponse>
+  implements LLMResponseAdapter<TResponse>
+{
+  readonly provider: SupportedProvider;
+  private inner: LLMResponseAdapter<TResponse>;
+  // The inner logged-domain response after a policy change. For nested
+  // translators this stays provider-native, not OpenAI Chat or Responses.
+  private modifiedInner: TResponse | null = null;
+  private ctx: OpenaiResponsesContext;
+
+  constructor(
+    inner: LLMResponseAdapter<TResponse>,
+    ctx: OpenaiResponsesContext,
+  ) {
+    this.inner = inner;
+    this.ctx = ctx;
+    this.provider = inner.provider;
+  }
+
+  getId(): string {
+    return this.ctx.responseId;
+  }
+
+  getModel(): string {
+    return this.ctx.requestedModel;
+  }
+
+  getText(): string {
+    return this.inner.getText();
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    return this.inner.getToolCalls();
+  }
+
+  hasToolCalls(): boolean {
+    return this.inner.hasToolCalls();
+  }
+
+  getUsage(): UsageView {
+    return this.inner.getUsage();
+  }
+
+  getOriginalResponse(): TResponse {
+    return chatCompletionToResponses(
+      this.inner.getOriginalResponse() as unknown as OpenAiResponse,
+      this.ctx,
+    ) as unknown as TResponse;
+  }
+
+  getLoggedResponse(): TResponse {
+    if (this.modifiedInner !== null) {
+      return this.modifiedInner;
+    }
+    return this.inner.getLoggedResponse
+      ? this.inner.getLoggedResponse()
+      : this.inner.getOriginalResponse();
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{
+      id: string;
+      name: string;
+      arguments: string;
+      wireId?: string;
+    }>,
+  ): TResponse {
+    const inner =
+      this.inner.withRewrittenToolCalls?.(toolCalls) ??
+      this.inner.getOriginalResponse();
+    this.modifiedInner = this.inner.getLoggedResponse?.() ?? inner;
+    return chatCompletionToResponses(
+      inner as unknown as OpenAiResponse,
+      this.ctx,
+    ) as unknown as TResponse;
+  }
+
+  getFinishReasons(): string[] {
+    return this.inner.getFinishReasons();
+  }
+
+  toRefusalResponse(refusalMessage: string, contentMessage: string): TResponse {
+    const refusal = this.inner.toRefusalResponse(
+      refusalMessage,
+      contentMessage,
+    );
+    this.modifiedInner = this.inner.getLoggedResponse?.() ?? refusal;
+    return chatCompletionToResponses(
+      refusal as unknown as OpenAiResponse,
+      this.ctx,
+    ) as unknown as TResponse;
+  }
+
+  withReplacedText(text: string): TResponse {
+    if (!this.inner.withReplacedText) {
+      throw new Error("Wrapped response adapter cannot replace response text");
+    }
+    const inner = this.inner.withReplacedText(text);
+    this.modifiedInner = this.inner.getLoggedResponse?.() ?? inner;
+    return chatCompletionToResponses(
+      inner as unknown as OpenAiResponse,
+      this.ctx,
+    ) as unknown as TResponse;
+  }
+}
+
+class ResponsesFromChatStreamAdapter<TChunk, TResponse>
+  implements LLMStreamAdapter<TChunk, TResponse>
+{
+  readonly provider: SupportedProvider;
+  private inner: LLMStreamAdapter<TChunk, TResponse>;
+  private ctx: OpenaiResponsesContext;
+  private outputStarted = false;
+  private outputCompleted = false;
+  private sequenceNumber = 0;
+  private readonly itemId = `msg_${randomUUID()}`;
+  private getTextSuffix: ((completedText: string) => string) | null = null;
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal, so the terminal response.completed (and the persisted response)
+  // carry only the refusal message — not the original text or the blocked tool
+  // calls the model had emitted.
+  private replacedText: string | null = null;
+
+  constructor(
+    inner: LLMStreamAdapter<TChunk, TResponse>,
+    ctx: OpenaiResponsesContext,
+  ) {
+    this.inner = inner;
+    this.ctx = ctx;
+    this.provider = inner.provider;
+  }
+
+  get state() {
+    return this.inner.state;
+  }
+
+  get clientResponse() {
+    return { id: this.ctx.responseId, model: this.ctx.requestedModel };
+  }
+
+  setTextSuffix(getSuffix: (completedText: string) => string): void {
+    this.getTextSuffix = getSuffix;
+  }
+
+  processChunk(chunk: TChunk): ChunkProcessingResult {
+    const previousText = this.state.text;
+    const result = this.inner.processChunk(chunk);
+
+    if (result.error) {
+      return result;
+    }
+
+    if (result.isToolCallChunk) {
+      return {
+        ...result,
+        sseData: null,
+      };
+    }
+
+    const textDelta = this.state.text.slice(previousText.length);
+    let sseData = "";
+    if (textDelta) {
+      sseData += this.ensureOutputStarted();
+      sseData += toSse({
+        type: "response.output_text.delta",
+        item_id: this.itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        delta: textDelta,
+        logprobs: [],
+      });
+    }
+
+    return {
+      ...result,
+      sseData: sseData || null,
+    };
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    };
+  }
+
+  formatTextDeltaSSE(text: string): string {
+    return [
+      this.ensureOutputStarted(),
+      toSse({
+        type: "response.output_text.delta",
+        item_id: this.itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        delta: text,
+        logprobs: [],
+      }),
+    ].join("");
+  }
+
+  getRawToolCallEvents(): string[] {
+    return this.withWireIds(this.state.toolCalls).flatMap((toolCall, index) => {
+      const itemId = `fc_${toolCall.id}`;
+      const item = {
+        id: itemId,
+        call_id: toolCall.wireId ?? toolCall.id,
+        type: "function_call",
+        name: toolCall.name,
+        arguments: toolCall.arguments,
+        status: "completed",
+      };
+
+      return [
+        toSse({
+          type: "response.output_item.added",
+          output_index: index,
+          sequence_number: this.nextSequenceNumber(),
+          item,
+        }),
+        toSse({
+          type: "response.function_call_arguments.done",
+          item_id: itemId,
+          output_index: index,
+          sequence_number: this.nextSequenceNumber(),
+          arguments: toolCall.arguments,
+          name: toolCall.name,
+        }),
+        toSse({
+          type: "response.output_item.done",
+          output_index: index,
+          sequence_number: this.nextSequenceNumber(),
+          item,
+        }),
+      ];
+    });
+  }
+
+  formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
+    this.inner.formatCompleteTextSSE(text);
+    return [
+      this.ensureOutputStarted(),
+      toSse({
+        type: "response.output_text.delta",
+        item_id: this.itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        delta: text,
+        logprobs: [],
+      }),
+      this.completeOutput(text),
+    ];
+  }
+
+  prepareResponseReplacement(): void {
+    this.inner.prepareResponseReplacement?.();
+    this.outputStarted = false;
+    this.outputCompleted = false;
+    this.sequenceNumber = 0;
+    this.replacedText = null;
+  }
+
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    this.inner.formatToolCallsSSE?.(toolCalls);
+    const frames = formatResponsesFunctionCallFrames({
+      toolCalls: this.withWireIds(toolCalls),
+      firstOutputIndex: 1,
+      nextSequenceNumber: () => this.nextSequenceNumber(),
+    });
+    frames.push(
+      toSse({
+        type: this.terminalEventType(),
+        sequence_number: this.nextSequenceNumber(),
+        response: {
+          ...this.buildResponsesResponse(toolCalls),
+          usage: this.getResponsesUsage(),
+        },
+      }),
+    );
+    this.outputCompleted = true;
+    return frames;
+  }
+
+  // The handler calls this after the policy verdict, so blocked calls never
+  // appear in a terminal envelope and each response completes exactly once.
+  formatEndSSE(): string {
+    if (this.outputCompleted) {
+      return RESPONSES_STREAM_END;
+    }
+    const footer =
+      this.replacedText === null &&
+      this.state.toolCalls.length === 0 &&
+      COMPLETED_STOP_REASONS.has(this.state.stopReason ?? "") &&
+      this.state.text
+        ? (this.getTextSuffix?.(this.state.text) ?? "")
+        : "";
+    // The footer's mark spans two lines, so it starts on its own after a blank
+    // line, as the providers that place it first keep it apart from the answer.
+    const suffix = footer ? `\n\n${footer}` : "";
+    const text = `${this.state.text}${suffix}`;
+    const suffixDelta = suffix ? this.formatTextDeltaSSE(suffix) : "";
+    return `${suffixDelta}${this.completeOutput(text)}${RESPONSES_STREAM_END}`;
+  }
+
+  toProviderResponse(): TResponse {
+    // Logging and policy hooks consume the provider-native response. The
+    // client-facing Responses envelope is built by the SSE methods above.
+    return this.inner.toProviderResponse();
+  }
+
+  private ensureOutputStarted(): string {
+    if (this.outputStarted) {
+      return "";
+    }
+
+    this.outputStarted = true;
+    return [
+      toSse({
+        type: "response.created",
+        sequence_number: this.nextSequenceNumber(),
+        response: {
+          id: this.ctx.responseId,
+          object: "response",
+          created_at: this.ctx.createdUnix,
+          model: this.ctx.requestedModel,
+          status: "in_progress",
+          output: [],
+        },
+      }),
+      toSse({
+        type: "response.output_item.added",
+        output_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        item: {
+          id: this.itemId,
+          type: "message",
+          role: "assistant",
+          status: "in_progress",
+          content: [],
+        },
+      }),
+      toSse({
+        type: "response.content_part.added",
+        item_id: this.itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        part: {
+          type: "output_text",
+          text: "",
+          annotations: [],
+        },
+      }),
+    ].join("");
+  }
+
+  private completeOutput(textOverride?: string): string {
+    if (this.outputCompleted) {
+      return "";
+    }
+
+    this.outputCompleted = true;
+    const text = textOverride ?? this.state.text;
+    return [
+      this.outputStarted ? "" : this.ensureOutputStarted(),
+      toSse({
+        type: "response.output_text.done",
+        item_id: this.itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        text,
+        logprobs: [],
+      }),
+      toSse({
+        type: "response.content_part.done",
+        item_id: this.itemId,
+        output_index: 0,
+        content_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        part: {
+          type: "output_text",
+          text,
+          annotations: [],
+        },
+      }),
+      toSse({
+        type: "response.output_item.done",
+        output_index: 0,
+        sequence_number: this.nextSequenceNumber(),
+        item: {
+          id: this.itemId,
+          type: "message",
+          role: "assistant",
+          status: this.ending().status,
+          content: [
+            {
+              type: "output_text",
+              text,
+              annotations: [],
+            },
+          ],
+        },
+      }),
+      toSse({
+        type: this.terminalEventType(),
+        sequence_number: this.nextSequenceNumber(),
+        // The builder omits usage entirely for an unobserved turn, which is
+        // fine for the non-streaming body but not here: a terminal frame
+        // without numeric usage is silently dropped by the Responses parser.
+        response: {
+          ...this.buildResponsesResponse(undefined, text),
+          usage: this.getResponsesUsage(),
+        },
+      }),
+    ].join("");
+  }
+
+  private buildResponsesResponse(
+    toolCallsOverride?: StreamAccumulatorState["toolCalls"],
+    messageTextOverride?: string,
+  ) {
+    const output = [];
+
+    // On a refusal the blocked tool calls are dropped and the refusal message
+    // is the only output — never the original text the model streamed.
+    const messageText =
+      messageTextOverride ?? this.replacedText ?? this.state.text;
+    if (messageText) {
+      output.push({
+        id: this.itemId,
+        type: "message",
+        role: "assistant",
+        status: this.ending().status,
+        content: [
+          {
+            type: "output_text",
+            text: messageText,
+            annotations: [],
+          },
+        ],
+      });
+    }
+
+    if (this.replacedText === null) {
+      output.push(
+        ...this.withWireIds(toolCallsOverride ?? this.state.toolCalls).map(
+          (toolCall) => ({
+            id: toolCall.id,
+            call_id: toolCall.wireId ?? toolCall.id,
+            type: "function_call",
+            name: toolCall.name,
+            arguments: toolCall.arguments,
+            status: "completed",
+          }),
+        ),
+      );
+    }
+
+    return {
+      id: this.ctx.responseId,
+      object: "response",
+      created_at: this.ctx.createdUnix,
+      model: this.ctx.requestedModel,
+      ...this.ending(),
+      output,
+      usage: this.state.usage ? this.getResponsesUsage() : undefined,
+    };
+  }
+
+  // A turn the model did not finish (token budget, content filter) ends as
+  // `incomplete`, as the non-streamed translation does. A policy refusal that
+  // replaced the response is a finished answer.
+  private ending() {
+    return responsesEndingFromFinishReason(
+      this.replacedText !== null
+        ? "stop"
+        : (this.inner.getOpenAiFinishReason?.() ?? this.state.stopReason),
+    );
+  }
+
+  private terminalEventType() {
+    return this.ending().status === "incomplete"
+      ? "response.incomplete"
+      : "response.completed";
+  }
+
+  private getResponsesUsage() {
+    // Every adapter reports outputTokens with reasoning included, as
+    // Responses' output_tokens does.
+    return toResponsesUsage(this.state.usage);
+  }
+
+  private nextSequenceNumber(): number {
+    this.sequenceNumber += 1;
+    return this.sequenceNumber;
+  }
+
+  // The client echoes `call_id` on its next request. When the wrapped adapter
+  // packs more into that id (Gemini's thought signature), it wraps the id the
+  // client would echo anyway, so an OpenAPPA stamp survives inside it.
+  private withWireIds<
+    TToolCall extends { id: string; name: string; wireId?: string },
+  >(toolCalls: TToolCall[]): TToolCall[] {
+    if (!this.inner.wireToolCallId) {
+      return toolCalls;
+    }
+    return toolCalls.map((toolCall, index) => ({
+      ...toolCall,
+      wireId: this.inner.wireToolCallId?.({
+        toolCall: { id: toolCall.wireId ?? toolCall.id, name: toolCall.name },
+        index,
+      }),
+    }));
+  }
+}
+
+export function makeResponsesFromChatAdapterFactory<
+  TRequest,
+  TResponse,
+  TMessages,
+  TChunk,
+  THeaders,
+>(
+  provider: LLMProvider<TRequest, TResponse, TMessages, TChunk, THeaders>,
+  ctx: OpenaiResponsesContext,
+): LLMProvider<TRequest, TResponse, TMessages, TChunk, THeaders> {
+  return {
+    ...provider,
+    // The wrapped provider speaks chat completions, but this surface emits a
+    // Responses stream — so its mid-stream error frame has to be Responses-
+    // shaped too, or the client parses it as an unknown chunk and the failure
+    // reaches the user as a blank turn.
+    formatStreamErrorFrame: formatResponsesStreamErrorFrame,
+    carriesStreamTerminal: carriesResponsesTerminal,
+    createResponseAdapter(response) {
+      return new ResponsesFromChatAdapter(
+        provider.createResponseAdapter(response),
+        ctx,
+      );
+    },
+    createStreamAdapter(
+      ...args: Parameters<typeof provider.createStreamAdapter>
+    ) {
+      return new ResponsesFromChatStreamAdapter(
+        provider.createStreamAdapter(...args),
+        ctx,
+      );
+    },
+  };
+}

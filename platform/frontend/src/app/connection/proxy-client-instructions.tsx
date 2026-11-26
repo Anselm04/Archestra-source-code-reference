@@ -1,0 +1,1149 @@
+"use client";
+
+import {
+  type ChatProvider,
+  DEFAULT_LLM_PROXY_NAME,
+  EXTERNAL_AGENT_ID_HEADER,
+  isModelRouterSupportedProvider,
+  isSupportedProvider,
+  providerDisplayNames,
+  providerSupportsChat,
+  type SupportedProvider,
+  VIRTUAL_KEY_HEADER,
+} from "@archestra/shared";
+import { AlertTriangle, Check, Copy, Loader2 } from "lucide-react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ConnectionCreditWarning,
+  CreditWarningNotice,
+} from "@/components/connection/credit-warning-notice";
+import { CopyableCode } from "@/components/copyable-code";
+import { CreateLlmProviderApiKeyDialog } from "@/components/create-llm-provider-api-key-dialog";
+import { PROVIDER_CONFIG } from "@/components/llm-provider-api-key-form";
+import { LlmProviderSelectItems } from "@/components/llm-provider-select-items";
+import {
+  TerminalCard,
+  terminalActionClass,
+  terminalCodeClass,
+  terminalLabelClass,
+} from "@/components/terminal-surface";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { copyToClipboard } from "@/lib/clipboard";
+import {
+  useCreateConnectionPassthroughKey,
+  useCreateConnectionVirtualKey,
+} from "@/lib/connection-setup.query";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import { useModelProviderCatalog } from "@/lib/integration-overrides";
+import { useAvailableLlmProviderApiKeys } from "@/lib/llm-provider-api-keys.query";
+import { cn } from "@/lib/utils/tailwind";
+import type { ConnectClient, ProxyStep } from "./clients";
+import { UnsupportedPanel } from "./mcp-client-instructions";
+import { TerminalBlock } from "./terminal-block";
+import { useUpdateUrlParams } from "./use-update-url-params";
+
+/** Original upstream base URLs — shown struck through next to the proxy URL. */
+export const PROVIDER_ORIGINAL_URLS: Record<ChatProvider, string> = {
+  openai: "https://api.openai.com/v1/",
+  anthropic: "https://api.anthropic.com/v1/",
+  gemini: "https://generativelanguage.googleapis.com/",
+  bedrock: "https://bedrock-runtime.<region>.amazonaws.com/",
+  azure: "https://<resource>.openai.azure.com/",
+  groq: "https://api.groq.com/openai/v1/",
+  cerebras: "https://api.cerebras.ai/v1/",
+  openrouter: "https://openrouter.ai/api/v1/",
+  ollama: "http://localhost:11434/v1/",
+  "ollama-native": "http://localhost:11434/",
+  vllm: "http://<host>:8000/v1/",
+  cohere: "https://api.cohere.com/v2/",
+  mistral: "https://api.mistral.ai/v1/",
+  perplexity: "https://api.perplexity.ai/",
+  xai: "https://api.x.ai/v1/",
+  deepseek: "https://api.deepseek.com/",
+  minimax: "https://api.minimax.io/v1/",
+  kimi: "https://api.moonshot.ai/v1/",
+  "kimi-code": "https://api.kimi.ai/coding/v1/",
+  zhipuai: "https://open.bigmodel.cn/api/",
+  "github-copilot": "https://api.githubcopilot.com/",
+  "microsoft-365-copilot": "https://graph.microsoft.com/beta/",
+  archestra: "https://<archestra-host>/v1/unified-model/",
+};
+
+interface ProxyClientInstructionsProps {
+  client: ConnectClient;
+  /** The LLM Proxy id — used in connection-setup POST payloads, not URLs. */
+  profileId: string;
+  /** When null/undefined: show all providers. Otherwise: only these. */
+  shownProviders?: readonly SupportedProvider[] | null;
+  /** Connection base URL chosen at the page level (see ConnectionUrlStep). */
+  baseUrl: string;
+}
+
+/**
+ * Every provider this page can instruct a client to connect to. Embeddings-only
+ * providers are excluded: the whole page is about pointing a chat client at the
+ * proxy, and they serve no chat endpoint to point at.
+ */
+const ALL_PROVIDERS = (
+  Object.keys(providerDisplayNames) as SupportedProvider[]
+).filter(providerSupportsChat);
+
+/**
+ * providerId URL value for the Unified Model API tile. Not a real provider —
+ * isSupportedProvider() rejects it, so every other providerId consumer
+ * (script/config clients, deep links) safely treats it as "none selected".
+ */
+const MODEL_ROUTER_TILE = "model-router";
+
+/**
+ * Slugify the LLM proxy name into a TOML-friendly identifier (e.g. used as
+ * `[model_providers.<slug>]` in Codex's config).
+ */
+function toProxyProviderSlug(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return slug || "archestra";
+}
+
+export function ProxyClientInstructions({
+  client,
+  profileId,
+  shownProviders,
+  baseUrl,
+}: ProxyClientInstructionsProps) {
+  const appName = useAppName();
+  const providerCatalog = useModelProviderCatalog();
+  const shownSet = useMemo(
+    () => (shownProviders ? new Set(shownProviders) : null),
+    [shownProviders],
+  );
+  const isShown = useCallback(
+    (p: ChatProvider) => !shownSet || shownSet.has(p),
+    [shownSet],
+  );
+
+  const searchParams = useSearchParams();
+  const urlProvider = searchParams.get("providerId");
+  const updateUrlParams = useUpdateUrlParams();
+  const updateProviderInUrl = useCallback(
+    (value: string | null) => updateUrlParams({ providerId: value }),
+    [updateUrlParams],
+  );
+
+  const rawSupportedProviders = useMemo(
+    () =>
+      client.proxy.kind === "custom"
+        ? client.proxy.supportedProviders
+        : client.proxy.kind === "generic"
+          ? ALL_PROVIDERS
+          : [],
+    [client.proxy],
+  );
+  // A custom client may name providers straight from its own config, so the
+  // embeddings-only filter is reapplied here rather than trusted upstream.
+  const supportedProviders = useMemo(
+    () => rawSupportedProviders.filter(providerSupportsChat).filter(isShown),
+    [rawSupportedProviders, isShown],
+  );
+  const visibleAllProviders = useMemo(
+    () => ALL_PROVIDERS.filter(isShown),
+    [isShown],
+  );
+
+  // Drive selection off the URL so client switches (which clear providerId in
+  // the URL) immediately reset the picker without stale local state.
+  const selectedProvider: ChatProvider | null =
+    urlProvider &&
+    isSupportedProvider(urlProvider) &&
+    providerSupportsChat(urlProvider) &&
+    isShown(urlProvider)
+      ? urlProvider
+      : null;
+
+  // Generic clients get the Unified Model API as the first tile of the grid;
+  // custom clients build per-provider instructions and don't offer it.
+  const routerAvailable = client.proxy.kind === "generic";
+  const routerSelected = routerAvailable && urlProvider === MODEL_ROUTER_TILE;
+
+  // Auto-select the first tile when nothing is chosen yet, so the card opens
+  // with instructions expanded instead of a blank grid: the Unified Model API for
+  // generic clients, the first provider otherwise.
+  useEffect(() => {
+    if (selectedProvider || routerSelected) return;
+    if (routerAvailable) {
+      updateProviderInUrl(MODEL_ROUTER_TILE);
+    } else if (supportedProviders.length > 0) {
+      updateProviderInUrl(supportedProviders[0]);
+    }
+  }, [
+    selectedProvider,
+    routerSelected,
+    routerAvailable,
+    supportedProviders,
+    updateProviderInUrl,
+  ]);
+
+  const handleProviderSelect = (p: ChatProvider) => {
+    updateProviderInUrl(p);
+  };
+
+  const providerLabel = selectedProvider
+    ? providerCatalog.label(selectedProvider)
+    : null;
+  const url = selectedProvider ? `${baseUrl}/${selectedProvider}` : null;
+  const isCompatible =
+    !!selectedProvider && supportedProviders.includes(selectedProvider);
+
+  const instruction = useMemo(() => {
+    if (client.proxy.kind !== "custom") return null;
+    if (!selectedProvider || !providerLabel || !url) return null;
+    return client.proxy.build({
+      provider: selectedProvider,
+      providerLabel,
+      url,
+      tokenPlaceholder: `<your-${selectedProvider}-api-key>`,
+      proxyName: toProxyProviderSlug(DEFAULT_LLM_PROXY_NAME),
+      appName,
+    });
+  }, [client.proxy, selectedProvider, providerLabel, url, appName]);
+
+  if (client.proxy.kind === "unsupported") {
+    return <UnsupportedPanel reason={client.proxy.reason} />;
+  }
+
+  const gridProviders =
+    client.proxy.kind === "generic" ? visibleAllProviders : supportedProviders;
+  const rawProviderCount =
+    client.proxy.kind === "generic"
+      ? ALL_PROVIDERS.length
+      : rawSupportedProviders.length;
+  const hiddenByAdmin = gridProviders.length === 0 && rawProviderCount > 0;
+
+  if (gridProviders.length === 0) {
+    return <NoProvidersPanel client={client} hiddenByAdmin={hiddenByAdmin} />;
+  }
+
+  return (
+    <div id="proxy-instructions" className="space-y-4">
+      {routerAvailable ? (
+        <GenericEndpointCard
+          baseUrl={baseUrl}
+          providers={visibleAllProviders}
+          routerSelected={routerSelected}
+          selectedProvider={selectedProvider}
+          onSelectRouter={() => updateProviderInUrl(MODEL_ROUTER_TILE)}
+          onSelectProvider={handleProviderSelect}
+        />
+      ) : (
+        <ProviderPicker
+          providers={gridProviders}
+          supported={supportedProviders}
+          selected={selectedProvider}
+          onSelect={handleProviderSelect}
+        />
+      )}
+
+      {routerSelected ? (
+        <ModelRouterInstructions />
+      ) : !selectedProvider ? null : client.proxy.kind === "generic" &&
+        providerLabel ? (
+        <GenericProxyInstructions
+          selectedProvider={selectedProvider}
+          providerLabel={providerLabel}
+        />
+      ) : isCompatible && instruction ? (
+        instruction.kind === "snippet" ? (
+          <div className="space-y-2">
+            <TerminalBlock code={instruction.code} />
+            {instruction.note && <ProxyNote note={instruction.note} />}
+          </div>
+        ) : instruction.kind === "steps" ? (
+          <div className="space-y-3">
+            {instruction.note && <ProxyNote note={instruction.note} />}
+            <StepList steps={instruction.steps} llmProxyId={profileId} />
+          </div>
+        ) : (
+          <div className="space-y-6">
+            {instruction.sections.map((sec) => (
+              <div key={sec.title} className="space-y-3">
+                <div>
+                  <div className="text-[14px] font-semibold text-foreground">
+                    {sec.title}
+                  </div>
+                  {sec.description && (
+                    <div className="mt-0.5 text-[12.5px] leading-snug text-muted-foreground">
+                      {sec.description}
+                    </div>
+                  )}
+                </div>
+                <StepList steps={sec.steps} llmProxyId={profileId} />
+              </div>
+            ))}
+            {instruction.note && <ProxyNote note={instruction.note} />}
+          </div>
+        )
+      ) : (
+        <UnsupportedPanel
+          reason={`${client.label} doesn't support this provider.`}
+        />
+      )}
+
+      {client.proxy.kind === "generic" &&
+        client.id !== "generic" &&
+        (routerSelected || selectedProvider) && (
+          <AgentIdHeaderHint agentId={client.id} />
+        )}
+    </div>
+  );
+}
+
+/**
+ * The header that names a generic-instructions agent on the proxy, so its
+ * calls show as that agent rather than as a generic client.
+ */
+function AgentIdHeaderHint({ agentId }: { agentId: string }) {
+  return (
+    <div className="space-y-1.5 rounded-lg border bg-card p-4">
+      <div className="text-xs font-medium text-muted-foreground">
+        Agent header
+      </div>
+      <p className="text-xs text-muted-foreground">
+        If your agent can send custom headers, add this one so its calls show
+        under its name.
+      </p>
+      <CopyableCode
+        value={`${EXTERNAL_AGENT_ID_HEADER}: ${agentId}`}
+        toastMessage="Header copied"
+      />
+    </div>
+  );
+}
+
+type GenericAuthMethod = "provider-key" | "virtual-key";
+
+/**
+ * The "Any client" step 4 body for a single provider: the user decides how to
+ * authenticate — bring their own provider key (passthrough) or have us
+ * auto-provision a personal virtual key (the same provisioning the one-command
+ * setup performs, gated by llmVirtualKey:create). The Unified Model API lives in
+ * its own first tile of the grid ({@link ModelRouterInstructions}).
+ */
+function GenericProxyInstructions({
+  selectedProvider,
+  providerLabel,
+}: {
+  selectedProvider: ChatProvider;
+  providerLabel: string;
+}) {
+  const [authMethod, setAuthMethod] =
+    useState<GenericAuthMethod>("provider-key");
+  const { data: canCreateVirtualKey } = useHasPermissions({
+    llmVirtualKey: ["create"],
+  });
+  const { data: canCreateProviderKey } = useHasPermissions({
+    llmProviderApiKey: ["create"],
+  });
+  const [showAddProviderKey, setShowAddProviderKey] = useState(false);
+  const provisionKey = useCreateConnectionVirtualKey();
+  const provisionAsync = provisionKey.mutateAsync;
+  const [virtualKey, setVirtualKey] = useState<{
+    value: string;
+    name: string;
+    creditWarning?: ConnectionCreditWarning | null;
+  } | null>(null);
+
+  // A virtual key can only wrap a provider key the user can resolve. Mirror the
+  // one-command flow: only offer the option when the selected provider has a
+  // configured key — otherwise provisioning would 400 ("no key configured").
+  const { data: availableKeys } = useAvailableLlmProviderApiKeys();
+  const providerHasKey = useMemo(
+    () => (availableKeys ?? []).some((k) => k.provider === selectedProvider),
+    [availableKeys, selectedProvider],
+  );
+  const offerVirtualKey = canCreateVirtualKey === true && providerHasKey;
+
+  // A freshly provisioned key is scoped to the current provider; drop it when
+  // the provider or auth mode changes so a stale key is never shown.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps are the reset triggers, not values read
+  useEffect(() => {
+    setVirtualKey(null);
+  }, [selectedProvider, authMethod]);
+
+  useEffect(() => {
+    if (!offerVirtualKey && authMethod === "virtual-key") {
+      setAuthMethod("provider-key");
+    }
+  }, [offerVirtualKey, authMethod]);
+
+  // Auto-provision the moment the user picks the virtual-key tab — no extra
+  // "generate" click. ensureConnectionVirtualKey reuses an existing key, so a
+  // repeat call (e.g. React strict-mode double-invoke) is idempotent.
+  const provisioningRef = useRef(false);
+  useEffect(() => {
+    if (authMethod !== "virtual-key" || !offerVirtualKey || virtualKey) return;
+    if (provisioningRef.current) return;
+    provisioningRef.current = true;
+    let cancelled = false;
+    provisionAsync({ provider: selectedProvider })
+      .then((result) => {
+        if (!cancelled && result) setVirtualKey(result);
+      })
+      .finally(() => {
+        provisioningRef.current = false;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authMethod,
+    offerVirtualKey,
+    selectedProvider,
+    virtualKey,
+    provisionAsync,
+  ]);
+
+  return (
+    <div className="space-y-3">
+      <div className="space-y-4 rounded-lg border bg-card p-4">
+        <div className="space-y-2">
+          <div className="text-xs font-medium text-muted-foreground">
+            Authentication
+          </div>
+          <Tabs
+            value={authMethod}
+            onValueChange={(v) => setAuthMethod(v as GenericAuthMethod)}
+          >
+            <TabsList size="sm">
+              <TabsTrigger value="provider-key">Your provider key</TabsTrigger>
+              <TabsTrigger value="virtual-key" disabled={!offerVirtualKey}>
+                Virtual key
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
+          <p className="text-xs text-muted-foreground">
+            {authMethod === "provider-key" ? (
+              canCreateVirtualKey && !providerHasKey ? (
+                <span key="needs-provider-key">
+                  Passthrough — you keep using your own {providerLabel} key. A
+                  virtual key needs a configured {providerLabel} provider key
+                  first
+                  {canCreateProviderKey ? (
+                    <>
+                      {" "}
+                      (
+                      <UnstyledButton
+                        type="button"
+                        className="font-medium text-foreground underline underline-offset-2 hover:text-primary"
+                        onClick={() => setShowAddProviderKey(true)}
+                      >
+                        add one
+                      </UnstyledButton>
+                      ).
+                    </>
+                  ) : (
+                    <span> (ask an admin to add one).</span>
+                  )}
+                </span>
+              ) : (
+                <span key="passthrough">
+                  Passthrough — you keep using your own provider API key; only
+                  the base URL changes.
+                </span>
+              )
+            ) : (
+              <span key="virtual">
+                A personal virtual key mapped to your provider key is created
+                automatically and shown below.
+              </span>
+            )}
+          </p>
+          {authMethod === "virtual-key" &&
+            (virtualKey ? (
+              <div className="space-y-1.5">
+                <CopyableCode
+                  value={virtualKey.value}
+                  variant="primary"
+                  toastMessage="Virtual key copied"
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Use this as your API key. Revoke it any time by deleting the
+                  &quot;{virtualKey.name}&quot; key on the Virtual Keys page.
+                </p>
+                <CreditWarningNotice warning={virtualKey.creditWarning} />
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" />
+                <span>Creating your virtual key…</span>
+              </div>
+            ))}
+        </div>
+      </div>
+
+      <CreateLlmProviderApiKeyDialog
+        open={showAddProviderKey}
+        onOpenChange={setShowAddProviderKey}
+        title={`Add a ${providerLabel} provider key`}
+        description={`Add a provider API key so a virtual key can be minted from it. This unlocks the virtual-key option for ${providerLabel}.`}
+        defaultValues={{ provider: selectedProvider }}
+        allowedProviders={[selectedProvider]}
+        onSuccess={() => setShowAddProviderKey(false)}
+      />
+    </div>
+  );
+}
+
+/**
+ * The Unified Model API auth panel behind the first tab of the endpoint card
+ * (generic clients). One OpenAI-compatible endpoint that reaches every
+ * configured provider via provider-qualified model IDs (`openai:gpt-5.4`) —
+ * /v1/openai is just the OpenAI passthrough proxy; only /v1/unified-model fans
+ * out across providers. A virtual key wraps exactly one stored provider key,
+ * so router setups pick which provider the minted key maps to.
+ */
+function ModelRouterInstructions() {
+  const providerCatalog = useModelProviderCatalog();
+  const [authMethod, setAuthMethod] =
+    useState<GenericAuthMethod>("provider-key");
+  const { data: canCreateVirtualKey } = useHasPermissions({
+    llmVirtualKey: ["create"],
+  });
+
+  const { data: availableKeys } = useAvailableLlmProviderApiKeys();
+  const providersWithKeys = useMemo(() => {
+    const configured = new Set((availableKeys ?? []).map((k) => k.provider));
+    // Not every provider is reachable through the router — `ollama-native`
+    // speaks Ollama's own `/api/chat` wire, which the router cannot translate.
+    // A virtual key mapped to such a provider could never serve a routed model.
+    return ALL_PROVIDERS.filter(
+      (p) => configured.has(p) && isModelRouterSupportedProvider(p),
+    );
+  }, [availableKeys]);
+  const [pickedProvider, setPickedProvider] = useState<ChatProvider | null>(
+    null,
+  );
+  const mappedProvider =
+    pickedProvider && providersWithKeys.includes(pickedProvider)
+      ? pickedProvider
+      : (providersWithKeys[0] ?? null);
+  const offerVirtualKey = canCreateVirtualKey === true && !!mappedProvider;
+
+  const provisionKey = useCreateConnectionVirtualKey();
+  const provisionAsync = provisionKey.mutateAsync;
+  const [virtualKey, setVirtualKey] = useState<{
+    value: string;
+    name: string;
+    creditWarning?: ConnectionCreditWarning | null;
+  } | null>(null);
+
+  // A provisioned key is scoped to the mapped provider; drop it when the
+  // mapping or auth mode changes so a stale key is never shown.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps are the reset triggers, not values read
+  useEffect(() => {
+    setVirtualKey(null);
+  }, [mappedProvider, authMethod]);
+
+  useEffect(() => {
+    if (!offerVirtualKey && authMethod === "virtual-key") {
+      setAuthMethod("provider-key");
+    }
+  }, [offerVirtualKey, authMethod]);
+
+  // Same auto-provision-on-tab-pick behavior as the per-provider flow;
+  // ensureConnectionVirtualKey is idempotent per provider.
+  const provisioningRef = useRef(false);
+  useEffect(() => {
+    if (authMethod !== "virtual-key" || !offerVirtualKey || virtualKey) return;
+    if (!mappedProvider || provisioningRef.current) return;
+    provisioningRef.current = true;
+    let cancelled = false;
+    provisionAsync({ provider: mappedProvider })
+      .then((result) => {
+        if (!cancelled && result) setVirtualKey(result);
+      })
+      .finally(() => {
+        provisioningRef.current = false;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authMethod, offerVirtualKey, mappedProvider, virtualKey, provisionAsync]);
+
+  return (
+    <div className="space-y-3">
+      <div className="space-y-4 rounded-lg border bg-card p-4">
+        <p className="text-xs text-muted-foreground">
+          One OpenAI-style endpoint for every configured provider. Send
+          provider-qualified model IDs like{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+            openai:gpt-5.4
+          </code>{" "}
+          or{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+            anthropic:claude-sonnet-5
+          </code>{" "}
+          instead of switching base URLs per provider.
+        </p>
+
+        <div className="space-y-2">
+          <div className="text-xs font-medium text-muted-foreground">
+            Authentication
+          </div>
+          <Tabs
+            value={authMethod}
+            onValueChange={(v) => setAuthMethod(v as GenericAuthMethod)}
+          >
+            <TabsList size="sm">
+              <TabsTrigger value="provider-key">Your provider key</TabsTrigger>
+              <TabsTrigger value="virtual-key" disabled={!offerVirtualKey}>
+                Virtual key
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
+          {authMethod === "provider-key" ? (
+            <p className="text-xs text-muted-foreground">
+              Passthrough — you keep using your own provider API key. Works when
+              the model's provider prefix matches the key (e.g.{" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                openai:gpt-5.4
+              </code>{" "}
+              with an OpenAI key).
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {providersWithKeys.length > 1 && mappedProvider && (
+                <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <span>Mint the key from the</span>
+                  <Select
+                    value={mappedProvider}
+                    onValueChange={(v) => setPickedProvider(v as ChatProvider)}
+                  >
+                    <SelectTrigger size="sm" className="h-7 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {providersWithKeys.map((p) => (
+                        <SelectItem key={p} value={p}>
+                          {providerCatalog.label(p)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <span>provider key</span>
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground">
+                A personal virtual key mapped to your
+                {mappedProvider ? (
+                  <span> {providerCatalog.label(mappedProvider)}</span>
+                ) : null}{" "}
+                provider key is created automatically and shown below. Models
+                from other providers need a key mapped to that provider.
+              </p>
+              {virtualKey ? (
+                <div className="space-y-1.5">
+                  <CopyableCode
+                    value={virtualKey.value}
+                    variant="primary"
+                    toastMessage="Virtual key copied"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Use this as your API key. Revoke it any time by deleting the
+                    &quot;{virtualKey.name}&quot; key on the Virtual Keys page.
+                  </p>
+                  <CreditWarningNotice warning={virtualKey.creditWarning} />
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  <span>Creating your virtual key…</span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Provider selection and its corresponding proxy endpoint. */
+function GenericEndpointCard({
+  baseUrl,
+  providers,
+  routerSelected,
+  selectedProvider,
+  onSelectRouter,
+  onSelectProvider,
+  caption,
+}: {
+  baseUrl: string;
+  providers: ChatProvider[];
+  routerSelected: boolean;
+  selectedProvider: ChatProvider | null;
+  onSelectRouter: () => void;
+  onSelectProvider: (p: ChatProvider) => void;
+  /** Overrides the default "Replace the … base URL … with:" line. */
+  caption?: React.ReactNode;
+}) {
+  const providerCatalog = useModelProviderCatalog();
+  const label = routerSelected
+    ? "OpenAI-compatible"
+    : selectedProvider
+      ? providerCatalog.label(selectedProvider)
+      : "";
+  const originalUrl = routerSelected
+    ? "https://api.openai.com/v1/"
+    : selectedProvider
+      ? PROVIDER_ORIGINAL_URLS[selectedProvider]
+      : "";
+  const url = routerSelected
+    ? `${baseUrl}/unified-model`
+    : `${baseUrl}/${selectedProvider}`;
+
+  // Bedrock exposes two endpoints; both live in the same card as labeled rows.
+  const rows =
+    !routerSelected && selectedProvider === "bedrock"
+      ? [
+          {
+            comment: "Bedrock Converse API",
+            code: `${baseUrl}/bedrock`,
+          },
+          {
+            comment: "OpenAI Completions API compatible clients",
+            code: `${baseUrl}/bedrock/openai`,
+          },
+        ]
+      : undefined;
+
+  return (
+    <div className="space-y-2">
+      {caption ?? (
+        <div className="text-xs text-muted-foreground">
+          Replace the{" "}
+          <span className="font-medium text-foreground">{label}</span> base URL{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-[11px] line-through opacity-60">
+            {originalUrl}
+          </code>{" "}
+          with:
+        </div>
+      )}
+      <ProviderPicker
+        providers={providers}
+        supported={providers}
+        selected={selectedProvider}
+        onSelect={onSelectProvider}
+        modelRouter={{ selected: routerSelected, onSelect: onSelectRouter }}
+      />
+      <TerminalBlock code={url} rows={rows} />
+      {routerSelected && (
+        <InlineNotice variant="warning">
+          <AlertTriangle />
+          <span className="font-medium">Updated endpoint</span>
+          <InlineNoticeText>
+            The previous /v1/model-router endpoint is still supported. Use
+            /v1/unified-model for new connections.
+          </InlineNoticeText>
+        </InlineNotice>
+      )}
+    </div>
+  );
+}
+
+function NoProvidersPanel({
+  client,
+  hiddenByAdmin,
+}: {
+  client: ConnectClient;
+  hiddenByAdmin: boolean;
+}) {
+  return (
+    <div className="rounded-lg border border-dashed bg-muted/30 p-6 text-center text-sm text-muted-foreground">
+      <div className="font-medium text-foreground">
+        No providers available for {client.label}
+      </div>
+      <p className="mt-1">
+        {hiddenByAdmin
+          ? "Your admin hasn't enabled any of the providers this client supports."
+          : "This client doesn't support any providers that are currently enabled."}
+      </p>
+    </div>
+  );
+}
+
+function StepList({
+  steps,
+  llmProxyId,
+}: {
+  steps: ProxyStep[];
+  /** LLM proxy the setup targets — needed to provision a passthrough key. */
+  llmProxyId: string;
+}) {
+  return (
+    <ol className="grid gap-5">
+      {steps.map((s, i) => (
+        <li
+          key={s.title}
+          className="grid grid-cols-[22px_1fr] items-start gap-3"
+        >
+          <div className="mt-0.5 flex size-[22px] shrink-0 items-center justify-center rounded-full border bg-muted/50 font-mono text-[11px] font-semibold text-muted-foreground">
+            {i + 1}
+          </div>
+          <div className="min-w-0 space-y-3">
+            <div>
+              <div className="text-[13.5px] font-medium text-foreground">
+                {s.title}
+              </div>
+              {s.body && (
+                <div className="mt-0.5 text-[12.5px] leading-snug text-muted-foreground">
+                  {s.body}
+                </div>
+              )}
+            </div>
+            {s.fields && s.fields.length > 0 && (
+              <div className="grid gap-2">
+                {s.fields.map((f) => (
+                  <FieldRow
+                    key={f.label}
+                    label={f.label}
+                    value={f.value}
+                    copyable={f.copyable ?? true}
+                  />
+                ))}
+              </div>
+            )}
+            {s.showPassthroughKey && (
+              <PassthroughKeyField
+                llmProxyId={llmProxyId}
+                variant={s.passthroughKeyVariant ?? "header"}
+                agentId={s.passthroughKeyAgentId}
+              />
+            )}
+            {s.code && <TerminalBlock code={s.code} />}
+          </div>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/**
+ * Inline reveal for the manual attribution step: auto-provisions the caller's
+ * personal passthrough virtual key (scoped to this proxy) and shows the header
+ * name + copyable value to paste into the client's custom-headers field. Gated
+ * on llmVirtualKey:create; otherwise points to the LLM Proxy page.
+ */
+type PassthroughKeyState =
+  | { status: "loading" }
+  | { status: "done"; key: { value: string; name: string } }
+  | { status: "error" };
+
+function PassthroughKeyField({
+  llmProxyId,
+  variant,
+  agentId,
+}: {
+  llmProxyId: string;
+  variant: "header" | "env";
+  /**
+   * Optional client-attribution value sent as the X-Archestra-Agent-Id header
+   * alongside the passthrough key (e.g. "anthropic_claude_code" / "anthropic_claude_desktop"). Not a
+   * secret — shown in full.
+   */
+  agentId?: string;
+}) {
+  const { data: canCreate } = useHasPermissions({ llmVirtualKey: ["create"] });
+  const { mutateAsync } = useCreateConnectionPassthroughKey();
+  const [state, setState] = useState<PassthroughKeyState>({
+    status: "loading",
+  });
+
+  // ensureConnectionPassthroughKey is idempotent server-side, so a single fire
+  // is enough; always settle into done/error (never leave a dangling spinner —
+  // an earlier cancelled-flag version could strand the UI on success).
+  const runProvision = useCallback(() => {
+    setState({ status: "loading" });
+    mutateAsync({ llmProxyId })
+      .then((result) =>
+        setState(
+          result ? { status: "done", key: result } : { status: "error" },
+        ),
+      )
+      .catch(() => setState({ status: "error" }));
+  }, [mutateAsync, llmProxyId]);
+
+  // Auto-provision once the permission resolves. The ref fires exactly once and
+  // survives React strict-mode's double-invoke.
+  const firedRef = useRef(false);
+  useEffect(() => {
+    if (canCreate !== true || firedRef.current) return;
+    firedRef.current = true;
+    runProvision();
+  }, [canCreate, runProvision]);
+
+  if (canCreate === false) {
+    return (
+      <p className="text-[12.5px] leading-snug text-muted-foreground">
+        Open the Connect dialog on the{" "}
+        <Link
+          href="/llm/proxy"
+          className="font-medium text-foreground underline underline-offset-2 hover:text-primary"
+        >
+          LLM Proxy
+        </Link>{" "}
+        page and create a passthrough key. Then add a header named{" "}
+        <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+          {VIRTUAL_KEY_HEADER}
+        </code>{" "}
+        with the key as its value.
+      </p>
+    );
+  }
+
+  if (state.status === "error") {
+    return (
+      <p className="text-[12.5px] leading-snug text-muted-foreground">
+        Couldn&apos;t create a passthrough key.{" "}
+        <UnstyledButton
+          type="button"
+          onClick={runProvision}
+          className="font-medium text-foreground underline underline-offset-2 hover:text-primary"
+        >
+          Retry
+        </UnstyledButton>{" "}
+        or open the Connect dialog on the{" "}
+        <Link
+          href="/llm/proxy"
+          className="font-medium text-foreground underline underline-offset-2 hover:text-primary"
+        >
+          LLM Proxy
+        </Link>{" "}
+        page.
+      </p>
+    );
+  }
+
+  if (state.status !== "done") {
+    return (
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Loader2 className="size-3.5 animate-spin" />
+        <span>Creating your passthrough key…</span>
+      </div>
+    );
+  }
+
+  const { key } = state;
+  // The agent-id line (non-secret) rides in the same ANTHROPIC_CUSTOM_HEADERS
+  // value (env) or as its own header row (header), one "Name: Value" per line.
+  const agentIdLine = agentId
+    ? `${EXTERNAL_AGENT_ID_HEADER}: ${agentId}`
+    : null;
+  return (
+    <div className="grid gap-2">
+      {variant === "env" ? (
+        // Paste as the ANTHROPIC_CUSTOM_HEADERS value. The key is a secret, so
+        // it is masked on screen and copied in full; the agent-id is shown as-is.
+        <StackedCopyField
+          label="ANTHROPIC_CUSTOM_HEADERS"
+          display={[agentIdLine, `${VIRTUAL_KEY_HEADER}: ${SECRET_MASK}`]
+            .filter(Boolean)
+            .join("\n")}
+          copyValue={[agentIdLine, `${VIRTUAL_KEY_HEADER}: ${key.value}`]
+            .filter(Boolean)
+            .join("\n")}
+        />
+      ) : (
+        <>
+          {agentIdLine && (
+            <StackedCopyField
+              label="Header"
+              display={EXTERNAL_AGENT_ID_HEADER}
+              copyValue={EXTERNAL_AGENT_ID_HEADER}
+            />
+          )}
+          {agentIdLine && (
+            <StackedCopyField
+              label="Value"
+              display={agentId ?? ""}
+              copyValue={agentId ?? ""}
+            />
+          )}
+          <StackedCopyField
+            label="Header"
+            display={VIRTUAL_KEY_HEADER}
+            copyValue={VIRTUAL_KEY_HEADER}
+          />
+          <StackedCopyField
+            label="Value"
+            display={SECRET_MASK}
+            copyValue={key.value}
+          />
+        </>
+      )}
+      <p className="text-[11px] text-muted-foreground">
+        Revoke any time from the LLM Proxy&apos;s Connect dialog by deleting the
+        &quot;{key.name}&quot; key.
+      </p>
+    </div>
+  );
+}
+
+/** Mask shown in place of a secret value (the real value is only copied). */
+const SECRET_MASK = "•".repeat(20);
+
+/**
+ * Stacked label + value with a copy button. `display` is what's shown on screen
+ * (a mask for secrets); `copyValue` is what's written to the clipboard. The
+ * stacked layout avoids the cramped fixed-width FieldRow label column.
+ */
+function StackedCopyField({
+  label,
+  display,
+  copyValue,
+}: {
+  label: string;
+  display: string;
+  copyValue: string;
+}) {
+  return (
+    <TerminalCard>
+      <div className="flex items-center gap-3 px-4 py-3">
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className={terminalLabelClass}>{label}</div>
+          <code className={cn("block truncate", terminalCodeClass)}>
+            {display}
+          </code>
+        </div>
+        <FieldCopyButton value={copyValue} />
+      </div>
+    </TerminalCard>
+  );
+}
+
+function FieldRow({
+  label,
+  value,
+  copyable,
+}: {
+  label: string;
+  value: string;
+  copyable: boolean;
+}) {
+  if (!copyable) {
+    return (
+      <div className="grid grid-cols-[140px_1fr] items-center gap-3 rounded-md border border-dashed bg-muted/30 px-4 py-3">
+        <div className="font-mono text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+          {label}
+        </div>
+        <span className="min-w-0 truncate text-[13px] italic text-muted-foreground">
+          {value}
+        </span>
+      </div>
+    );
+  }
+  return (
+    <TerminalCard>
+      <div className="grid grid-cols-[140px_1fr_auto] items-center gap-3 px-4 py-3">
+        <div className={terminalLabelClass}>{label}</div>
+        <code className={cn("min-w-0 truncate", terminalCodeClass)}>
+          {value}
+        </code>
+        <FieldCopyButton value={value} />
+      </div>
+    </TerminalCard>
+  );
+}
+
+function FieldCopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = useCallback(async () => {
+    await copyToClipboard(value);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1600);
+  }, [value]);
+  return (
+    <UnstyledButton
+      type="button"
+      onClick={onCopy}
+      aria-label="Copy to clipboard"
+      className={cn(terminalActionClass, "size-7")}
+    >
+      {copied ? (
+        <Check className="size-3.5 text-terminal-success" strokeWidth={2.5} />
+      ) : (
+        <Copy className="size-3.5" strokeWidth={2} />
+      )}
+    </UnstyledButton>
+  );
+}
+
+function ProxyNote({ note }: { note: string }) {
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-2.5 text-[12.5px] text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+      <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+      <span>{note}</span>
+    </div>
+  );
+}
+
+interface ProviderPickerProps {
+  providers: ChatProvider[];
+  supported: ChatProvider[];
+  selected: ChatProvider | null;
+  onSelect: (provider: ChatProvider) => void;
+  modelRouter?: { selected: boolean; onSelect: () => void };
+}
+
+function ProviderPicker({
+  providers,
+  supported,
+  selected,
+  onSelect,
+  modelRouter,
+}: ProviderPickerProps) {
+  const providerCatalog = useModelProviderCatalog();
+  return (
+    <Select
+      value={
+        modelRouter?.selected ? MODEL_ROUTER_TILE : (selected ?? undefined)
+      }
+      onValueChange={(value) => {
+        if (value === MODEL_ROUTER_TILE) modelRouter?.onSelect();
+        else onSelect(value as ChatProvider);
+      }}
+    >
+      <SelectTrigger aria-label="Provider" size="sm" className="w-full sm:w-64">
+        <SelectValue placeholder="Select a provider" />
+      </SelectTrigger>
+      <SelectContent>
+        {modelRouter && (
+          <SelectItem value={MODEL_ROUTER_TILE}>Unified Model API</SelectItem>
+        )}
+        <LlmProviderSelectItems
+          options={providers.map((provider) => ({
+            value: provider,
+            name: providerCatalog.label(provider),
+            icon: PROVIDER_CONFIG[provider].icon,
+            subtext: supported.includes(provider)
+              ? undefined
+              : "Not compatible",
+          }))}
+        />
+      </SelectContent>
+    </Select>
+  );
+}

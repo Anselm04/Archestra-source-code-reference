@@ -1,0 +1,211 @@
+"use client";
+
+import { DEFAULT_ADMIN_EMAIL } from "@archestra/shared";
+import { AlertTriangle } from "lucide-react";
+import Link from "next/link";
+import { GuardrailsDisabledWarning } from "@/app/openappa/_parts/guardrails-deployment-toggle";
+import { IntentPrefetchLink } from "@/components/intent-prefetch-link";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  useSidebar,
+} from "@/components/ui/sidebar";
+import {
+  useDefaultCredentialsEnabled,
+  useHasPermissions,
+  useSession,
+} from "@/lib/auth/auth.query";
+import { useDisableBasicAuth, useFeature } from "@/lib/config/config.query";
+import { useK8sCapabilities } from "@/lib/environment.query";
+import { useGuardrailsDeployment } from "@/lib/guardrails-deployment.query";
+import { useShellReady } from "@/lib/shell-deferral";
+import { cn } from "@/lib/utils/tailwind";
+
+interface Warning {
+  label: string;
+  href: string;
+  external: boolean;
+}
+
+export function SidebarWarningsAccordion({
+  showGuardrailsStatus = true,
+}: {
+  /** False where the navigation already shows the Guardrails row. */
+  showGuardrailsStatus?: boolean;
+}) {
+  const { data: session } = useSession();
+  const userEmail = session?.user?.email;
+  // The default-credentials and network-policy checks wait for the page's
+  // first data (see useShellReady).
+  const shellReady = useShellReady();
+  const disableBasicAuth = useDisableBasicAuth();
+  const openappaEnabled = useFeature("openappaEnabled");
+  const guardrailsDeployment = useGuardrailsDeployment();
+  const { data: canUpdateOrg } = useHasPermissions({
+    organization: ["update"],
+  });
+  // Only the default admin with organization:update sees this warning, and
+  // only while password sign-in is on.
+  const canSeeDefaultCredsWarning =
+    canUpdateOrg === true &&
+    disableBasicAuth === false &&
+    userEmail === DEFAULT_ADMIN_EMAIL;
+  const { data: defaultCredentialsEnabled, isLoading: isLoadingCreds } =
+    useDefaultCredentialsEnabled({
+      enabled: shellReady && canSeeDefaultCredsWarning,
+    });
+  // Reading capabilities needs environment:update, so gating the query on the
+  // same permission keeps it from 403-ing for everyone else on every page.
+  const { data: canUpdateEnvironment } = useHasPermissions({
+    environment: ["update"],
+  });
+  const { data: capabilities } = useK8sCapabilities(
+    shellReady && canUpdateEnvironment === true,
+  );
+  const { state: sidebarState } = useSidebar();
+
+  const showDefaultCredsWarning =
+    canSeeDefaultCredsWarning &&
+    !isLoadingCreds &&
+    defaultCredentialsEnabled === true;
+
+  // Only a measured verdict warns. "unknown" means nothing tested the cluster,
+  // which is not evidence that egress rules are inert.
+  //
+  // networkPolicy is optional-chained despite being required in the response
+  // type: a payload that does not match — an error envelope, an older backend —
+  // would otherwise throw here and blank every page, since this renders in the
+  // layout rather than on one screen.
+  const showNetworkPolicyWarning =
+    capabilities?.networkPolicy?.enforcementStatus === "verified-not-enforced";
+
+  const warnings = [
+    showDefaultCredsWarning && {
+      label: "Change default credentials",
+      href: "/account?highlight=change-password",
+      external: false,
+    },
+    showNetworkPolicyWarning && {
+      // The Environments page explains what this means and links the docs.
+      label: "Network policy not enforced",
+      href: "/settings/environments",
+      external: false,
+    },
+  ].filter((w): w is Warning => Boolean(w));
+
+  // Only while enforcement is off: the row is a warning, and there is nothing
+  // to warn about once the guardrail is doing its job. Checked here too, not
+  // just inside the row, so the group does not render as an empty strip.
+  const showGuardrails =
+    openappaEnabled === true &&
+    showGuardrailsStatus &&
+    guardrailsDeployment.data?.enabled === false;
+  if (warnings.length === 0 && !showGuardrails) {
+    return null;
+  }
+
+  const isCollapsed = sidebarState === "collapsed";
+
+  return (
+    <SidebarGroup className="p-0 ">
+      <SidebarGroupContent>
+        <SidebarMenu>
+          {isCollapsed && warnings.length > 0 ? (
+            <SidebarMenuItem>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <SidebarMenuButton className="text-destructive hover:text-destructive">
+                    <AlertTriangle className="shrink-0" />
+                    <span>Security warnings</span>
+                  </SidebarMenuButton>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="right" align="end">
+                  {warnings.map((w) => (
+                    <DropdownMenuItem
+                      asChild
+                      key={w.label}
+                      className="cursor-pointer"
+                    >
+                      {/* A plain Link: menu items exist only once the menu is
+                          opened, which is already intent. */}
+                      <Link
+                        href={w.href}
+                        {...externalLinkProps(w.label, w.external)}
+                      >
+                        <span>{w.label}</span>
+                      </Link>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <div
+                data-sidebar="menu-badge"
+                className={cn(
+                  "pointer-events-none absolute right-1 top-1.5 flex h-5 min-w-5 select-none items-center justify-center rounded-md px-1 text-xs font-medium tabular-nums",
+                  "text-destructive",
+                  "group-data-[collapsible=icon]:hidden",
+                )}
+              >
+                {warnings.length}
+              </div>
+
+              <span
+                className={cn(
+                  "pointer-events-none absolute top-0.5 right-0.5 z-10",
+                  "hidden group-data-[collapsible=icon]:flex",
+                  "h-3.5 min-w-3.5 items-center justify-center rounded-full",
+                  "bg-destructive text-[9px] font-bold leading-none",
+                  "text-destructive-foreground",
+                )}
+              >
+                {warnings.length}
+              </span>
+            </SidebarMenuItem>
+          ) : (
+            warnings.map((w) => <WarningItem key={w.label} {...w} />)
+          )}
+          {showGuardrails && <GuardrailsDisabledWarning />}
+        </SidebarMenu>
+      </SidebarGroupContent>
+    </SidebarGroup>
+  );
+}
+
+function WarningItem({ label, href, external }: Warning) {
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton
+        asChild
+        tooltip={label}
+        className="text-destructive hover:text-destructive"
+      >
+        <IntentPrefetchLink href={href} {...externalLinkProps(label, external)}>
+          <AlertTriangle className="shrink-0" />
+          <span>{label}</span>
+        </IntentPrefetchLink>
+      </SidebarMenuButton>
+    </SidebarMenuItem>
+  );
+}
+
+// The new-tab hint rides on aria-label rather than an sr-only sibling, because
+// SidebarMenuButton truncates its last span child and a second span would take
+// that rule off the label, wrapping it to two lines.
+function externalLinkProps(label: string, external: boolean) {
+  return external
+    ? ({
+        target: "_blank",
+        rel: "noopener noreferrer",
+        "aria-label": `${label} (opens in new tab)`,
+      } as const)
+    : {};
+}

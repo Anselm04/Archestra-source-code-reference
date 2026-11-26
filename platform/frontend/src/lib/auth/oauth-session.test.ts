@@ -1,0 +1,138 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import {
+  clearInstallContext,
+  clearOAuthPendingChatResume,
+  getOAuthMcpServerId,
+  getOAuthPendingChatResume,
+  getOAuthState,
+  getOAuthUserConfigValues,
+  setOAuthInstallChatResume,
+  setOAuthMcpServerId,
+  setOAuthReauthChatResume,
+  setOAuthState,
+  setOAuthUserConfigValues,
+} from "./oauth-session";
+
+describe("oauth-session install context", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("drops the re-authentication server ID so a later install is not diverted", () => {
+    setOAuthMcpServerId("server_abc");
+    expect(getOAuthMcpServerId()).toBe("server_abc");
+
+    clearInstallContext();
+
+    expect(getOAuthMcpServerId()).toBeNull();
+  });
+
+  it("keeps the expected callback state until the install context is cleared", () => {
+    expect(getOAuthState()).toBeNull();
+    setOAuthState("synthetic-state");
+    expect(getOAuthState()).toBe("synthetic-state");
+    clearInstallContext();
+    expect(getOAuthState()).toBeNull();
+  });
+});
+
+describe("oauth-session reauth chat resume", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("stores a pending chat resume message for chat return URLs", () => {
+    const conversationId = setOAuthReauthChatResume({
+      returnUrl: "http://localhost:3000/chat/conv_123",
+      serverName: "PostHog",
+    });
+
+    expect(conversationId).toBe("conv_123");
+    expect(getOAuthPendingChatResume()).toEqual({
+      conversationId: "conv_123",
+      message:
+        'I re-authenticated the "PostHog" connection. Please retry the last failed tool call and continue from where we left off.',
+    });
+  });
+
+  it("ignores non-chat return URLs", () => {
+    const conversationId = setOAuthReauthChatResume({
+      returnUrl: "http://localhost:3000/mcp/registry",
+      serverName: "PostHog",
+    });
+
+    expect(conversationId).toBeNull();
+    expect(getOAuthPendingChatResume()).toBeNull();
+  });
+
+  it("clears the pending chat resume message", () => {
+    setOAuthReauthChatResume({
+      returnUrl: "http://localhost:3000/chat/conv_123",
+      serverName: "PostHog",
+    });
+
+    clearOAuthPendingChatResume();
+
+    expect(getOAuthPendingChatResume()).toBeNull();
+  });
+});
+
+describe("oauth-session install chat resume", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("stores an install-specific resume message and returns the conversation id for chat return URLs", () => {
+    const conversationId = setOAuthInstallChatResume({
+      returnUrl: "http://localhost:3000/chat/conv_456",
+      serverName: "Atlassian",
+    });
+
+    expect(conversationId).toBe("conv_456");
+    expect(getOAuthPendingChatResume()).toEqual({
+      conversationId: "conv_456",
+      message:
+        'I connected the "Atlassian" integration. Please retry what I asked and continue from where we left off.',
+    });
+  });
+
+  it("does not store a resume (and returns null) for non-chat return URLs", () => {
+    const conversationId = setOAuthInstallChatResume({
+      returnUrl: "http://localhost:3000/mcp/registry",
+      serverName: "Atlassian",
+    });
+
+    expect(conversationId).toBeNull();
+    expect(getOAuthPendingChatResume()).toBeNull();
+  });
+});
+
+describe("oauth-session user config storage", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it("clears stored user config when nothing safe should persist", () => {
+    setOAuthUserConfigValues({
+      values: {
+        api_key: "super-secret",
+      },
+      userConfig: {
+        api_key: { sensitive: true },
+      },
+    });
+
+    expect(getOAuthUserConfigValues()).toBeNull();
+  });
+
+  it("fails closed when user config metadata is missing", () => {
+    setOAuthUserConfigValues({
+      values: {
+        tenant_id: "tenant-123",
+      },
+      userConfig: undefined,
+    });
+
+    expect(getOAuthUserConfigValues()).toBeNull();
+  });
+});

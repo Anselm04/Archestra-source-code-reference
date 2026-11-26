@@ -1,0 +1,1472 @@
+import net from "node:net";
+import { DrizzleQueryError } from "drizzle-orm/errors";
+import { errors as undiciErrors } from "undici";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { z } from "zod";
+import * as proxyPlugins from "@/proxy/plugins/registry";
+import { ApiError } from "@/types";
+
+// Create a hoisted mock function that defaults to returning true (healthy)
+const mockIsDatabaseHealthy = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const mockSentryCaptureException = vi.hoisted(() => vi.fn());
+
+// Mock the database module before any imports that depend on it
+vi.mock("@/database", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/database")>();
+  return {
+    ...actual,
+    isDatabaseHealthy: mockIsDatabaseHealthy,
+  };
+});
+
+vi.mock("@sentry/node", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@sentry/node")>();
+  return {
+    ...actual,
+    captureException: mockSentryCaptureException,
+  };
+});
+
+import { authPlugin } from "@/auth/fastify-plugin/plugin";
+import config from "@/config";
+import OrganizationModel from "@/models/organization";
+// Import after mock setup
+import healthRoutes from "@/routes/health";
+import {
+  GUARDRAILS_NOOP_ANNOTATOR_PATH,
+  OPENAPPA_ARCHESTRA_ANNOTATOR_PATH,
+  OPENAPPA_HELPERS_PREFIX,
+} from "@/routes/route-paths";
+import {
+  buildSandboxFrameAncestors,
+  createFastifyInstance,
+  registerApiRoutes,
+  registerWorkerRoutes,
+} from "./server";
+
+// Mock process.exit to prevent it from actually exiting during tests
+const _processExitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+  // Don't actually exit or throw, just mock it
+  return undefined as never;
+});
+
+describe("createFastifyInstance", () => {
+  test("propagates plugin startup failure before API routes can be registered", async () => {
+    const initialization = vi
+      .spyOn(proxyPlugins, "initializeLlmProxyPlugins")
+      .mockRejectedValue(new Error("plugin startup unavailable"));
+    const app = createFastifyInstance();
+    const register = vi.spyOn(app, "register");
+
+    try {
+      await expect(registerApiRoutes(app)).rejects.toThrow(
+        "plugin startup unavailable",
+      );
+      // startWebServer awaits registerApiRoutes before it calls listen, so this
+      // rejection keeps the server from becoming reachable or ready.
+      expect(register).not.toHaveBeenCalled();
+    } finally {
+      initialization.mockRestore();
+      await app.close();
+    }
+  });
+
+  describe("error handling", () => {
+    test.each([
+      [400, "Validation failed", "api_validation_error"],
+      [401, "Unauthenticated", "api_authentication_error"],
+      [403, "Forbidden", "api_authorization_error"],
+      [404, "Not found", "api_not_found_error"],
+      [500, "Internal server error", "api_internal_server_error"],
+      [409, "Resource conflict", "api_conflict_error"],
+      [429, "Slow down", "api_rate_limit_error"],
+      [418, "I'm a teapot", "unknown_api_error"],
+    ])("maps ApiError %i to its error type", async (statusCode, message, type) => {
+      const app = createFastifyInstance();
+
+      app.get(`/test-${statusCode}`, async () => {
+        throw new ApiError(statusCode, message);
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/test-${statusCode}`,
+      });
+
+      expect(response.statusCode).toBe(statusCode);
+      expect(response.json()).toEqual({
+        error: { message, type },
+      });
+    });
+
+    // Without this the client only knows it was throttled, not for how long, so
+    // it falls back to its own escalating backoff — minutes of waiting for a
+    // limit that clears in under a minute.
+    test("sends Retry-After when a throttling error knows when it clears", async () => {
+      const app = createFastifyInstance();
+      app.get("/test-throttled", async () => {
+        const error = new ApiError(429, "Slow down");
+        error.retryAfterSeconds = 12.2;
+        throw error;
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-throttled",
+      });
+
+      expect(response.statusCode).toBe(429);
+      // Rounded up: Retry-After is whole seconds, and rounding down would
+      // invite a retry that is still inside the window.
+      expect(response.headers["retry-after"]).toBe("13");
+    });
+
+    test("tells SDK clients not to retry a failure that repeats on every request", async () => {
+      const app = createFastifyInstance();
+      app.get("/test-refused", async () => {
+        const error = new ApiError(500, "Policy refused");
+        error.shouldRetry = false;
+        throw error;
+      });
+      // SDKs retry a 409 by default, so a refused conversation needs it too.
+      app.get("/test-refused-history", async () => {
+        const error = new ApiError(409, "History refused");
+        error.shouldRetry = false;
+        throw error;
+      });
+      app.get("/test-plain-500", async () => {
+        throw new ApiError(500, "Unexpected");
+      });
+
+      const refused = await app.inject({ method: "GET", url: "/test-refused" });
+      const history = await app.inject({
+        method: "GET",
+        url: "/test-refused-history",
+      });
+      const plain = await app.inject({ method: "GET", url: "/test-plain-500" });
+
+      expect(refused.statusCode).toBe(500);
+      expect(refused.headers["x-should-retry"]).toBe("false");
+      expect(history.statusCode).toBe(409);
+      expect(history.headers["x-should-retry"]).toBe("false");
+      // Without guidance the header is absent and clients keep their own rules.
+      expect(plain.headers["x-should-retry"]).toBeUndefined();
+    });
+
+    test("omits Retry-After when the error does not say when it clears", async () => {
+      const app = createFastifyInstance();
+      app.get("/test-plain-429", async () => {
+        throw new ApiError(429, "Slow down");
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-plain-429",
+      });
+
+      expect(response.headers["retry-after"]).toBeUndefined();
+    });
+
+    test("returns Fastify's own 4xx status instead of coercing it to a 500", async () => {
+      const app = createFastifyInstance();
+      app.post("/test-media-type", async () => ({ ok: true }));
+
+      // An unsupported content type makes Fastify raise its typed 415 error
+      // before the handler runs; the error handler must preserve that status.
+      const response = await app.inject({
+        method: "POST",
+        url: "/test-media-type",
+        headers: { "content-type": "application/x-unknown" },
+        payload: "raw",
+      });
+
+      expect(response.statusCode).toBe(415);
+      expect(response.json().error.type).not.toBe("api_internal_server_error");
+    });
+
+    test("returns a useful service-unavailable response when a provider connection times out", async () => {
+      const app = createFastifyInstance();
+      app.get("/v1/ollama/test-provider-timeout", async () => {
+        throw Object.assign(new Error("Connect Timeout Error"), {
+          code: "FST_REPLY_FROM_INTERNAL_SERVER_ERROR",
+          statusCode: 500,
+        });
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/v1/ollama/test-provider-timeout",
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: {
+          message:
+            "Could not connect to the model provider. Check its base URL and network access, then retry.",
+          type: "api_service_unavailable_error",
+        },
+      });
+    });
+
+    test.each([
+      "/v1/ollama",
+      "/v1/ollama-native",
+    ])("returns 503 when the real passthrough proxy at %s cannot connect", async (prefix) => {
+      const fastifyHttpProxy = (await import("@fastify/http-proxy")).default;
+      const { errors } = await import("undici");
+      const app = createFastifyInstance();
+      try {
+        await app.register(fastifyHttpProxy, {
+          upstream: "http://provider.example",
+          prefix,
+          undici: {
+            connect: (_options, callback) => {
+              queueMicrotask(() =>
+                callback(new errors.ConnectTimeoutError(), null),
+              );
+            },
+          },
+        });
+        const response = await app.inject({
+          method: "GET",
+          url: `${prefix}/models`,
+        });
+        expect(response.statusCode).toBe(503);
+        expect(response.json()).toEqual({
+          error: {
+            message:
+              "Could not connect to the model provider. Check its base URL and network access, then retry.",
+            type: "api_service_unavailable_error",
+          },
+        });
+      } finally {
+        await app.close();
+      }
+    });
+
+    test("reports a connect timeout outside the provider routes as an upstream failure", async () => {
+      const app = createFastifyInstance();
+      try {
+        app.get("/test-connect-timeout", async () => {
+          throw Object.assign(new Error("Connect Timeout Error"), {
+            code: "UND_ERR_CONNECT_TIMEOUT",
+            statusCode: 500,
+          });
+        });
+        const response = await app.inject({
+          method: "GET",
+          url: "/test-connect-timeout",
+        });
+        expect(response.statusCode).toBe(503);
+        expect(response.json().error.message).toBe(
+          "Could not connect to an upstream service (UND_ERR_CONNECT_TIMEOUT). Check the service URL and network access, then retry.",
+        );
+      } finally {
+        await app.close();
+      }
+    });
+
+    test.each([
+      [
+        "/v1/ollama/models",
+        "FST_REPLY_FROM_INTERNAL_SERVER_ERROR",
+        "Unexpected failure",
+      ],
+    ])("keeps unrelated errors as internal failures at %s", async (url, code, message) => {
+      const app = createFastifyInstance();
+      try {
+        app.get(url, async () => {
+          throw Object.assign(new Error(message), { code, statusCode: 500 });
+        });
+        const response = await app.inject({ method: "GET", url });
+        expect(response.statusCode).toBe(500);
+        expect(response.json().error.type).toBe("api_internal_server_error");
+      } finally {
+        await app.close();
+      }
+    });
+
+    test("maps transient database connectivity errors to a retryable 503", async () => {
+      const app = createFastifyInstance();
+      const databaseHost = new URL(config.database.url).hostname;
+      // Mimic the ORM's per-query wrapper around an underlying DNS failure
+      app.get("/test-db-unavailable", async () => {
+        throw new Error('Failed query: select "id" from "agents"', {
+          cause: new Error(`getaddrinfo EAI_AGAIN ${databaseHost}`),
+        });
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-db-unavailable",
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: {
+          message:
+            "Cannot reach the database. Retry shortly; if it continues, ask an administrator to check the database service and connection settings.",
+          type: "api_service_unavailable_error",
+        },
+      });
+    });
+
+    test.each([
+      [
+        "an MCP error relaying a DNS failure",
+        new Error(
+          "MCP error -32603: request to https://api.example.com/v1 failed, reason: getaddrinfo ENOTFOUND api.example.com",
+        ),
+        "api.example.com",
+        "",
+      ],
+      [
+        "an SDK wrapping a refused connection",
+        new Error("Connection error.", {
+          cause: Object.assign(
+            new Error("connect ECONNREFUSED 203.0.113.10:443"),
+            {
+              code: "ECONNREFUSED",
+              syscall: "connect",
+              address: "203.0.113.10",
+              port: 443,
+            },
+          ),
+        }),
+        "203.0.113.10:443",
+        " (ECONNREFUSED)",
+      ],
+    ])("names the unreachable host instead of blaming the database for %s", async (_kind, thrown, host, code) => {
+      const app = createFastifyInstance();
+      app.get("/test-outbound-unreachable", async () => {
+        throw thrown;
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-outbound-unreachable",
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: {
+          message: `Could not connect to ${host}${code}. Check that the network egress policy allows this host and that the service is reachable, then retry.`,
+          type: "api_service_unavailable_error",
+        },
+      });
+      await app.close();
+    });
+
+    test("names the host of a native fetch whose connection was reset", async () => {
+      // A peer (or an egress policy) that resets the socket: fetch's cause is a
+      // bare `read ECONNRESET` that carries no address, port, or host name.
+      const peer = net.createServer((socket) => {
+        socket.on("data", () => socket.resetAndDestroy());
+      });
+      await new Promise<void>((resolve) =>
+        peer.listen(0, "127.0.0.1", resolve),
+      );
+      const { port } = peer.address() as net.AddressInfo;
+      const app = createFastifyInstance();
+      const warn = vi.spyOn(app.log, "warn");
+      app.get("/test-fetch-reset", async () => {
+        await fetch(`http://127.0.0.1:${port}/`);
+        return {};
+      });
+
+      try {
+        const response = await app.inject({
+          method: "GET",
+          url: "/test-fetch-reset",
+        });
+
+        expect(response.statusCode).toBe(503);
+        expect(response.json().error.message).toBe(
+          `Could not connect to 127.0.0.1:${port} (ECONNRESET). Check that the network egress policy allows this host and that the service is reachable, then retry.`,
+        );
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            outboundTarget: `127.0.0.1:${port}`,
+            errorCode: "ECONNRESET",
+          }),
+          "HTTP 503 upstream service unavailable",
+        );
+      } finally {
+        await app.close();
+        await new Promise((resolve) => peer.close(resolve));
+      }
+    });
+
+    test("names the host of a fetch connect timeout from the timeout's own message", async () => {
+      // undici's connect timeout sets no address fields; only its message
+      // names the endpoint it was dialing.
+      const app = createFastifyInstance();
+      app.get("/test-fetch-connect-timeout", async () => {
+        throw new TypeError("fetch failed", {
+          cause: new undiciErrors.ConnectTimeoutError(
+            "Connect Timeout Error (attempted address: api.example.com:443, timeout: 10000ms)",
+          ),
+        });
+      });
+
+      try {
+        const response = await app.inject({
+          method: "GET",
+          url: "/test-fetch-connect-timeout",
+        });
+
+        expect(response.statusCode).toBe(503);
+        expect(response.json().error.message).toBe(
+          "Could not connect to api.example.com:443 (UND_ERR_CONNECT_TIMEOUT). Check that the network egress policy allows this host and that the service is reachable, then retry.",
+        );
+      } finally {
+        await app.close();
+      }
+    });
+
+    test("does not report a client timeout that names no host as a database outage", async () => {
+      const app = createFastifyInstance();
+      const warn = vi.spyOn(app.log, "warn");
+      const error = vi.spyOn(app.log, "error");
+      app.get("/test-client-timeout", async () => {
+        throw Object.assign(new Error("Request timed out"), {
+          code: "ETIMEDOUT",
+        });
+      });
+
+      try {
+        const response = await app.inject({
+          method: "GET",
+          url: "/test-client-timeout",
+        });
+
+        expect(response.statusCode).toBe(503);
+        expect(response.json()).toEqual({
+          error: {
+            message:
+              "Could not connect to an upstream service (ETIMEDOUT). Check the service URL and network access, then retry.",
+            type: "api_service_unavailable_error",
+          },
+        });
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            outboundTarget: null,
+            errorCode: "ETIMEDOUT",
+          }),
+          "HTTP 503 upstream service unavailable",
+        );
+        expect(error).not.toHaveBeenCalledWith(
+          expect.anything(),
+          "HTTP 503 database temporarily unavailable",
+        );
+      } finally {
+        await app.close();
+      }
+    });
+
+    test("still reports a timeout raised by the database client as a database outage", async () => {
+      const app = createFastifyInstance();
+      app.get("/test-db-timeout", async () => {
+        throw new DrizzleQueryError(
+          'select "id" from "agents"',
+          [],
+          Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT" }),
+        );
+      });
+
+      try {
+        const response = await app.inject({
+          method: "GET",
+          url: "/test-db-timeout",
+        });
+
+        expect(response.statusCode).toBe(503);
+        expect(response.json().error.message).toBe(
+          "Cannot reach the database. Retry shortly; if it continues, ask an administrator to check the database service and connection settings.",
+        );
+      } finally {
+        await app.close();
+      }
+    });
+
+    test.each([
+      [
+        "disk_full",
+        "No space left on device",
+        "Database storage is full. Ask an administrator to free or expand it.",
+      ],
+      [
+        "statement_timeout",
+        "canceling statement due to statement timeout",
+        "Database query timed out. Retry; if it continues, ask an administrator to check database load.",
+      ],
+    ])("gives an actionable response for database %s without exposing SQL", async (_kind, cause, message) => {
+      const app = createFastifyInstance();
+      app.get("/test-db-capacity", async () => {
+        throw new Error('Failed query: select "secret" from "secrets"', {
+          cause: new Error(cause),
+        });
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-db-capacity",
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: { message, type: "api_service_unavailable_error" },
+      });
+      expect(response.body).not.toContain("select");
+      await app.close();
+    });
+
+    test("handles standard Error objects correctly", async () => {
+      const app = createFastifyInstance();
+
+      app.get("/test-standard-error", async () => {
+        throw new Error("Something went wrong");
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-standard-error",
+      });
+
+      // Standard errors are now properly handled as 500 with api_internal_server_error type
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toEqual({
+        error: {
+          message: "Something went wrong",
+          type: "api_internal_server_error",
+        },
+      });
+    });
+
+    test("handles TypeError objects correctly", async () => {
+      const app = createFastifyInstance();
+
+      app.get("/test-type-error", async () => {
+        throw new TypeError("Cannot read property of undefined");
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-type-error",
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toEqual({
+        error: {
+          message: "Cannot read property of undefined",
+          type: "api_internal_server_error",
+        },
+      });
+    });
+
+    test("keeps a failed query's SQL and parameters out of the 500 body but logs the query", async () => {
+      const app = createFastifyInstance();
+      const loggerErrorSpy = vi.spyOn(app.log, "error");
+      const pgError = Object.assign(
+        new Error(
+          'insert or update on table "chat_api_keys" violates foreign key constraint',
+        ),
+        { code: "23503" },
+      );
+      app.get("/test-db-query-error", async () => {
+        throw new DrizzleQueryError(
+          'insert into "chat_api_keys" ("secret_id", "user_id") values ($1, $2)',
+          ["secret-id-1", "owner-id-1"],
+          pgError,
+        );
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-db-query-error",
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toEqual({
+        error: {
+          message:
+            "A database query failed. Ask an administrator to check the server logs.",
+          type: "api_internal_server_error",
+        },
+      });
+      expect(response.body).not.toContain("chat_api_keys");
+      expect(response.body).not.toContain("secret-id-1");
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: expect.stringContaining("Failed query"),
+          statusCode: 500,
+        }),
+        "HTTP 50x request error occurred",
+      );
+
+      loggerErrorSpy.mockRestore();
+      await app.close();
+    });
+
+    test("keeps a failed query's text out of an ApiError built from it", async () => {
+      const app = createFastifyInstance();
+      const queryError = new DrizzleQueryError(
+        'delete from "mcp_server" where "id" = $1',
+        ["server-id-1"],
+        new Error("canceled"),
+      );
+      app.get("/test-api-error-from-query", async () => {
+        throw new ApiError(500, `Hard reset failed: ${queryError.message}`);
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-api-error-from-query",
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json().error.message).toBe(
+        "A database query failed. Ask an administrator to check the server logs.",
+      );
+      expect(response.body).not.toContain("server-id-1");
+      await app.close();
+    });
+
+    test("keeps a wrapper's own message when the failed query is only its cause", async () => {
+      const app = createFastifyInstance();
+      app.get("/test-wrapped-query-error", async () => {
+        throw new Error("Could not save the key", {
+          cause: new DrizzleQueryError(
+            'insert into "secret" ("secret") values ($1)',
+            ["value-1"],
+            new Error("violates foreign key constraint"),
+          ),
+        });
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-wrapped-query-error",
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json().error.message).toBe("Could not save the key");
+      await app.close();
+    });
+
+    test("handles response serialization errors when response doesn't match schema", async () => {
+      const app = createFastifyInstance();
+
+      app.get(
+        "/test-serialization-error",
+        {
+          schema: {
+            response: {
+              200: z.object({
+                name: z.string(),
+                count: z.number(),
+              }),
+            },
+          },
+        },
+        async () => {
+          // Return data that doesn't match the response schema (wrong type for "count")
+          return { name: "test", count: "not-a-number" };
+        },
+      );
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-serialization-error",
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toEqual({
+        error: {
+          message: "Response doesn't match the schema",
+          type: "api_internal_server_error",
+        },
+      });
+    });
+
+    test("captures response serialization errors in Sentry with validation details", async () => {
+      mockSentryCaptureException.mockClear();
+      const app = createFastifyInstance();
+
+      app.get(
+        "/test-serialization-sentry",
+        {
+          schema: {
+            response: {
+              200: z.object({
+                id: z.string(),
+                active: z.boolean(),
+              }),
+            },
+          },
+        },
+        async () => {
+          // Return wrong type for "active" to trigger serialization error
+          return { id: "123", active: "yes" };
+        },
+      );
+
+      await app.inject({
+        method: "GET",
+        url: "/test-serialization-sentry",
+      });
+
+      // Verify Sentry.captureException was called with the error and validation details
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+
+      const [capturedError, capturedContext] =
+        mockSentryCaptureException.mock.calls[0];
+      expect(capturedError).toBeDefined();
+      expect(capturedContext.extra).toBeDefined();
+      expect(capturedContext.extra.method).toBe("GET");
+      expect(capturedContext.extra.url).toContain("/test-serialization-sentry");
+      expect(capturedContext.extra.validationErrors).toBeInstanceOf(Array);
+      expect(capturedContext.extra.validationErrors.length).toBeGreaterThan(0);
+      expect(capturedContext.tags).toEqual({
+        error_type: "response_serialization",
+      });
+
+      // Verify the validation error has useful details
+      const firstError = capturedContext.extra.validationErrors[0];
+      expect(firstError).toHaveProperty("path");
+      expect(firstError).toHaveProperty("code");
+      expect(firstError).toHaveProperty("message");
+    });
+
+    test("logs response serialization errors with validation details in message", async () => {
+      const app = createFastifyInstance();
+      const loggerErrorSpy = vi.spyOn(app.log, "error");
+
+      app.get(
+        "/test-serialization-logging",
+        {
+          schema: {
+            response: {
+              200: z.object({
+                value: z.number(),
+              }),
+            },
+          },
+        },
+        async () => {
+          return { value: "not-a-number" };
+        },
+      );
+
+      await app.inject({
+        method: "GET",
+        url: "/test-serialization-logging",
+      });
+
+      // Verify the log message includes the URL and validation error details
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: 500,
+          method: "GET",
+          validationErrors: expect.arrayContaining([
+            expect.objectContaining({
+              code: expect.any(String),
+              message: expect.any(String),
+            }),
+          ]),
+        }),
+        expect.stringContaining("/test-serialization-logging"),
+      );
+
+      loggerErrorSpy.mockRestore();
+    });
+
+    test("handles validation errors from Zod", async () => {
+      const app = createFastifyInstance();
+
+      const TestSchema = z.object({
+        required: z.string(),
+      });
+
+      app.post(
+        "/test-validation",
+        {
+          schema: {
+            body: TestSchema,
+            response: {
+              200: z.object({ success: z.boolean() }),
+            },
+          },
+        },
+        async () => {
+          return { success: true };
+        },
+      );
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/test-validation",
+        headers: {
+          "content-type": "application/json",
+        },
+        payload: {
+          // Missing required field
+          notRequired: "value",
+        },
+      });
+
+      // Zod validation errors are handled properly and return 400
+      expect(response.statusCode).toBe(400);
+      const body = response.json();
+      expect(body.error).toBeDefined();
+      expect(body.error.type).toBe("api_validation_error");
+      expect(typeof body.error.message).toBe("string");
+    });
+
+    test("returns 413 with body-too-large message when payload exceeds limit", async () => {
+      const app = createFastifyInstance();
+      const loggerWarnSpy = vi.spyOn(app.log, "warn");
+
+      // Route-scoped bodyLimit keeps the test payload small while still
+      // exercising the FST_ERR_CTP_BODY_TOO_LARGE branch.
+      app.post("/test-413", { bodyLimit: 100 }, async () => ({ ok: true }));
+
+      const oversized = "x".repeat(500);
+      const response = await app.inject({
+        method: "POST",
+        url: "/test-413",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({ data: oversized }),
+      });
+
+      expect(response.statusCode).toBe(413);
+      const body = response.json();
+      expect(body.error.type).toBe("api_payload_too_large_error");
+      expect(body.error.message).toMatch(/Request body too large/);
+      expect(body.error.message).toMatch(/ARCHESTRA_API_BODY_LIMIT/);
+
+      expect(loggerWarnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          statusCode: 413,
+          code: "FST_ERR_CTP_BODY_TOO_LARGE",
+          bodyLimit: expect.any(Number),
+          method: "POST",
+          url: "/test-413",
+        }),
+        "HTTP 413 request body too large",
+      );
+
+      loggerWarnSpy.mockRestore();
+    });
+  });
+
+  describe("keep-alive", () => {
+    // A load balancer that pools connections to this server will reuse an idle
+    // one right up to its own keep-alive deadline. If we close first, it can
+    // dispatch a request onto a socket we are tearing down, and the client sees
+    // a dropped request on a call that was otherwise fine — intermittent, and
+    // indistinguishable from a flaky network. Google Cloud's external
+    // Application Load Balancer is the strictest of the common ones: a fixed,
+    // non-configurable 600s. Neither the compiler nor Fastify complains if the
+    // option goes missing — Fastify quietly falls back to its own 72s default —
+    // so this pins the one property that keeps the race closed.
+    const LOAD_BALANCER_KEEP_ALIVE_MS = 600_000;
+
+    test("outlasts the longest load-balancer keep-alive window", () => {
+      const app = createFastifyInstance();
+
+      expect(app.server.keepAliveTimeout).toBeGreaterThan(
+        LOAD_BALANCER_KEEP_ALIVE_MS,
+      );
+    });
+  });
+
+  describe("logging verification", () => {
+    test("logs 500+ errors at error level", async () => {
+      const app = createFastifyInstance();
+
+      // Mock the logger error method
+      const loggerErrorSpy = vi.spyOn(app.log, "error");
+
+      app.get("/test-500-logging", async () => {
+        throw new ApiError(500, "Server error");
+      });
+
+      await app.inject({
+        method: "GET",
+        url: "/test-500-logging",
+      });
+
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: "Server error",
+          statusCode: 500,
+          method: "GET",
+          url: "/test-500-logging",
+        }),
+        "HTTP 50x request error occurred",
+      );
+
+      loggerErrorSpy.mockRestore();
+    });
+
+    test("logs 400-499 errors at info level", async () => {
+      const app = createFastifyInstance();
+
+      // Mock the logger info method
+      const loggerInfoSpy = vi.spyOn(app.log, "info");
+
+      app.get("/test-400-logging", async () => {
+        throw new ApiError(404, "Not found");
+      });
+
+      await app.inject({
+        method: "GET",
+        url: "/test-400-logging",
+      });
+
+      expect(loggerInfoSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: "Not found",
+          statusCode: 404,
+          method: "GET",
+          url: "/test-400-logging",
+        }),
+        "HTTP 40x request error occurred",
+      );
+
+      loggerInfoSpy.mockRestore();
+    });
+
+    test("logs a 401 at debug level", async () => {
+      const app = createFastifyInstance();
+      const loggerInfoSpy = vi.spyOn(app.log, "info");
+      const loggerDebugSpy = vi.spyOn(app.log, "debug");
+
+      app.get("/test-401-logging", async () => {
+        throw new ApiError(401, "Unauthenticated");
+      });
+
+      await app.inject({ method: "GET", url: "/test-401-logging" });
+
+      expect(loggerDebugSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ error: "Unauthenticated", statusCode: 401 }),
+        "HTTP 40x request error occurred",
+      );
+      expect(loggerInfoSpy).not.toHaveBeenCalledWith(
+        expect.anything(),
+        "HTTP 40x request error occurred",
+      );
+
+      loggerInfoSpy.mockRestore();
+      loggerDebugSpy.mockRestore();
+    });
+
+    test("logs unknown 4xx status codes at info level", async () => {
+      const app = createFastifyInstance();
+
+      // Mock the logger info method since 418 >= 400
+      const loggerInfoSpy = vi.spyOn(app.log, "info");
+
+      app.get("/test-unknown-logging", async () => {
+        throw new ApiError(418, "I'm a teapot");
+      });
+
+      await app.inject({
+        method: "GET",
+        url: "/test-unknown-logging",
+      });
+
+      // Verify that info level logging was called for 4xx status codes
+      expect(loggerInfoSpy).toHaveBeenCalled();
+
+      loggerInfoSpy.mockRestore();
+    });
+
+    test("logs unknown status codes below 400 at error level", async () => {
+      const app = createFastifyInstance();
+
+      // Mock the logger error method
+      const loggerErrorSpy = vi.spyOn(app.log, "error");
+
+      app.get("/test-low-status-logging", async () => {
+        throw new ApiError(200, "Success with error"); // Unusual but tests the else branch
+      });
+
+      await app.inject({
+        method: "GET",
+        url: "/test-low-status-logging",
+      });
+
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: "Success with error",
+          statusCode: 200,
+          method: "GET",
+          url: "/test-low-status-logging",
+        }),
+        "HTTP request error occurred",
+      );
+
+      loggerErrorSpy.mockRestore();
+    });
+
+    test("logs standard errors at error level with request context", async () => {
+      const app = createFastifyInstance();
+
+      const loggerErrorSpy = vi.spyOn(app.log, "error");
+
+      app.get("/test-standard-error-logging", async () => {
+        throw new Error("Standard error");
+      });
+
+      await app.inject({
+        method: "GET",
+        url: "/test-standard-error-logging",
+      });
+
+      expect(loggerErrorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: "Standard error",
+          statusCode: 500,
+          method: "GET",
+          url: "/test-standard-error-logging",
+          stack: expect.any(String),
+        }),
+        "HTTP 50x request error occurred",
+      );
+
+      loggerErrorSpy.mockRestore();
+    });
+  });
+
+  describe("response format", () => {
+    test("returns consistent error response format for ApiError", async () => {
+      const app = createFastifyInstance();
+
+      app.get("/test-format", async () => {
+        throw new ApiError(422, "Unprocessable entity");
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-format",
+      });
+
+      expect(response.statusCode).toBe(422);
+
+      const body = response.json();
+      expect(body).toHaveProperty("error");
+      expect(body.error).toHaveProperty("message");
+      expect(body.error).toHaveProperty("type");
+      expect(body.error.message).toBe("Unprocessable entity");
+      expect(body.error.type).toBe("unknown_api_error");
+    });
+
+    test("handles errors thrown from async route handlers", async () => {
+      const app = createFastifyInstance();
+
+      app.get("/test-async-error", async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        throw new ApiError(409, "Conflict");
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-async-error",
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json()).toEqual({
+        error: {
+          message: "Conflict",
+          type: "api_conflict_error",
+        },
+      });
+    });
+
+    test("handles errors with different HTTP methods", async () => {
+      const app = createFastifyInstance();
+
+      const methods = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
+
+      for (const method of methods) {
+        app.route({
+          method,
+          url: `/test-${method.toLowerCase()}`,
+          handler: async () => {
+            throw new ApiError(400, `${method} validation error`);
+          },
+        });
+      }
+
+      for (const method of methods) {
+        const response = await app.inject({
+          method,
+          url: `/test-${method.toLowerCase()}`,
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(response.json()).toEqual({
+          error: {
+            message: `${method} validation error`,
+            type: "api_validation_error",
+          },
+        });
+      }
+    });
+  });
+
+  describe("Fastify instance configuration", () => {
+    test("has ZodTypeProvider configured", async () => {
+      const app = createFastifyInstance();
+
+      const TestSchema = z.object({
+        name: z.string(),
+        age: z.number(),
+      });
+
+      app.post(
+        "/test-zod",
+        {
+          schema: {
+            body: TestSchema,
+            response: {
+              200: z.object({ received: z.boolean() }),
+            },
+          },
+        },
+        async (request) => {
+          // If Zod validation works, request.body should be typed correctly
+          expect((request.body as { name: string }).name).toBeDefined();
+          expect((request.body as { age: number }).age).toBeDefined();
+          return { received: true };
+        },
+      );
+
+      const response = await app.inject({
+        method: "POST",
+        url: "/test-zod",
+        headers: {
+          "content-type": "application/json",
+        },
+        payload: {
+          name: "John",
+          age: 30,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ received: true });
+    });
+
+    test("has validator and serializer compilers configured", async () => {
+      const app = createFastifyInstance();
+
+      // Test that the compilers are working by using a route with schema validation
+      app.get(
+        "/test-compilers",
+        {
+          schema: {
+            querystring: z.object({
+              test: z.string(),
+            }),
+            response: {
+              200: z.object({
+                message: z.string(),
+                query: z.string(),
+              }),
+            },
+          },
+        },
+        async (request) => {
+          return {
+            message: "Compilers working",
+            query: (request.query as { test: string }).test,
+          };
+        },
+      );
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/test-compilers?test=value",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        message: "Compilers working",
+        query: "value",
+      });
+    });
+  });
+
+  describe("browser API documents", () => {
+    test("uses a stable content-versioned favicon without changing API clients", async () => {
+      const favicon =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/58BAwAI/AL+hc2rNAAAAABJRU5ErkJggg==";
+      const appearanceSpy = vi
+        .spyOn(OrganizationModel, "getAppearanceSettings")
+        .mockResolvedValue({ favicon } as never);
+      const app = createFastifyInstance();
+      app.get("/api/test-browser-document", async () => ({ value: "ok" }));
+
+      try {
+        const browserHeaders = {
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+        };
+        const firstNavigation = await app.inject({
+          method: "GET",
+          url: "/api/test-browser-document",
+          headers: browserHeaders,
+        });
+        const reload = await app.inject({
+          method: "GET",
+          url: "/api/test-browser-document",
+          headers: browserHeaders,
+        });
+        const navigationWithoutFetchMetadata = await app.inject({
+          method: "GET",
+          url: "/api/test-browser-document?source=qa",
+          headers: { accept: "text/html,application/xhtml+xml" },
+        });
+        const apiClient = await app.inject({
+          method: "GET",
+          url: "/api/test-browser-document",
+          headers: { accept: "application/json, */*" },
+        });
+        const fetchRequest = await app.inject({
+          method: "GET",
+          url: "/api/test-browser-document",
+          headers: {
+            accept: "text/html",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+          },
+        });
+
+        expect(firstNavigation.headers["content-type"]).toContain("text/html");
+        expect(firstNavigation.body).toContain(
+          '<link rel="icon" href="/favicon.ico?v=48ac386978254451">',
+        );
+        expect(reload.body).toContain(
+          '<link rel="icon" href="/favicon.ico?v=48ac386978254451">',
+        );
+        expect(navigationWithoutFetchMetadata.body).toContain(
+          '<link rel="icon" href="/favicon.ico?v=48ac386978254451">',
+        );
+        expect(apiClient.headers["content-type"]).toContain("application/json");
+        expect(apiClient.json()).toEqual({ value: "ok" });
+        expect(fetchRequest.headers["content-type"]).toContain(
+          "application/json",
+        );
+        expect(fetchRequest.json()).toEqual({ value: "ok" });
+        expect(appearanceSpy).toHaveBeenCalledTimes(3);
+      } finally {
+        appearanceSpy.mockRestore();
+        await app.close();
+      }
+    });
+  });
+});
+
+describe("health endpoints", () => {
+  describe("/health endpoint", () => {
+    test("returns 200 with application info", async () => {
+      const app = createFastifyInstance();
+      await app.register(healthRoutes);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/health",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body).toHaveProperty("name");
+      expect(body).toHaveProperty("status");
+      expect(body).toHaveProperty("version");
+      expect(body.status).toBe("ok");
+    });
+  });
+
+  describe("/ready endpoint", () => {
+    const originalOpenappa = {
+      enabled: config.openappa.enabled,
+      core: config.enterpriseFeatures.core,
+    };
+    afterEach(() => {
+      config.openappa.enabled = originalOpenappa.enabled;
+      config.enterpriseFeatures.core = originalOpenappa.core;
+    });
+
+    test("returns 200 when database is healthy", async () => {
+      config.openappa.enabled = false;
+      const app = createFastifyInstance();
+      await app.register(healthRoutes);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/ready",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json();
+      expect(body).toHaveProperty("name");
+      expect(body).toHaveProperty("status");
+      expect(body).toHaveProperty("version");
+      expect(body).toHaveProperty("database");
+      expect(body.status).toBe("ok");
+      expect(body.database).toBe("connected");
+      expect(body.openappa).toBe("disabled");
+    });
+
+    test("returns 503 when Guardrails is enabled and its runtime cannot open", async () => {
+      // The test process resolves no database URL for the native runtime, so
+      // opening it fails the way a refused URL does in a deployment.
+      config.openappa.enabled = true;
+      config.enterpriseFeatures.core = true;
+      const app = createFastifyInstance();
+      await app.register(healthRoutes);
+
+      const response = await app.inject({ method: "GET", url: "/ready" });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({
+        status: "degraded",
+        database: "connected",
+        openappa: "unavailable",
+        openappaReason: "unknown",
+      });
+    });
+
+    test("returns 503 when database is unhealthy", async () => {
+      const app = createFastifyInstance();
+      await app.register(healthRoutes);
+
+      // Mock isDatabaseHealthy to return false
+      mockIsDatabaseHealthy.mockResolvedValueOnce(false);
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/ready",
+      });
+
+      expect(response.statusCode).toBe(503);
+      const body = response.json();
+      expect(body.status).toBe("degraded");
+      expect(body.database).toBe("disconnected");
+    });
+
+    test("returns 200 without checking the database in maintenance mode", async () => {
+      const originalMaintenanceMode = config.maintenanceMode;
+      config.maintenanceMode = "Scheduled maintenance";
+      mockIsDatabaseHealthy.mockClear();
+
+      try {
+        const app = createFastifyInstance();
+        await app.register(healthRoutes);
+
+        const response = await app.inject({
+          method: "GET",
+          url: "/ready",
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toMatchObject({
+          status: "maintenance",
+          database: "not_checked",
+        });
+        expect(mockIsDatabaseHealthy).not.toHaveBeenCalled();
+      } finally {
+        config.maintenanceMode = originalMaintenanceMode;
+      }
+    });
+  });
+});
+
+describe("buildSandboxFrameAncestors", () => {
+  test("stays open when the deployment declares no origins", () => {
+    // The published Docker image sets no ARCHESTRA_FRONTEND_URL and no sandbox
+    // domain, so the browser can legitimately reach it on any origin: a
+    // remapped published port, a LAN address, a reverse proxy. Anything but "*"
+    // here has the browser refuse the sandbox iframe outright
+    // (ERR_BLOCKED_BY_RESPONSE), leaving an empty app pane.
+    expect(
+      buildSandboxFrameAncestors({
+        allowedOrigins: [],
+        sandboxDomain: null,
+      }),
+    ).toBe("*");
+  });
+
+  test("declared origins restrict the policy", () => {
+    expect(
+      buildSandboxFrameAncestors({
+        allowedOrigins: ["https://archestra.example.com"],
+        sandboxDomain: null,
+      }),
+    ).toBe("https://archestra.example.com");
+  });
+
+  test("a sandbox domain alone is a declared restriction", () => {
+    expect(
+      buildSandboxFrameAncestors({
+        allowedOrigins: [],
+        sandboxDomain: "mcp.example.com",
+      }),
+    ).toBe("*.mcp.example.com");
+  });
+
+  test("deduplicates repeated sources", () => {
+    expect(
+      buildSandboxFrameAncestors({
+        allowedOrigins: [
+          "https://archestra.example.com",
+          "https://archestra.example.com",
+        ],
+        sandboxDomain: null,
+      }),
+    ).toBe("https://archestra.example.com");
+  });
+});
+
+describe("registerWorkerRoutes", () => {
+  // Scheduled and A2A runs execute on workers, where the in-process APPA
+  // runtime posts its annotators and helper consults to this server.
+  test("serves the APPA runtime's loopback endpoints", async () => {
+    const originalEnabled = config.openappa.enabled;
+    config.openappa.enabled = true;
+    const app = createFastifyInstance();
+    try {
+      await app.register(authPlugin);
+      await registerWorkerRoutes(app);
+
+      const noop = await app.inject({
+        method: "POST",
+        url: GUARDRAILS_NOOP_ANNOTATOR_PATH,
+        payload: {
+          version: 1,
+          kind: "annotation",
+          name: "noop",
+          artifact: { args: { name: "unlisted_tool", arguments: {} } },
+          declaration: {},
+        },
+      });
+      expect(noop.statusCode, noop.body).toBe(200);
+
+      // Without the per-process bridge bearer: the route is mounted and
+      // turns the caller away itself.
+      for (const url of [
+        OPENAPPA_ARCHESTRA_ANNOTATOR_PATH,
+        `${OPENAPPA_HELPERS_PREFIX}/${crypto.randomUUID()}/helper`,
+      ]) {
+        const response = await app.inject({ method: "POST", url, payload: {} });
+        expect(response.statusCode, `${url}: ${response.body}`).toBe(401);
+      }
+    } finally {
+      config.openappa.enabled = originalEnabled;
+      await app.close();
+    }
+  });
+});

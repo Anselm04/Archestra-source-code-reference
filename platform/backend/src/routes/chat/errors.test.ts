@@ -1,0 +1,2535 @@
+import {
+  AnthropicErrorTypes,
+  ApiErrorTypeSchema,
+  ArchestraInternalErrorCode,
+  BedrockErrorTypes,
+  ChatErrorCode,
+  ChatErrorMessages,
+  GeminiErrorCodes,
+  GeminiErrorReasons,
+  OpenAIErrorTypes,
+  ZhipuaiErrorTypes,
+} from "@archestra/shared";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockSentryCaptureException = vi.hoisted(() => vi.fn());
+
+vi.mock("@sentry/node", () => ({
+  captureException: mockSentryCaptureException,
+}));
+
+import { NoSuchToolError, UnsupportedFunctionalityError } from "ai";
+import { MICROSOFT_365_COPILOT_TOOLS_UNSUPPORTED_MESSAGE } from "@/routes/proxy/adapters/microsoft-365-copilot-graph-translator";
+import { GithubCopilot } from "@/types";
+import { LlmProviderAuthRequiredError } from "@/utils/llm-provider-auth-error";
+import {
+  buildAbortiveTurnError,
+  EmptyModelResponseError,
+  formatUnavailableToolErrorDetails,
+  getUnavailableToolErrorDetails,
+  mapProviderError,
+  ProviderError,
+  sanitizeChatErrorForFrontend,
+} from "./errors";
+import { ContextWindowExceededError } from "./normalization/enforce-context-window-limit";
+import { RequestTooLargeError } from "./normalization/enforce-request-size-limit";
+
+beforeEach(() => {
+  mockSentryCaptureException.mockClear();
+});
+
+describe("mapProviderError - aborted run", () => {
+  it("maps an AbortError to the Aborted card without reporting it", () => {
+    const result = mapProviderError(
+      new DOMException("This operation was aborted", "AbortError"),
+      "openrouter",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.Aborted);
+    expect(result.isRetryable).toBe(false);
+    expect(result.message).toBe(ChatErrorMessages[ChatErrorCode.Aborted]);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a TimeoutError as a cancellation", () => {
+    const result = mapProviderError(
+      new DOMException("The operation timed out", "TimeoutError"),
+      "openrouter",
+    );
+
+    expect(result.code).not.toBe(ChatErrorCode.Aborted);
+  });
+});
+
+describe("mapProviderError - per-user provider auth required", () => {
+  it("maps LlmProviderAuthRequiredError to a ProviderAuthRequired card with authAction", () => {
+    const result = mapProviderError(
+      new LlmProviderAuthRequiredError("github-copilot"),
+      "github-copilot",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.ProviderAuthRequired);
+    expect(result.isRetryable).toBe(false);
+    expect(result.authAction).toEqual({
+      provider: "github-copilot",
+      providerLabel: "GitHub Copilot",
+    });
+  });
+
+  it("reclassifies a revoked ChatGPT-subscription envelope (internal_code) to the reconnect card, keeping the actionable message", () => {
+    // The envelope the chat route receives when the Codex refresh token is
+    // expired/revoked: the token service's synthetic 401 relayed by the proxy
+    // with the normalized internal code. Without it, the 401 maps to the
+    // generic Authentication card ("Invalid API key — check your Chat
+    // Settings"), pointing at entirely the wrong remedy.
+    const revokedMessage =
+      "ChatGPT sign-in has expired or been revoked. Reconnect your ChatGPT account to keep using your Codex subscription.";
+    const result = mapProviderError(
+      {
+        name: "AI_APICallError",
+        statusCode: 401,
+        responseBody: JSON.stringify({
+          error: {
+            type: "authentication_error",
+            message: revokedMessage,
+            internal_code: ArchestraInternalErrorCode.ProviderAuthRequired,
+          },
+        }),
+        isRetryable: false,
+      },
+      "openai",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.ProviderAuthRequired);
+    expect(result.isRetryable).toBe(false);
+    expect(result.message).toBe(revokedMessage);
+    expect(result.authAction).toEqual({
+      provider: "openai",
+      providerLabel: "ChatGPT Subscription",
+    });
+  });
+
+  it("reclassifies a revoked X Premium envelope (internal_code) to the reconnect card labeled with the subscription", () => {
+    // Same synthetic-401 shape as the Codex case, produced by the xAI
+    // subscription fetch wrapper and relayed by the xAI adapter's
+    // extractInternalCode.
+    const revokedMessage =
+      "Your xAI SuperGrok sign-in has expired or been revoked. Reconnect your Grok account to continue.";
+    const result = mapProviderError(
+      {
+        name: "AI_APICallError",
+        statusCode: 401,
+        responseBody: JSON.stringify({
+          error: {
+            type: "authentication_error",
+            message: revokedMessage,
+            internal_code: ArchestraInternalErrorCode.ProviderAuthRequired,
+          },
+        }),
+        isRetryable: false,
+      },
+      "xai",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.ProviderAuthRequired);
+    expect(result.isRetryable).toBe(false);
+    expect(result.message).toBe(revokedMessage);
+    expect(result.authAction).toEqual({
+      provider: "xai",
+      providerLabel: "SuperGrok",
+    });
+  });
+});
+
+describe("mapProviderError - request too large", () => {
+  it("maps RequestTooLargeError to a non-retryable RequestTooLarge card naming the decoded file size", () => {
+    const result = mapProviderError(
+      new RequestTooLargeError({
+        provider: "bedrock",
+        fileBytes: 49 * 1024 * 1024,
+        limitBytes: 20 * 1024 * 1024,
+        fileCount: 1,
+      }),
+      "bedrock",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.RequestTooLarge);
+    expect(result.isRetryable).toBe(false);
+    // The user-facing size is the real file size, not the inflated wire size.
+    expect(result.message).toMatch(/\bThis file is 49 MB\b/);
+    expect(result.message).toContain("AWS Bedrock");
+    expect(result.message).toContain("20 MB");
+  });
+});
+
+describe("mapProviderError - context window exceeded", () => {
+  it("maps ContextWindowExceededError to a non-retryable ContextTooLong card", () => {
+    const result = mapProviderError(
+      new ContextWindowExceededError({
+        model: "claude-test",
+        estimatedTokens: 566_084,
+        contextLength: 262_144,
+      }),
+      "anthropic",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+    expect(result.isRetryable).toBe(false);
+  });
+});
+
+describe("mapProviderError - request exceeds the provider's token bucket", () => {
+  /**
+   * The Archestra envelope the chat route receives for a 413 the Groq adapter
+   * classified as a token-bucket rejection: the prompt plus the reserved output
+   * budget exceeds the whole per-minute allowance. `type` here is Archestra's
+   * own 413 label (see ApiError), not Groq's — Groq's body is already collapsed
+   * into `message` plus the normalized `internal_code` by this point.
+   */
+  function createGroqTokenBucketError(internalCode?: string) {
+    return {
+      name: "AI_APICallError",
+      statusCode: 413,
+      responseBody: JSON.stringify({
+        error: {
+          type: ApiErrorTypeSchema.enum.api_payload_too_large_error,
+          message:
+            "Request too large for model `openai/gpt-oss-120b` in organization `org_test` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 34621, please reduce your message size and try again.",
+          internal_code: internalCode,
+        },
+      }),
+      isRetryable: false,
+    };
+  }
+
+  it("maps the normalized internal code to a non-retryable RequestExceedsRateLimit card", () => {
+    const result = mapProviderError(
+      createGroqTokenBucketError(
+        ArchestraInternalErrorCode.RequestExceedsRateLimit,
+      ),
+      "groq",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.RequestExceedsRateLimit);
+    expect(result.isRetryable).toBe(false);
+  });
+
+  it("never tells the user to start a new chat", () => {
+    // The whole defect: a one-word message was reported as an over-long
+    // conversation, so every remedy the card suggested was unreachable.
+    const result = mapProviderError(
+      createGroqTokenBucketError(
+        ArchestraInternalErrorCode.RequestExceedsRateLimit,
+      ),
+      "groq",
+    );
+
+    expect(result.message).not.toContain("new chat");
+    expect(result.message).toContain("per minute");
+  });
+
+  it("falls back to RequestTooLarge when the adapter did not classify it", () => {
+    const result = mapProviderError(createGroqTokenBucketError(), "groq");
+
+    expect(result.code).toBe(ChatErrorCode.RequestTooLarge);
+    expect(result.isRetryable).toBe(false);
+  });
+});
+
+// =============================================================================
+// OpenAI Error Tests
+// =============================================================================
+
+describe("mapProviderError - OpenAI", () => {
+  /**
+   * Helper to create an APICallError-like object for OpenAI
+   */
+  function createOpenAIError(
+    statusCode: number,
+    errorType: string,
+    message: string,
+    code?: string,
+    internalCode?: string,
+    usageLimit?: { entity_type: string; limit_type: string },
+  ) {
+    return {
+      name: "AI_APICallError",
+      statusCode,
+      responseBody: JSON.stringify({
+        error: {
+          type: errorType,
+          message,
+          code,
+          internal_code: internalCode,
+          usage_limit: usageLimit,
+        },
+      }),
+      isRetryable: statusCode >= 500 || statusCode === 429,
+    };
+  }
+
+  describe("400 - invalid_request_error", () => {
+    it("should map to InvalidRequest", () => {
+      const error = createOpenAIError(
+        400,
+        OpenAIErrorTypes.INVALID_REQUEST,
+        "Invalid request parameters",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+      expect(result.isRetryable).toBe(false);
+      expect(result.originalError?.provider).toBe("openai");
+      expect(result.originalError?.status).toBe(400);
+    });
+  });
+
+  describe("401 - authentication_error", () => {
+    it("should map to Authentication for authentication_error type", () => {
+      const error = createOpenAIError(
+        401,
+        OpenAIErrorTypes.AUTHENTICATION,
+        "Invalid authentication credentials",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+      expect(result.message).toBe(
+        ChatErrorMessages[ChatErrorCode.Authentication],
+      );
+      expect(result.isRetryable).toBe(false);
+    });
+
+    it("should map to Authentication for invalid_api_key code", () => {
+      const error = createOpenAIError(
+        401,
+        OpenAIErrorTypes.INVALID_REQUEST,
+        "Invalid API key provided",
+        OpenAIErrorTypes.INVALID_API_KEY_CODE,
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+    });
+  });
+
+  describe("403 - insufficient_quota / permission_denied", () => {
+    it("should map to PermissionDenied", () => {
+      const error = createOpenAIError(
+        403,
+        OpenAIErrorTypes.PERMISSION_DENIED,
+        "You have insufficient quota for this operation",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.PermissionDenied);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("404 - not_found_error", () => {
+    it("should map to NotFound", () => {
+      const error = createOpenAIError(
+        404,
+        OpenAIErrorTypes.NOT_FOUND,
+        "The model 'gpt-5' does not exist",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.NotFound);
+      expect(result.isRetryable).toBe(false);
+    });
+
+    it("should map to NotFound for model_not_found code", () => {
+      const error = createOpenAIError(
+        404,
+        OpenAIErrorTypes.INVALID_REQUEST,
+        "The model does not exist",
+        OpenAIErrorTypes.MODEL_NOT_FOUND,
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.NotFound);
+    });
+  });
+
+  describe("409 - conflict_error", () => {
+    it("should map to InvalidRequest", () => {
+      const error = createOpenAIError(
+        409,
+        OpenAIErrorTypes.CONFLICT,
+        "Conflict with existing resource",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("422 - unprocessable_entity_error", () => {
+    it("should map to InvalidRequest", () => {
+      const error = createOpenAIError(
+        422,
+        OpenAIErrorTypes.UNPROCESSABLE_ENTITY,
+        "Unable to process the request",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("429 - rate_limit_exceeded", () => {
+    it("should map to RateLimit", () => {
+      const error = createOpenAIError(
+        429,
+        OpenAIErrorTypes.RATE_LIMIT,
+        "Rate limit exceeded. Please retry after 20 seconds.",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+      expect(result.isRetryable).toBe(true);
+    });
+
+    it("marks usage-limit budget overages from the proxy", () => {
+      // The proxy returns Archestra budget blocks as 402 with type
+      // usage_limit_exceeded (deliberately NOT a 429/rate-limit shape).
+      const error = createOpenAIError(
+        402,
+        "usage_limit_exceeded",
+        "This request was blocked by Archestra (not the AI provider): the organization-level cost limit has been reached.",
+        "token_cost_limit_exceeded",
+        undefined,
+        {
+          entity_type: "organization",
+          limit_type: "token_cost",
+        },
+      );
+      const result = mapProviderError(error, "openai");
+
+      // An Archestra budget block gets the dedicated, non-retryable
+      // UsageLimitExceeded code so the UI attributes it to Archestra and
+      // drops the retry affordance.
+      expect(result.code).toBe(ChatErrorCode.UsageLimitExceeded);
+      expect(result.isRetryable).toBe(false);
+      expect(result.usageLimitExceeded).toBe(true);
+      expect(result.usageLimitEntityType).toBe("organization");
+      expect(result.message).toBe(
+        "Archestra blocked this request because the organization usage limit has been reached.",
+      );
+    });
+  });
+
+  describe("500 - server_error", () => {
+    it("should map to ServerError", () => {
+      const error = createOpenAIError(
+        500,
+        OpenAIErrorTypes.SERVER_ERROR,
+        "Internal server error",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("503 - service_unavailable", () => {
+    it("should map to ServerError", () => {
+      const error = createOpenAIError(
+        503,
+        OpenAIErrorTypes.SERVICE_UNAVAILABLE,
+        "Service temporarily unavailable",
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("context_length_exceeded", () => {
+    it("should map to ContextTooLong when envelope carries internal_code", () => {
+      const error = createOpenAIError(
+        400,
+        OpenAIErrorTypes.API_VALIDATION_ERROR,
+        "This model's maximum context length is 8192 tokens. However, your messages resulted in 8904 tokens.",
+        undefined,
+        OpenAIErrorTypes.CONTEXT_LENGTH_EXCEEDED,
+      );
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("connection timeout", () => {
+    it("should map to Unknown when no status code and no responseBody", () => {
+      const error = {
+        name: "AI_APIConnectionError",
+        message: "Connection timeout after 30000ms",
+      };
+      const result = mapProviderError(error, "openai");
+
+      expect(result.code).toBe(ChatErrorCode.Unknown);
+    });
+  });
+});
+
+// =============================================================================
+// Anthropic Error Tests
+// =============================================================================
+
+describe("mapProviderError - Anthropic", () => {
+  /**
+   * Helper to create an APICallError-like object for Anthropic
+   */
+  function createAnthropicError(
+    statusCode: number,
+    errorType: string,
+    message: string,
+    internalCode?: string,
+  ) {
+    return {
+      name: "AI_APICallError",
+      statusCode,
+      responseBody: JSON.stringify({
+        error: {
+          type: errorType,
+          message,
+          internal_code: internalCode,
+        },
+      }),
+      isRetryable:
+        statusCode >= 500 || statusCode === 429 || statusCode === 529,
+    };
+  }
+
+  describe("400 - invalid_request_error", () => {
+    it("should map to InvalidRequest", () => {
+      const error = createAnthropicError(
+        400,
+        AnthropicErrorTypes.INVALID_REQUEST,
+        "Invalid request body",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+      expect(result.isRetryable).toBe(false);
+      expect(result.originalError?.provider).toBe("anthropic");
+    });
+
+    it("reclassifies a balance-too-low envelope (internal_code) to a non-retryable ProviderInsufficientBalance card", () => {
+      const error = createAnthropicError(
+        400,
+        "api_validation_error",
+        "Provider API key remaining usage balance is too low. Please contact your administrator or try again later.",
+        ArchestraInternalErrorCode.ProviderInsufficientBalance,
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.ProviderInsufficientBalance);
+      expect(result.isRetryable).toBe(false);
+      expect(result.message).toBe(
+        ChatErrorMessages[ChatErrorCode.ProviderInsufficientBalance],
+      );
+    });
+  });
+
+  describe("401 - authentication_error", () => {
+    it("should map to Authentication", () => {
+      const error = createAnthropicError(
+        401,
+        AnthropicErrorTypes.AUTHENTICATION,
+        "Invalid API key",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+      expect(result.message).toBe(
+        ChatErrorMessages[ChatErrorCode.Authentication],
+      );
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("403 - permission_error", () => {
+    it("should map to PermissionDenied", () => {
+      const error = createAnthropicError(
+        403,
+        AnthropicErrorTypes.PERMISSION,
+        "API key does not have access to this resource",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.PermissionDenied);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("404 - not_found_error", () => {
+    it("should map to NotFound", () => {
+      const error = createAnthropicError(
+        404,
+        AnthropicErrorTypes.NOT_FOUND,
+        "Model not found",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.NotFound);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("413 - request_too_large", () => {
+    it("should map to RequestTooLarge, not ContextTooLong", () => {
+      // Anthropic's 413 is a byte-size cap on the request body (attachments are
+      // the usual cause), so "start a new chat" was the wrong advice.
+      const error = createAnthropicError(
+        413,
+        AnthropicErrorTypes.REQUEST_TOO_LARGE,
+        "Request exceeds the maximum allowed size",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.RequestTooLarge);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("400 - invalid_request_error with prompt-is-too-long message", () => {
+    it("should map to ContextTooLong", () => {
+      const error = createAnthropicError(
+        400,
+        AnthropicErrorTypes.INVALID_REQUEST,
+        "prompt is too long: 250000 tokens > 200000 maximum",
+        "context_length_exceeded",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("429 - rate_limit_error", () => {
+    it("should map to RateLimit", () => {
+      const error = createAnthropicError(
+        429,
+        AnthropicErrorTypes.RATE_LIMIT,
+        "Rate limit exceeded",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("500 - api_error", () => {
+    it("should map to ServerError", () => {
+      const error = createAnthropicError(
+        500,
+        AnthropicErrorTypes.API_ERROR,
+        "Internal server error",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("529 - overloaded_error", () => {
+    it("should map to ServerError", () => {
+      const error = createAnthropicError(
+        529,
+        AnthropicErrorTypes.OVERLOADED,
+        "API is temporarily overloaded",
+      );
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+
+    it("should map 529 to ServerError even without error type", () => {
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 529,
+        responseBody: JSON.stringify({ error: { message: "Overloaded" } }),
+      };
+      const result = mapProviderError(error, "anthropic");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+    });
+  });
+});
+
+// =============================================================================
+// Gemini Error Tests (Google AI Studio)
+// =============================================================================
+
+describe("mapProviderError - Gemini (Google AI Studio)", () => {
+  /**
+   * Helper to create an APICallError-like object for Gemini
+   */
+  function createGeminiError(
+    statusCode: number,
+    grpcStatus: string,
+    message: string,
+    internalCode?: string,
+  ) {
+    return {
+      name: "AI_APICallError",
+      statusCode,
+      responseBody: JSON.stringify({
+        error: {
+          code: statusCode,
+          status: grpcStatus,
+          message,
+          internal_code: internalCode,
+        },
+      }),
+      isRetryable: statusCode >= 500 || statusCode === 429,
+    };
+  }
+
+  describe("400 - INVALID_ARGUMENT", () => {
+    it("should map to InvalidRequest", () => {
+      const error = createGeminiError(
+        400,
+        GeminiErrorCodes.INVALID_ARGUMENT,
+        "Invalid argument",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+      expect(result.isRetryable).toBe(false);
+      expect(result.originalError?.provider).toBe("gemini");
+    });
+
+    it("should map to ContextTooLong when message indicates input token count exceeds maximum", () => {
+      const error = createGeminiError(
+        400,
+        GeminiErrorCodes.INVALID_ARGUMENT,
+        "The input token count (1500000) exceeds the maximum number of tokens allowed (1048576).",
+        "context_length_exceeded",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("401 - UNAUTHENTICATED", () => {
+    it("should map to Authentication", () => {
+      const error = createGeminiError(
+        401,
+        GeminiErrorCodes.UNAUTHENTICATED,
+        "API key not valid. Please pass a valid API key.",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+      expect(result.message).toBe(
+        ChatErrorMessages[ChatErrorCode.Authentication],
+      );
+      expect(result.isRetryable).toBe(false);
+    });
+
+    it("keeps original error message as a string when proxy error message contains nested JSON", () => {
+      const nestedProviderError = {
+        error: "invalid_grant",
+        error_description: "reauth related error",
+        error_subtype: "invalid_rapt",
+      };
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 500,
+        responseBody: JSON.stringify({
+          error: {
+            message: JSON.stringify(nestedProviderError),
+            type: "api_internal_server_error",
+          },
+        }),
+        isRetryable: true,
+      };
+
+      const result = mapProviderError(error, "gemini");
+
+      expect(typeof result.originalError?.message).toBe("string");
+      expect(result.originalError?.message).toContain("reauth related error");
+    });
+  });
+
+  describe("403 - PERMISSION_DENIED", () => {
+    it("should map to PermissionDenied", () => {
+      const error = createGeminiError(
+        403,
+        GeminiErrorCodes.PERMISSION_DENIED,
+        "Permission denied for this resource",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.PermissionDenied);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("404 - NOT_FOUND", () => {
+    it("should map to NotFound", () => {
+      const error = createGeminiError(
+        404,
+        GeminiErrorCodes.NOT_FOUND,
+        "Model not found",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.NotFound);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("429 - RESOURCE_EXHAUSTED", () => {
+    it("should map to RateLimit", () => {
+      const error = createGeminiError(
+        429,
+        GeminiErrorCodes.RESOURCE_EXHAUSTED,
+        "Quota exceeded",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("500 - INTERNAL", () => {
+    it("should map to ServerError", () => {
+      const error = createGeminiError(
+        500,
+        GeminiErrorCodes.INTERNAL,
+        "Internal server error",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("503 - UNAVAILABLE", () => {
+    it("should map to ServerError", () => {
+      const error = createGeminiError(
+        503,
+        GeminiErrorCodes.UNAVAILABLE,
+        "Service unavailable",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+});
+
+// =============================================================================
+// Gemini Error Tests (Vertex AI)
+// =============================================================================
+
+describe("mapProviderError - Gemini (Vertex AI)", () => {
+  /**
+   * Helper to create an APICallError-like object for Vertex AI
+   * Vertex AI errors have the same structure as Google AI Studio
+   */
+  function createVertexAIError(
+    statusCode: number,
+    grpcStatus: string,
+    message: string,
+  ) {
+    return {
+      name: "AI_APICallError",
+      url: "https://us-central1-aiplatform.googleapis.com/v1/projects/...",
+      statusCode,
+      responseBody: JSON.stringify({
+        error: {
+          code: statusCode,
+          status: grpcStatus,
+          message,
+        },
+      }),
+      isRetryable: statusCode >= 500 || statusCode === 429,
+    };
+  }
+
+  describe("401 - UNAUTHENTICATED (OAuth token)", () => {
+    it("should map to Authentication for invalid OAuth token", () => {
+      const error = createVertexAIError(
+        401,
+        GeminiErrorCodes.UNAUTHENTICATED,
+        "Request had invalid authentication credentials",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+      expect(result.originalError?.message).toContain("invalid authentication");
+    });
+  });
+
+  describe("403 - PERMISSION_DENIED (IAM)", () => {
+    it("should map to PermissionDenied for IAM permission issues", () => {
+      const error = createVertexAIError(
+        403,
+        GeminiErrorCodes.PERMISSION_DENIED,
+        "Permission denied on resource project",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.PermissionDenied);
+    });
+  });
+
+  describe("429 - RESOURCE_EXHAUSTED (quota)", () => {
+    it("should map to RateLimit for quota exceeded", () => {
+      const error = createVertexAIError(
+        429,
+        GeminiErrorCodes.RESOURCE_EXHAUSTED,
+        "Quota exceeded for aiplatform.googleapis.com",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("500 - INTERNAL", () => {
+    it("should map to ServerError", () => {
+      const error = createVertexAIError(
+        500,
+        GeminiErrorCodes.INTERNAL,
+        "Internal error encountered",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("503 - UNAVAILABLE", () => {
+    it("should map to ServerError", () => {
+      const error = createVertexAIError(
+        503,
+        GeminiErrorCodes.UNAVAILABLE,
+        "The service is currently unavailable",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("DEADLINE_EXCEEDED", () => {
+    it("should map to ServerError", () => {
+      const error = createVertexAIError(
+        504,
+        GeminiErrorCodes.DEADLINE_EXCEEDED,
+        "Deadline exceeded while waiting for response",
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+    });
+  });
+});
+
+// =============================================================================
+// Gemini ErrorInfo Reason Tests (google.rpc.ErrorInfo)
+// =============================================================================
+
+describe("mapProviderError - Gemini ErrorInfo reasons", () => {
+  /**
+   * Helper to create a Gemini error with ErrorInfo in the details array
+   * @see https://googleapis.dev/nodejs/spanner/latest/google.rpc.ErrorInfo.html
+   */
+  function createGeminiErrorWithDetails(
+    statusCode: number,
+    grpcStatus: string,
+    message: string,
+    reason: string,
+    domain = "googleapis.com",
+  ) {
+    return {
+      name: "AI_APICallError",
+      statusCode,
+      responseBody: JSON.stringify({
+        error: {
+          code: statusCode,
+          status: grpcStatus,
+          message,
+          details: [
+            {
+              "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+              reason,
+              domain,
+              metadata: {
+                service: "generativelanguage.googleapis.com",
+              },
+            },
+            {
+              "@type": "type.googleapis.com/google.rpc.LocalizedMessage",
+              locale: "en-US",
+              message,
+            },
+          ],
+        },
+      }),
+      isRetryable: statusCode >= 500 || statusCode === 429,
+    };
+  }
+
+  describe("Authentication errors via ErrorInfo reason", () => {
+    it("should map API_KEY_INVALID to Authentication (even with INVALID_ARGUMENT status)", () => {
+      // This is the real-world case: status is INVALID_ARGUMENT but reason tells us it's an API key issue
+      const error = createGeminiErrorWithDetails(
+        400,
+        GeminiErrorCodes.INVALID_ARGUMENT,
+        "API key not valid. Please pass a valid API key.",
+        GeminiErrorReasons.API_KEY_INVALID,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+      expect(result.message).toBe(
+        ChatErrorMessages[ChatErrorCode.Authentication],
+      );
+    });
+
+    it("should map API_KEY_NOT_FOUND to Authentication", () => {
+      const error = createGeminiErrorWithDetails(
+        400,
+        GeminiErrorCodes.INVALID_ARGUMENT,
+        "API key not found",
+        GeminiErrorReasons.API_KEY_NOT_FOUND,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+    });
+
+    it("should map API_KEY_EXPIRED to Authentication", () => {
+      const error = createGeminiErrorWithDetails(
+        401,
+        GeminiErrorCodes.UNAUTHENTICATED,
+        "API key has expired",
+        GeminiErrorReasons.API_KEY_EXPIRED,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+    });
+
+    it("should map ACCESS_TOKEN_EXPIRED to Authentication", () => {
+      const error = createGeminiErrorWithDetails(
+        401,
+        GeminiErrorCodes.UNAUTHENTICATED,
+        "Access token expired",
+        GeminiErrorReasons.ACCESS_TOKEN_EXPIRED,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+    });
+
+    it("should map ACCESS_TOKEN_INVALID to Authentication", () => {
+      const error = createGeminiErrorWithDetails(
+        401,
+        GeminiErrorCodes.UNAUTHENTICATED,
+        "Invalid access token",
+        GeminiErrorReasons.ACCESS_TOKEN_INVALID,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+    });
+  });
+
+  describe("Rate limit errors via ErrorInfo reason", () => {
+    it("should map RATE_LIMIT_EXCEEDED to RateLimit", () => {
+      const error = createGeminiErrorWithDetails(
+        429,
+        GeminiErrorCodes.RESOURCE_EXHAUSTED,
+        "Rate limit exceeded",
+        GeminiErrorReasons.RATE_LIMIT_EXCEEDED,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+      expect(result.isRetryable).toBe(true);
+    });
+
+    it("should map QUOTA_EXCEEDED to RateLimit", () => {
+      const error = createGeminiErrorWithDetails(
+        429,
+        GeminiErrorCodes.RESOURCE_EXHAUSTED,
+        "Quota exceeded",
+        GeminiErrorReasons.QUOTA_EXCEEDED,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+    });
+  });
+
+  describe("Not found errors via ErrorInfo reason", () => {
+    it("should map MODEL_NOT_FOUND to NotFound", () => {
+      const error = createGeminiErrorWithDetails(
+        404,
+        GeminiErrorCodes.NOT_FOUND,
+        "Model not found",
+        GeminiErrorReasons.MODEL_NOT_FOUND,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.NotFound);
+    });
+  });
+
+  describe("Content filtering errors via ErrorInfo reason", () => {
+    it("should map SAFETY_BLOCKED to ContentFiltered", () => {
+      const error = createGeminiErrorWithDetails(
+        400,
+        GeminiErrorCodes.INVALID_ARGUMENT,
+        "Content blocked due to safety concerns",
+        GeminiErrorReasons.SAFETY_BLOCKED,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ContentFiltered);
+    });
+
+    it("should map RECITATION_BLOCKED to ContentFiltered", () => {
+      const error = createGeminiErrorWithDetails(
+        400,
+        GeminiErrorCodes.INVALID_ARGUMENT,
+        "Content blocked due to potential recitation",
+        GeminiErrorReasons.RECITATION_BLOCKED,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ContentFiltered);
+    });
+  });
+
+  describe("Context length errors via ErrorInfo reason", () => {
+    it("should map CONTEXT_LENGTH_EXCEEDED to ContextTooLong", () => {
+      const error = createGeminiErrorWithDetails(
+        400,
+        GeminiErrorCodes.INVALID_ARGUMENT,
+        "Request exceeds maximum context length",
+        GeminiErrorReasons.CONTEXT_LENGTH_EXCEEDED,
+      );
+      const result = mapProviderError(error, "gemini");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+    });
+  });
+
+  describe("Real-world deeply nested error with ErrorInfo", () => {
+    it("should extract ErrorInfo from deeply nested JSON and map correctly", () => {
+      // This is a real-world error structure captured from the chat UI
+      const deeplyNestedWithDetails = {
+        name: "AI_APICallError",
+        url: "http://localhost:9000/v1/gemini/xxx/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: {
+            message: JSON.stringify({
+              error: {
+                message: JSON.stringify({
+                  error: {
+                    code: 400,
+                    message: "API key not valid. Please pass a valid API key.",
+                    status: "INVALID_ARGUMENT",
+                    details: [
+                      {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        reason: "API_KEY_INVALID",
+                        domain: "googleapis.com",
+                        metadata: {
+                          service: "generativelanguage.googleapis.com",
+                        },
+                      },
+                    ],
+                  },
+                }),
+                code: 400,
+                status: "Bad Request",
+              },
+            }),
+            type: "api_validation_error",
+          },
+        }),
+        isRetryable: false,
+      };
+
+      const result = mapProviderError(deeplyNestedWithDetails, "gemini");
+
+      // With ErrorInfo extraction, this should now map to Authentication, not InvalidRequest
+      expect(result.code).toBe(ChatErrorCode.Authentication);
+      expect(result.originalError?.message).toContain("API key not valid");
+    });
+  });
+});
+
+// =============================================================================
+// Bedrock Error Tests (AWS Converse API)
+// =============================================================================
+
+describe("mapProviderError - Bedrock", () => {
+  /**
+   * Helper to create an error-like object for Bedrock AWS Converse API
+   * Bedrock errors have structure: { message: "...", __type: "ThrottlingException" }
+   */
+  function createBedrockError(
+    statusCode: number,
+    awsType: string,
+    message: string,
+    internalCode?: string,
+  ) {
+    return {
+      name: "Error",
+      statusCode,
+      responseBody: JSON.stringify({
+        message,
+        __type: awsType,
+        ...(internalCode ? { error: { internal_code: internalCode } } : {}),
+      }),
+    };
+  }
+
+  describe("400 - ValidationException", () => {
+    it("should map to InvalidRequest", () => {
+      const error = createBedrockError(
+        400,
+        BedrockErrorTypes.VALIDATION,
+        "Malformed input request",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+      expect(result.isRetryable).toBe(false);
+      expect(result.originalError?.provider).toBe("bedrock");
+      expect(result.originalError?.status).toBe(400);
+    });
+  });
+
+  describe("403 - AccessDeniedException", () => {
+    it("should map to PermissionDenied", () => {
+      const error = createBedrockError(
+        403,
+        BedrockErrorTypes.ACCESS_DENIED,
+        "User is not authorized to perform this action",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.PermissionDenied);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("404 - ResourceNotFoundException", () => {
+    it("should map to NotFound", () => {
+      const error = createBedrockError(
+        404,
+        BedrockErrorTypes.RESOURCE_NOT_FOUND,
+        "The specified model does not exist",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.NotFound);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("408 - ModelTimeoutException", () => {
+    it("should map to ServerError", () => {
+      const error = createBedrockError(
+        408,
+        BedrockErrorTypes.MODEL_TIMEOUT,
+        "Model invocation timed out",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("424 - ModelErrorException", () => {
+    it("should map to ServerError", () => {
+      const error = createBedrockError(
+        424,
+        BedrockErrorTypes.MODEL_ERROR,
+        "The model returned an error",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("429 - ThrottlingException", () => {
+    it("should map to RateLimit", () => {
+      const error = createBedrockError(
+        429,
+        BedrockErrorTypes.THROTTLING,
+        "Too many requests, please wait before trying again",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("429 - ModelNotReadyException", () => {
+    it("should map to RateLimit", () => {
+      const error = createBedrockError(
+        429,
+        BedrockErrorTypes.MODEL_NOT_READY,
+        "Model is not ready for inference",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("500 - InternalServerException", () => {
+    it("should map to ServerError", () => {
+      const error = createBedrockError(
+        500,
+        BedrockErrorTypes.INTERNAL_SERVER,
+        "An internal server error occurred",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("503 - ServiceUnavailableException", () => {
+    it("should map to ServerError", () => {
+      const error = createBedrockError(
+        503,
+        BedrockErrorTypes.SERVICE_UNAVAILABLE,
+        "Service is temporarily unavailable",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.ServerError);
+      expect(result.isRetryable).toBe(true);
+    });
+  });
+
+  describe("context window exceeded", () => {
+    it("should map to ContextTooLong when message contains model_context_window_exceeded", () => {
+      const error = createBedrockError(
+        400,
+        BedrockErrorTypes.VALIDATION,
+        "model_context_window_exceeded: The input is too long for the model",
+        "context_length_exceeded",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.isRetryable).toBe(false);
+    });
+
+    it("should map to ContextTooLong when message says input is too long", () => {
+      const error = createBedrockError(
+        400,
+        BedrockErrorTypes.VALIDATION,
+        "Input is too long for requested model.",
+        "context_length_exceeded",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.isRetryable).toBe(false);
+    });
+
+    it("should map to ContextTooLong when Claude on Bedrock returns 'prompt is too long'", () => {
+      const error = createBedrockError(
+        400,
+        BedrockErrorTypes.VALIDATION,
+        "prompt is too long: 250000 tokens > 200000 maximum",
+        "context_length_exceeded",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.isRetryable).toBe(false);
+    });
+
+    it("should still map unrelated ValidationException to InvalidRequest", () => {
+      const error = createBedrockError(
+        400,
+        BedrockErrorTypes.VALIDATION,
+        "Malformed input request: missing required field 'messages'.",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+    });
+  });
+
+  describe("fallback to HTTP status code", () => {
+    it("should fall back to status code when __type is missing", () => {
+      const error = {
+        statusCode: 429,
+        responseBody: JSON.stringify({
+          message: "Rate limited",
+        }),
+      };
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.code).toBe(ChatErrorCode.RateLimit);
+    });
+  });
+
+  describe("provider preservation", () => {
+    it("should preserve bedrock provider", () => {
+      const error = createBedrockError(
+        500,
+        BedrockErrorTypes.INTERNAL_SERVER,
+        "Error",
+      );
+      const result = mapProviderError(error, "bedrock");
+
+      expect(result.originalError?.provider).toBe("bedrock");
+    });
+  });
+});
+
+// =============================================================================
+// Context window exceeded — OpenAI-compat cohort (structured code path)
+// =============================================================================
+
+// Each of these providers routes through the shared OpenAI parser + mapper.
+// Without per-provider assertions, a wiring change that accidentally
+// unhooked one of them from the OpenAI mapper would silently regress
+// ContextTooLong detection. These tests lock the contract.
+describe("mapProviderError - context window exceeded (OpenAI-compat cohort)", () => {
+  const openaiCompatProviders = [
+    "azure",
+    "groq",
+    "cerebras",
+    "deepseek",
+    "mistral",
+    "perplexity",
+    "xai",
+    "openrouter",
+  ] as const;
+
+  for (const provider of openaiCompatProviders) {
+    it(`should map to ContextTooLong for ${provider} when error.code is context_length_exceeded`, () => {
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: {
+            type: OpenAIErrorTypes.INVALID_REQUEST,
+            code: OpenAIErrorTypes.CONTEXT_LENGTH_EXCEEDED,
+            message: "This model's maximum context length is 8192 tokens",
+          },
+        }),
+        isRetryable: false,
+      };
+      const result = mapProviderError(error, provider);
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.originalError?.provider).toBe(provider);
+    });
+  }
+});
+
+// =============================================================================
+// Context window exceeded — Cohere, vLLM, Ollama, MiniMax, Zhipu
+// =============================================================================
+
+describe("mapProviderError - context window exceeded (other providers)", () => {
+  describe("Cohere", () => {
+    it("should map to ContextTooLong when message starts with 'too many tokens'", () => {
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          message:
+            "too many tokens: total number of tokens in the prompt cannot exceed 4081 - received 4292.",
+          error: { internal_code: "context_length_exceeded" },
+        }),
+        isRetryable: false,
+      };
+      const result = mapProviderError(error, "cohere");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+      expect(result.isRetryable).toBe(false);
+    });
+  });
+
+  describe("vLLM", () => {
+    it("should map to ContextTooLong when message contains 'maximum context length'", () => {
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: {
+            type: "BadRequestError",
+            code: 400,
+            message:
+              "This model's maximum context length is 4096 tokens. However, you requested 5000 tokens.",
+            internal_code: "context_length_exceeded",
+          },
+        }),
+        isRetryable: false,
+      };
+      const result = mapProviderError(error, "vllm");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+    });
+  });
+
+  describe("Ollama", () => {
+    it("should map to ContextTooLong when message contains 'exceeded max context length'", () => {
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: {
+            type: "invalid_request_error",
+            message:
+              "prompt too long; exceeded max context length by 1024 tokens",
+            internal_code: "context_length_exceeded",
+          },
+        }),
+        isRetryable: false,
+      };
+      const result = mapProviderError(error, "ollama");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+    });
+  });
+
+  describe("MiniMax", () => {
+    it("should map to ContextTooLong when message reports 'context window exceeds limit'", () => {
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: {
+            message: "context window exceeds limit (2013)",
+            internal_code: "context_length_exceeded",
+          },
+        }),
+        isRetryable: false,
+      };
+      const result = mapProviderError(error, "minimax");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+    });
+  });
+
+  describe("Zhipu", () => {
+    it("should map to ContextTooLong for error.code 1261", () => {
+      const error = {
+        name: "AI_APICallError",
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: {
+            code: ZhipuaiErrorTypes.CONTEXT_LENGTH_EXCEEDED,
+            message: "Prompt exceeds max length",
+            internal_code: "context_length_exceeded",
+          },
+        }),
+        isRetryable: false,
+      };
+      const result = mapProviderError(error, "zhipuai");
+
+      expect(result.code).toBe(ChatErrorCode.ContextTooLong);
+    });
+  });
+});
+
+// =============================================================================
+// Nested JSON Parsing Tests (Real-world Gemini errors)
+// =============================================================================
+
+describe("mapProviderError - Nested JSON parsing", () => {
+  describe("deeply nested Gemini error (real-world example)", () => {
+    // Real error captured from Gemini with invalid API key - 4+ levels of nesting
+    const deeplyNestedError = {
+      name: "AI_APICallError",
+      url: "http://localhost:9000/v1/gemini/xxx/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+      statusCode: 400,
+      responseBody:
+        '{"error":{"message":"{\\"error\\":{\\"message\\":\\"{\\\\\\"error\\\\\\": {\\\\\\"code\\\\\\": 400, \\\\\\"message\\\\\\": \\\\\\"API key not valid. Please pass a valid API key.\\\\\\", \\\\\\"status\\\\\\": \\\\\\"INVALID_ARGUMENT\\\\\\"}}\\",\\"code\\":400,\\"status\\":\\"Bad Request\\"}}","type":"api_validation_error"}}',
+      isRetryable: false,
+    };
+
+    it("should parse deeply nested JSON and extract meaningful message", () => {
+      const result = mapProviderError(deeplyNestedError, "gemini");
+
+      // The status should be extracted from the innermost error
+      expect(result.originalError?.message).toContain("API key not valid");
+    });
+
+    it("should map based on extracted status", () => {
+      const result = mapProviderError(deeplyNestedError, "gemini");
+
+      // Even though outer status is 400, the inner status is INVALID_ARGUMENT
+      // which maps to InvalidRequest
+      expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+    });
+  });
+
+  describe("moderately nested Gemini error", () => {
+    const nestedError = {
+      name: "AI_APICallError",
+      statusCode: 400,
+      responseBody:
+        '{"error":{"message":"{\\"error\\":{\\"message\\":\\"API key not valid. Please pass a valid API key.\\",\\"code\\":400,\\"status\\":\\"Bad Request\\"}}","type":"api_validation_error"}}',
+      isRetryable: false,
+    };
+
+    it("should extract message from nested structure", () => {
+      const result = mapProviderError(nestedError, "gemini");
+
+      expect(result.originalError?.message).toContain("API key not valid");
+    });
+  });
+});
+
+// =============================================================================
+// Circular Reference Handling Tests
+// =============================================================================
+
+describe("mapProviderError - Circular reference handling", () => {
+  it("should safely serialize errors with circular references", () => {
+    const circularError: Record<string, unknown> = {
+      message: "Error with circular reference",
+      statusCode: 500,
+    };
+    circularError.self = circularError;
+
+    const result = mapProviderError(circularError, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.ServerError);
+    expect(() => JSON.stringify(result)).not.toThrow();
+  });
+
+  it("should safely serialize Error objects with cause chains", () => {
+    const rootCause = new Error("Root cause");
+    const middleError = new Error("Middle error", { cause: rootCause });
+    const topError = new Error("Top level error", { cause: middleError });
+
+    const result = mapProviderError(topError, "anthropic");
+
+    expect(() => JSON.stringify(result)).not.toThrow();
+  });
+
+  it("should handle deeply nested circular references", () => {
+    const obj: Record<string, unknown> = {
+      message: "Nested circular",
+      level1: {
+        level2: {
+          level3: {},
+        },
+      },
+    };
+    (obj.level1 as Record<string, unknown>).level2 = { level3: obj };
+
+    const result = mapProviderError(obj, "gemini");
+
+    expect(() => JSON.stringify(result)).not.toThrow();
+  });
+});
+
+// =============================================================================
+// Fallback Behavior Tests
+// =============================================================================
+
+describe("mapProviderError - Fallback behavior", () => {
+  it("should map by status code when error type is missing", () => {
+    const error = {
+      statusCode: 429,
+      responseBody: JSON.stringify({ error: { message: "Rate limited" } }),
+    };
+    const result = mapProviderError(error, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.RateLimit);
+  });
+
+  it("should return Unknown for unrecognized errors without status", () => {
+    const error = {
+      message: "Something unexpected happened",
+    };
+    const result = mapProviderError(error, "anthropic");
+
+    expect(result.code).toBe(ChatErrorCode.Unknown);
+    expect(result.isRetryable).toBe(false);
+  });
+
+  it("should handle plain Error instances", () => {
+    const error = new Error("Standard error message");
+    const result = mapProviderError(error, "gemini");
+
+    expect(result.originalError?.message).toBe("Standard error message");
+  });
+
+  it("should map bare stream termination errors to retryable network errors", () => {
+    const error = new Error("terminated");
+    const result = mapProviderError(error, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.NetworkError);
+    expect(result.isRetryable).toBe(true);
+    expect(result.message).toBe(ChatErrorMessages[ChatErrorCode.NetworkError]);
+    expect(result.originalError?.message).toBe(
+      "Upstream provider closed the connection unexpectedly",
+    );
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("should map OpenRouter upstream idle timeouts to retryable network errors", () => {
+    // Faithful to the real shape: the mid-stream SSE idle timeout reaches the
+    // mapper as a bare Error (no statusCode/responseBody), whose non-enumerable
+    // message serializes to `{}` in the raw-error field.
+    const error = new Error("Upstream idle timeout exceeded");
+    const result = mapProviderError(error, "openrouter");
+
+    expect(result.code).toBe(ChatErrorCode.NetworkError);
+    expect(result.isRetryable).toBe(true);
+    expect(result.message).toBe(ChatErrorMessages[ChatErrorCode.NetworkError]);
+    // The real upstream message is preserved for debugging, unlike the bare
+    // termination case which is rewritten to a generic close message.
+    expect(result.originalError?.message).toBe(
+      "Upstream idle timeout exceeded",
+    );
+  });
+
+  it("should map an idle timeout delivered as an HTTP 408 with a body too", () => {
+    // The other delivery shape: when the timeout fires before the stream opens,
+    // OpenRouter returns HTTP 408 with a body. 408 falls through to Unknown, so
+    // the same message-text reclassification must apply.
+    const error = {
+      statusCode: 408,
+      responseBody: JSON.stringify({
+        error: { code: 408, message: "Upstream idle timeout exceeded" },
+      }),
+    };
+    const result = mapProviderError(error, "openrouter");
+
+    expect(result.code).toBe(ChatErrorCode.NetworkError);
+    expect(result.isRetryable).toBe(true);
+  });
+
+  it("should not reclassify a recognized error that mentions idle timeout", () => {
+    const error = {
+      statusCode: 401,
+      responseBody: JSON.stringify({
+        error: {
+          type: OpenAIErrorTypes.AUTHENTICATION,
+          message: "Auth failed while waiting on upstream idle timeout",
+        },
+      }),
+    };
+    const result = mapProviderError(error, "openrouter");
+
+    expect(result.code).toBe(ChatErrorCode.Authentication);
+    expect(result.isRetryable).toBe(false);
+  });
+
+  it("should map a relayed secrets-backend outage to a retryable server error without capturing", () => {
+    // The proxy relays the secrets-manager-unavailable message; the incident
+    // is already captured and grouped at its source.
+    const error = new Error(
+      "An error occurred while accessing secrets. Please try again later or contact your administrator.",
+    );
+    const result = mapProviderError(error, "anthropic");
+
+    expect(result.code).toBe(ChatErrorCode.ServerError);
+    expect(result.isRetryable).toBe(true);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("should map Bedrock's bare internal failure message to a retryable server error without capturing", () => {
+    // Mid-stream delivery: no status code and no typed body — just the message.
+    const error = new Error("Bedrock is unable to process your request.");
+    const result = mapProviderError(error, "bedrock");
+
+    expect(result.code).toBe(ChatErrorCode.ServerError);
+    expect(result.isRetryable).toBe(true);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("should handle string errors", () => {
+    const result = mapProviderError("Simple string error", "openai");
+
+    expect(result.originalError?.message).toBe("Simple string error");
+  });
+
+  it("should map OpenRouter upstream provider failures to retryable server errors", () => {
+    // Faithful to the real shape: a mid-stream SSE error part reaches the
+    // mapper as a bare `{ message, type }` object with no status code, so the
+    // per-provider mapper would land on the dead-end Unknown card.
+    const error = {
+      message: "Upstream error from SomeInferenceHost: undefined",
+      type: "api_error",
+    };
+    const result = mapProviderError(error, "openrouter");
+
+    expect(result.code).toBe(ChatErrorCode.ServerError);
+    expect(result.isRetryable).toBe(true);
+    expect(result.originalError?.message).toBe(
+      "Upstream error from SomeInferenceHost: undefined",
+    );
+    // A transient provider-side failure is expected noise, not a bug.
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("should map a mid-stream upstream empty response to a retryable empty-response card", () => {
+    // The proxy surfaces its empty-completion detection mid-stream as a bare
+    // SSE error part carrying the normalized internal code.
+    const error = {
+      message:
+        "OpenRouter returned an empty response without content or tool calls",
+      type: "api_error",
+      internal_code: ArchestraInternalErrorCode.UpstreamEmptyResponse,
+    };
+    const result = mapProviderError(error, "openrouter");
+
+    expect(result.code).toBe(ChatErrorCode.EmptyResponse);
+    expect(result.isRetryable).toBe(true);
+    expect(result.message).toBe(ChatErrorMessages[ChatErrorCode.EmptyResponse]);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("should map a mid-stream provider overload to a retryable server error", () => {
+    const error = {
+      message: "The provider is overloaded",
+      type: "api_error",
+      internal_code: ArchestraInternalErrorCode.ProviderOverloaded,
+    };
+    const result = mapProviderError(error, "anthropic");
+
+    expect(result.code).toBe(ChatErrorCode.ServerError);
+    expect(result.isRetryable).toBe(true);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("should unwrap a nested Responses stream error chunk and map an overload to a retryable server error", () => {
+    // The AI SDK's Responses parser relays the whole `error` chunk, so the
+    // provider's fields sit one level down under `error`.
+    const error = {
+      type: "error",
+      sequence_number: 0,
+      error: {
+        type: "api_error",
+        code: ArchestraInternalErrorCode.ProviderOverloaded,
+        message:
+          "Our servers are currently overloaded. Please try again later.",
+        param: null,
+      },
+    };
+    const result = mapProviderError(error, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.ServerError);
+    expect(result.isRetryable).toBe(true);
+    expect(result.message).toBe(ChatErrorMessages[ChatErrorCode.ServerError]);
+    expect(result.originalError?.message).toBe(
+      "Our servers are currently overloaded. Please try again later.",
+    );
+    expect(result.originalError?.type).toBe("api_error");
+    expect(
+      JSON.parse(
+        (result.originalError?.raw as { responseBody: string }).responseBody,
+      ).error,
+    ).toMatchObject({
+      type: "api_error",
+      code: ArchestraInternalErrorCode.ProviderOverloaded,
+    });
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an empty envelope", { type: "error", error: {} }],
+    ["a null error", { type: "error", error: null }],
+    ["a non-string message", { type: "error", error: { message: 42 } }],
+  ])("should fall back to the unknown card for %s", (_label, error) => {
+    const result = mapProviderError(error, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.Unknown);
+    expect(result.originalError?.message).toBe("Unknown error");
+  });
+
+  it("should map a pre-stream upstream empty response 503 to a retryable empty-response card", () => {
+    // The other delivery shape: detection before headers commit arrives as an
+    // HTTP 503 whose body carries the normalized internal code.
+    const error = {
+      statusCode: 503,
+      responseBody: JSON.stringify({
+        error: {
+          message:
+            "OpenRouter returned an empty response without content or tool calls",
+          type: "unknown_api_error",
+          internal_code: ArchestraInternalErrorCode.UpstreamEmptyResponse,
+        },
+      }),
+    };
+    const result = mapProviderError(error, "openrouter");
+
+    expect(result.code).toBe(ChatErrorCode.EmptyResponse);
+    expect(result.isRetryable).toBe(true);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// Sentry Capture Tests
+// =============================================================================
+
+describe("mapProviderError - Sentry raw error capture", () => {
+  it("captures errors that fail classification (Unknown)", () => {
+    const error = {
+      name: "AI_APICallError",
+      responseBody: JSON.stringify({
+        error: { message: "novel provider failure shape" },
+      }),
+    };
+
+    const result = mapProviderError(error, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.Unknown);
+    expect(mockSentryCaptureException).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "RawProviderError",
+        message: "novel provider failure shape",
+      }),
+      expect.objectContaining({
+        level: "error",
+        fingerprint: [
+          "chat-provider-error-raw-error-json",
+          "openai",
+          "unknown",
+          ChatErrorCode.Unknown,
+        ],
+        tags: expect.objectContaining({
+          provider: "openai",
+          mapped_code: ChatErrorCode.Unknown,
+          raw_error_json: "true",
+        }),
+        extra: expect.objectContaining({
+          errorMessage: "novel provider failure shape",
+          rawErrorJson: expect.stringContaining("AI_APICallError"),
+        }),
+      }),
+    );
+  });
+
+  it("does not capture transient retryable provider-side errors", () => {
+    const error = {
+      name: "AI_APICallError",
+      statusCode: 500,
+      responseBody: JSON.stringify({
+        error: {
+          type: OpenAIErrorTypes.SERVER_ERROR,
+          message: "Provider failed",
+        },
+      }),
+      isRetryable: true,
+    };
+
+    const result = mapProviderError(error, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.ServerError);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("does not capture client-class 4xx provider rejections", () => {
+    const error = {
+      name: "AI_APICallError",
+      statusCode: 400,
+      responseBody: JSON.stringify({
+        error: {
+          type: "api_validation_error",
+          message: "Provider returned error",
+        },
+      }),
+      isRetryable: false,
+    };
+
+    const result = mapProviderError(error, "openai");
+
+    expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// Provider Preservation Tests
+// =============================================================================
+
+describe("mapProviderError - Provider preservation", () => {
+  it("should preserve openai provider", () => {
+    const error = { statusCode: 500, message: "Error" };
+    const result = mapProviderError(error, "openai");
+
+    expect(result.originalError?.provider).toBe("openai");
+  });
+
+  it("should preserve anthropic provider", () => {
+    const error = { statusCode: 500, message: "Error" };
+    const result = mapProviderError(error, "anthropic");
+
+    expect(result.originalError?.provider).toBe("anthropic");
+  });
+
+  it("should preserve gemini provider", () => {
+    const error = { statusCode: 500, message: "Error" };
+    const result = mapProviderError(error, "gemini");
+
+    expect(result.originalError?.provider).toBe("gemini");
+  });
+});
+
+// =============================================================================
+// ProviderError Tests
+// =============================================================================
+
+describe("ProviderError", () => {
+  it("should construct with a ChatErrorResponse and expose it", () => {
+    const chatError = mapProviderError(
+      {
+        statusCode: 401,
+        responseBody: JSON.stringify({
+          error: { type: "authentication_error", message: "Invalid API key" },
+        }),
+      },
+      "anthropic",
+    );
+
+    const providerError = new ProviderError(chatError);
+
+    expect(providerError).toBeInstanceOf(Error);
+    expect(providerError).toBeInstanceOf(ProviderError);
+    expect(providerError.name).toBe("ProviderError");
+    expect(providerError.message).toBe("Invalid API key");
+    expect(providerError.chatErrorResponse).toBe(chatError);
+    expect(providerError.chatErrorResponse.code).toBe(
+      ChatErrorCode.Authentication,
+    );
+    expect(providerError.chatErrorResponse.originalError?.provider).toBe(
+      "anthropic",
+    );
+  });
+
+  it("should use ChatErrorResponse.message when originalError is missing", () => {
+    const chatError = {
+      code: ChatErrorCode.Unknown,
+      message: ChatErrorMessages[ChatErrorCode.Unknown],
+      isRetryable: false,
+    };
+
+    const providerError = new ProviderError(chatError);
+
+    expect(providerError.message).toBe(
+      ChatErrorMessages[ChatErrorCode.Unknown],
+    );
+  });
+
+  it("should preserve correct provider through mapProviderError round-trip", () => {
+    // Simulate an Anthropic billing error
+    const anthropicError = {
+      statusCode: 400,
+      responseBody: JSON.stringify({
+        error: {
+          type: AnthropicErrorTypes.INVALID_REQUEST,
+          message: "Your credit balance is too low",
+        },
+      }),
+    };
+
+    // Map with correct provider (anthropic) — as the A2A executor would
+    const mapped = mapProviderError(anthropicError, "anthropic");
+    const providerError = new ProviderError(mapped);
+
+    // The ProviderError preserves the correct provider
+    expect(providerError.chatErrorResponse.originalError?.provider).toBe(
+      "anthropic",
+    );
+    expect(providerError.chatErrorResponse.code).toBe(
+      ChatErrorCode.InvalidRequest,
+    );
+    expect(providerError.chatErrorResponse.originalError?.message).toContain(
+      "credit balance",
+    );
+  });
+
+  it("should preserve anthropic provider even when parent would use gemini", () => {
+    // This is the key scenario: subagent uses anthropic, parent uses gemini
+    // The A2A executor creates the ProviderError with "anthropic"
+    const subagentError = {
+      statusCode: 400,
+      responseBody: JSON.stringify({
+        error: {
+          type: AnthropicErrorTypes.INVALID_REQUEST,
+          message: "Your credit balance is too low to access the Anthropic API",
+        },
+      }),
+    };
+
+    // A2A executor maps with correct provider
+    const mappedWithCorrectProvider = mapProviderError(
+      subagentError,
+      "anthropic",
+    );
+    const providerError = new ProviderError(mappedWithCorrectProvider);
+
+    // Parent chat route receives ProviderError and uses it directly
+    // instead of re-mapping with "gemini"
+    const errorForFrontend = providerError.chatErrorResponse;
+
+    expect(errorForFrontend.originalError?.provider).toBe("anthropic");
+    expect(errorForFrontend.originalError?.message).toContain("Anthropic API");
+
+    // Compare: if we had incorrectly re-mapped with gemini
+    const wrongMapping = mapProviderError(subagentError, "gemini");
+    expect(wrongMapping.originalError?.provider).toBe("gemini"); // Wrong provider!
+  });
+
+  it("strips provider internals from the frontend error payload", () => {
+    expect(
+      sanitizeChatErrorForFrontend({
+        code: ChatErrorCode.ServerError,
+        message: ChatErrorMessages[ChatErrorCode.ServerError],
+        isRetryable: true,
+        sessionId: "session-123",
+        traceId: "trace-123",
+        spanId: "span-123",
+        originalError: {
+          provider: "anthropic",
+          status: 500,
+          message: "Sensitive provider detail",
+        },
+      }),
+    ).toEqual({
+      code: ChatErrorCode.ServerError,
+      message: ChatErrorMessages[ChatErrorCode.ServerError],
+      isRetryable: true,
+      sessionId: "session-123",
+      traceId: "trace-123",
+      spanId: "span-123",
+    });
+  });
+
+  it("preserves usage-limit metadata in the frontend error payload", () => {
+    expect(
+      sanitizeChatErrorForFrontend({
+        code: ChatErrorCode.UsageLimitExceeded,
+        message:
+          "Archestra blocked this request because the organization usage limit has been reached.",
+        isRetryable: false,
+        usageLimitExceeded: true,
+        usageLimitEntityType: "organization",
+        originalError: {
+          provider: "openai",
+          status: 429,
+          message: "Internal limit detail",
+        },
+      }),
+    ).toEqual({
+      code: ChatErrorCode.UsageLimitExceeded,
+      message:
+        "Archestra blocked this request because the organization usage limit has been reached.",
+      isRetryable: false,
+      usageLimitExceeded: true,
+      usageLimitEntityType: "organization",
+    });
+  });
+
+  it("preserves authAction so the connect card renders in slim chat mode", () => {
+    expect(
+      sanitizeChatErrorForFrontend({
+        code: ChatErrorCode.ProviderAuthRequired,
+        message: "Connect your GitHub Copilot account to use this model.",
+        isRetryable: false,
+        authAction: {
+          provider: "github-copilot",
+          providerLabel: "GitHub Copilot",
+        },
+      }),
+    ).toEqual({
+      code: ChatErrorCode.ProviderAuthRequired,
+      message: "Connect your GitHub Copilot account to use this model.",
+      isRetryable: false,
+      authAction: {
+        provider: "github-copilot",
+        providerLabel: "GitHub Copilot",
+      },
+    });
+  });
+});
+
+describe("mapProviderError - EmptyModelResponseError", () => {
+  it("explains an empty length-capped turn without offering an unchanged retry", () => {
+    const result = mapProviderError(
+      new EmptyModelResponseError({
+        finishReason: "length",
+        rawFinishReason: "max_tokens",
+        attempts: 1,
+      }),
+      "anthropic",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.IncompleteResponse);
+    expect(result.isRetryable).toBe(false);
+    expect(result.message).toContain("output limit before producing a reply");
+    expect(result.message).toContain("smaller");
+    expect(result.originalError?.raw).toEqual({
+      finishReason: "length",
+      rawFinishReason: "max_tokens",
+      attempts: 1,
+    });
+  });
+
+  it("maps a content-filter finish to the non-retryable ContentFiltered card", () => {
+    const result = mapProviderError(
+      new EmptyModelResponseError({
+        finishReason: "content-filter",
+        attempts: 1,
+      }),
+      "openai",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.ContentFiltered);
+    expect(result.isRetryable).toBe(false);
+  });
+
+  it("maps an exhausted stop finish to the retryable EmptyResponse card", () => {
+    const result = mapProviderError(
+      new EmptyModelResponseError({ finishReason: "stop", attempts: 3 }),
+      "openai",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.EmptyResponse);
+    expect(result.isRetryable).toBe(true);
+  });
+
+  it("maps an exhausted error finish to the retryable EmptyResponse card, preserving the raw finish reason", () => {
+    const result = mapProviderError(
+      new EmptyModelResponseError({
+        finishReason: "error",
+        rawFinishReason: "MALFORMED_FUNCTION_CALL",
+        attempts: 3,
+      }),
+      "gemini",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.EmptyResponse);
+    expect(result.isRetryable).toBe(true);
+    expect(result.originalError?.raw).toEqual({
+      finishReason: "error",
+      rawFinishReason: "MALFORMED_FUNCTION_CALL",
+      attempts: 3,
+    });
+  });
+});
+
+describe("mapProviderError - UnsupportedFunctionalityError", () => {
+  it("maps a provider-rejected attachment to a non-retryable InvalidRequest card naming the functionality", () => {
+    const functionality = "file part media type text/csv";
+    const result = mapProviderError(
+      new UnsupportedFunctionalityError({ functionality }),
+      "openai",
+    );
+
+    expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+    expect(result.isRetryable).toBe(false);
+    expect(result.message).toContain(functionality);
+    expect(result.originalError?.raw).toEqual({ functionality });
+  });
+});
+
+describe("getUnavailableToolErrorDetails", () => {
+  it("recognizes a NoSuchToolError instance", () => {
+    const details = getUnavailableToolErrorDetails(
+      new NoSuchToolError({
+        toolName: "ghost_tool",
+        availableTools: ["real_tool", "other_tool"],
+      }),
+    );
+
+    expect(details).not.toBeNull();
+    expect(details?.requestedToolName).toBe("ghost_tool");
+    expect(details?.availableToolNames).toEqual(["real_tool", "other_tool"]);
+  });
+
+  it("recognizes the stringified message the SDK emits for the duplicate tool-error part", () => {
+    // runToolsTransformation stringifies the error before onError sees it,
+    // so only the message text is available — no NoSuchToolError identity
+    const details = getUnavailableToolErrorDetails(
+      "Model tried to call unavailable tool 'ghost_tool'. Available tools: real_tool, other_tool.",
+    );
+
+    expect(details).not.toBeNull();
+    expect(details?.requestedToolName).toBe("ghost_tool");
+    expect(details?.availableToolNames).toEqual(["real_tool", "other_tool"]);
+  });
+
+  it("recognizes the message wrapped in a plain Error", () => {
+    const details = getUnavailableToolErrorDetails(
+      new Error(
+        "Model tried to call unavailable tool 'ghost_tool'. Available tools: real_tool.",
+      ),
+    );
+
+    expect(details?.requestedToolName).toBe("ghost_tool");
+    expect(details?.availableToolNames).toEqual(["real_tool"]);
+  });
+
+  it("recognizes the no-tools-available variant", () => {
+    const details = getUnavailableToolErrorDetails(
+      "Model tried to call unavailable tool 'ghost_tool'. No tools are available.",
+    );
+
+    expect(details?.requestedToolName).toBe("ghost_tool");
+    expect(details?.availableToolNames).toEqual([]);
+  });
+
+  it("produces identical formatted payloads for the instance and its stringified duplicate", () => {
+    const instance = new NoSuchToolError({
+      toolName: "ghost_tool",
+      availableTools: ["real_tool"],
+    });
+
+    const fromInstance = getUnavailableToolErrorDetails(instance);
+    const fromString = getUnavailableToolErrorDetails(instance.message);
+
+    expect(fromInstance).not.toBeNull();
+    expect(fromString).not.toBeNull();
+    if (!fromInstance || !fromString) return;
+    expect(formatUnavailableToolErrorDetails(fromString)).toBe(
+      formatUnavailableToolErrorDetails(fromInstance),
+    );
+  });
+
+  it("does not match its own formatted recovery payload", () => {
+    const details = getUnavailableToolErrorDetails(
+      "Model tried to call unavailable tool 'ghost_tool'. Available tools: real_tool.",
+    );
+    expect(details).not.toBeNull();
+    if (!details) return;
+
+    const formatted = formatUnavailableToolErrorDetails(details);
+    expect(getUnavailableToolErrorDetails(formatted)).toBeNull();
+    expect(getUnavailableToolErrorDetails(new Error(formatted))).toBeNull();
+  });
+
+  it("returns null for unrelated errors and non-string values", () => {
+    expect(getUnavailableToolErrorDetails(new Error("boom"))).toBeNull();
+    expect(getUnavailableToolErrorDetails("some other failure")).toBeNull();
+    expect(getUnavailableToolErrorDetails(undefined)).toBeNull();
+    expect(getUnavailableToolErrorDetails({ code: -32601 })).toBeNull();
+  });
+
+  it("steers to search_tools/run_tool when the tool list carries the dispatch pair", () => {
+    // search_and_run_only exposure: the live tool list holds only Archestra
+    // built-ins, so "copy an exact name from the list" would be a dead end —
+    // the message must state the run_tool calling convention instead.
+    const details = getUnavailableToolErrorDetails(
+      new NoSuchToolError({
+        toolName: "acme_hr__list_notes",
+        availableTools: [
+          "archestra__search_tools",
+          "archestra__run_tool",
+          "archestra__run_command",
+        ],
+      }),
+    );
+
+    expect(details).not.toBeNull();
+    expect(details?.message).toContain(
+      "cannot be called directly in this chat",
+    );
+    expect(details?.message).toContain("archestra__search_tools");
+    expect(details?.message).toContain(
+      "archestra__run_tool with tool_name set to that exact name",
+    );
+    expect(details?.message).not.toContain("Copy an exact name from the list");
+  });
+
+  it("steers to the dispatch pair for the stringified duplicate too", () => {
+    const details = getUnavailableToolErrorDetails(
+      "Model tried to call unavailable tool 'ghost_tool'. Available tools: archestra__search_tools, archestra__run_tool.",
+    );
+
+    expect(details?.message).toContain("archestra__run_tool");
+    expect(details?.message).not.toContain("Copy an exact name from the list");
+  });
+
+  it("keeps the copy-a-name steer when the dispatch pair is absent or partial", () => {
+    const withoutDispatch = getUnavailableToolErrorDetails(
+      new NoSuchToolError({
+        toolName: "ghost_tool",
+        availableTools: ["real_tool", "other_tool"],
+      }),
+    );
+    expect(withoutDispatch?.message).toContain(
+      "Copy an exact name from the list",
+    );
+
+    // run_tool alone is not a discovery surface; the pair is required
+    const partialDispatch = getUnavailableToolErrorDetails(
+      new NoSuchToolError({
+        toolName: "ghost_tool",
+        availableTools: ["archestra__run_tool", "real_tool"],
+      }),
+    );
+    expect(partialDispatch?.message).toContain(
+      "Copy an exact name from the list",
+    );
+  });
+});
+
+describe("buildAbortiveTurnError", () => {
+  it("maps a `length` truncation to a non-retryable ToolCallOutputTruncated", () => {
+    const result = buildAbortiveTurnError("anthropic", "length");
+    expect(result.code).toBe(ChatErrorCode.ToolCallOutputTruncated);
+    expect(result.isRetryable).toBe(false);
+  });
+
+  it("keeps a non-length abortive turn as a retryable IncompleteToolCall", () => {
+    for (const finishReason of ["tool-calls", "unknown", null, undefined]) {
+      const result = buildAbortiveTurnError("anthropic", finishReason);
+      expect(result.code).toBe(ChatErrorCode.IncompleteToolCall);
+      expect(result.isRetryable).toBe(true);
+    }
+  });
+});
+
+// =============================================================================
+// Microsoft 365 Copilot — tools rejection (ToolsUnsupported)
+// =============================================================================
+
+describe("mapProviderError - Microsoft 365 Copilot tools rejection", () => {
+  it("maps a mid-stream upstream timeout to a retryable network error", () => {
+    // Once streaming headers are committed the HTTP 504 cannot be changed;
+    // this is the bare SSE error shape delivered by the AI SDK instead.
+    const error = {
+      message:
+        "Microsoft 365 Copilot upstream idle timeout after 120 seconds without new response text.",
+      type: "api_error",
+      internal_code: ArchestraInternalErrorCode.UpstreamTimeout,
+    };
+    const result = mapProviderError(error, "microsoft-365-copilot");
+
+    expect(result.code).toBe(ChatErrorCode.NetworkError);
+    expect(result.isRetryable).toBe(true);
+    expect(result.originalError?.message).toContain("upstream idle timeout");
+  });
+
+  it("maps the proxy adapter's tools rejection to ToolsUnsupported", () => {
+    const error = {
+      name: "AI_APICallError",
+      statusCode: 400,
+      responseBody: JSON.stringify({
+        error: {
+          message: MICROSOFT_365_COPILOT_TOOLS_UNSUPPORTED_MESSAGE,
+          type: "invalid_request_error",
+        },
+      }),
+      isRetryable: false,
+    };
+    const result = mapProviderError(error, "microsoft-365-copilot");
+
+    expect(result.code).toBe(ChatErrorCode.ToolsUnsupported);
+    expect(result.isRetryable).toBe(false);
+    // The headline must be the actionable copy, not the generic
+    // invalid-request one whose details only admins can expand.
+    expect(result.message).toBe(
+      ChatErrorMessages[ChatErrorCode.ToolsUnsupported],
+    );
+  });
+
+  it("keeps other microsoft-365-copilot 400s on the generic invalid-request code", () => {
+    const error = {
+      name: "AI_APICallError",
+      statusCode: 400,
+      responseBody: JSON.stringify({
+        error: {
+          message: "additionalContext exceeds the allowed size",
+          type: "invalid_request_error",
+        },
+      }),
+      isRetryable: false,
+    };
+    const result = mapProviderError(error, "microsoft-365-copilot");
+
+    expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+  });
+});
+
+describe("mapProviderError - GitHub Copilot model rejection", () => {
+  it("maps Copilot's model-not-supported 400 to the actionable NotFound copy (T-959)", () => {
+    // The proxy's error wrapping keeps message/type but drops the upstream
+    // `model_not_supported` code — this is the exact shape the chat receives.
+    const error = {
+      name: "AI_APICallError",
+      statusCode: 400,
+      responseBody: JSON.stringify({
+        error: {
+          message: GithubCopilot.API.MODEL_NOT_SUPPORTED_MESSAGE,
+          type: "api_validation_error",
+        },
+      }),
+      isRetryable: false,
+    };
+    const result = mapProviderError(error, "github-copilot");
+
+    expect(result.code).toBe(ChatErrorCode.NotFound);
+    expect(result.isRetryable).toBe(false);
+    // "The selected model is not available. Please choose a different model."
+    // — not the retry-suggesting invalid-request copy: retrying a
+    // deterministic rejection fails identically every time.
+    expect(result.message).toBe(ChatErrorMessages[ChatErrorCode.NotFound]);
+  });
+
+  it("keeps other github-copilot 400s on the generic invalid-request code", () => {
+    const error = {
+      name: "AI_APICallError",
+      statusCode: 400,
+      responseBody: JSON.stringify({
+        error: {
+          message: "messages must be non-empty",
+          type: "invalid_request_error",
+        },
+      }),
+      isRetryable: false,
+    };
+    const result = mapProviderError(error, "github-copilot");
+
+    expect(result.code).toBe(ChatErrorCode.InvalidRequest);
+  });
+});

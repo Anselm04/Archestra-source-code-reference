@@ -1,0 +1,1305 @@
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  PLAYWRIGHT_MCP_CATALOG_ID,
+  type ThinkingEffort,
+  type ThinkingEffortSetting,
+} from "@archestra/shared";
+import {
+  keepPreviousData,
+  type QueryClient,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { usePathname } from "next/navigation";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import { toast } from "sonner";
+import { agentCatalogToolsQueryKey } from "@/lib/agent-query-keys";
+import { appInteractive } from "@/lib/app-interactive";
+import { awaitBootstrapSeed } from "@/lib/auth/auth.query";
+import { callApi } from "@/lib/chat/api-call";
+import { chatMessageQueue } from "@/lib/chat/chat-message-queue";
+import { conversationStorageKeys } from "@/lib/chat/chat-utils";
+import {
+  type ConversationFileItem,
+  deleteTargetFor,
+} from "@/lib/chat/conversation-files";
+import {
+  conversationQueryKey,
+  conversationsQueryKey,
+} from "@/lib/chat/conversations-query-key";
+import {
+  ENCRYPTED_CHAT_KEY_HEADER,
+  encryptedChatRequestHeaders,
+  storeEncryptedChatKey,
+} from "@/lib/chat/encrypted-chat";
+import { PERSISTED_QUERY_META } from "@/lib/query-persistence";
+import { invalidateToolAssignmentQueries } from "@/lib/use-invalidate-tool-assignment-queries";
+import { handleApiError, throwOnApiError, toApiError } from "@/lib/utils/api";
+import websocketService from "@/lib/websocket/websocket";
+
+const {
+  getChatConversations,
+  getChatConversation,
+  getChatOpenappaStatus,
+  getChatConversationFiles,
+  getChatAgentMcpTools,
+  createChatConversation,
+  updateChatConversation,
+  setConversationHooksDebug,
+  markChatConversationRead,
+  clearChatConversationErrors,
+  compactChatConversation,
+  deleteChatConversation,
+  generateChatConversationTitle,
+  getConversationEnabledTools,
+  updateConversationEnabledTools,
+  deleteConversationEnabledTools,
+  getAgentTools,
+  getInternalMcpCatalogTools,
+  bulkAssignTools,
+  cancelChatMcpTask,
+  stopChatStream,
+  resolveChatMcpElicitation,
+  deleteChatAttachment,
+  deleteSkillSandboxArtifact,
+} = archestraApiSdk;
+
+/**
+ * Invalidate every cache entry that should refresh when a chat turn produces or
+ * rewrites files. Always refreshes the chat's own Files panel
+ * (`["conversation-files", id]`) and the conversation (for a rewritten
+ * artifact); when the chat belongs to a project, also refreshes that project's
+ * Files panel (`["projects", projectId, "files"]`).
+ *
+ * The project cross-invalidation is the symmetric counterpart to the
+ * project-side mutations that invalidate `["conversation-files"]`. Without it, a
+ * file created inside a project chat stays invisible in the project's Files
+ * panel until a hard reload — navigating there via the breadcrumb keeps the
+ * cached (stale) list because the query was never marked stale.
+ */
+export function invalidateConversationFileQueries(
+  queryClient: QueryClient,
+  {
+    conversationId,
+    projectId,
+  }: { conversationId: string; projectId?: string | null },
+) {
+  queryClient.invalidateQueries({
+    queryKey: ["conversation-files", conversationId],
+  });
+  queryClient.invalidateQueries({ queryKey: ["conversation", conversationId] });
+  if (projectId) {
+    queryClient.invalidateQueries({
+      queryKey: ["projects", projectId, "files"],
+    });
+  }
+}
+
+export function mergeUpdatedConversationIntoCache(
+  oldConversation:
+    | archestraApiTypes.GetChatConversationResponses["200"]
+    | undefined,
+  updatedConversation: archestraApiTypes.UpdateChatConversationResponses["200"],
+  variables: { id: string } & WithThinkingEffortSetting<
+    NonNullable<archestraApiTypes.UpdateChatConversationData["body"]>
+  >,
+) {
+  if (!oldConversation) {
+    return updatedConversation;
+  }
+
+  const merged = { ...oldConversation };
+
+  if (variables.title !== undefined) {
+    merged.title = updatedConversation.title;
+    // A rename makes the title real, so the server dropped the placeholder flag.
+    merged.titleIsPlaceholder = updatedConversation.titleIsPlaceholder;
+  }
+  if (variables.modelId !== undefined || variables.agentId !== undefined) {
+    merged.modelId = updatedConversation.modelId;
+  }
+  if (variables.chatApiKeyId !== undefined || variables.agentId !== undefined) {
+    merged.chatApiKeyId = updatedConversation.chatApiKeyId;
+  }
+  // A pool or an auto router comes with a key and model (a member's, the normal
+  // tier's), and a key, model or agent change leaves it (or takes the new
+  // agent's).
+  if (variables.modelPoolId !== undefined || variables.autoRouterId) {
+    merged.modelId = updatedConversation.modelId;
+    merged.chatApiKeyId = updatedConversation.chatApiKeyId;
+  }
+  if (
+    variables.modelPoolId !== undefined ||
+    variables.autoRouterId !== undefined ||
+    variables.modelId !== undefined ||
+    variables.chatApiKeyId !== undefined ||
+    variables.agentId !== undefined
+  ) {
+    merged.modelPoolId = updatedConversation.modelPoolId;
+    merged.autoRouterId = updatedConversation.autoRouterId;
+  }
+  if (variables.agentId !== undefined) {
+    merged.agentId = updatedConversation.agentId;
+    merged.agent = updatedConversation.agent;
+  }
+  if (variables.pinnedAt !== undefined) {
+    merged.pinnedAt = updatedConversation.pinnedAt;
+  }
+  if (variables.projectId !== undefined) {
+    merged.projectId = updatedConversation.projectId;
+  }
+
+  return merged;
+}
+
+/**
+ * How long a loaded conversation (and its Files list) counts as fresh. Changes
+ * arrive by invalidation instead: the end of a turn on this page, the
+ * conversation_updated push for turns elsewhere, and every mutation.
+ */
+const CONVERSATION_STALE_TIME_MS = 30_000;
+
+/** How often a scheduled chat is polled for its seeded prompt, and how long. */
+const SCHEDULE_SEED_POLL_MS = 1_000;
+const SCHEDULE_SEED_MAX_POLLS = 120;
+
+export function useConversation(
+  conversationId?: string,
+  options?: {
+    /**
+     * False for components that only read the conversation the chat page
+     * already loads, so mounting them never starts a request of its own.
+     * Only safe next to the page's own observer of the same conversation,
+     * which refetches a stale entry: alone, such a reader shows a cached
+     * conversation (kept for 10 minutes) without revalidating it.
+     */
+    refetchOnMount?: boolean;
+  },
+) {
+  return useQuery({
+    queryKey: conversationQueryKey(conversationId),
+    queryFn: async ({ client }) => {
+      if (!conversationId) return null;
+      // A server-seeded document holds only the end of a long conversation.
+      // The rest is not on screen, so it loads once the page is interactive.
+      const seeded = client.getQueryData<{ olderMessageCount?: number }>(
+        conversationQueryKey(conversationId),
+      );
+      if (seeded?.olderMessageCount) await appInteractive.whenIdle();
+      return fetchConversation(conversationId);
+    },
+    enabled: !!conversationId,
+    // The end of a long conversation is a placeholder for the whole of it.
+    staleTime: (query) =>
+      (query.state.data as { olderMessageCount?: number } | null | undefined)
+        ?.olderMessageCount
+        ? 0
+        : CONVERSATION_STALE_TIME_MS,
+    refetchOnMount: options?.refetchOnMount ?? true,
+    gcTime: 10 * 60 * 1000, // Keep in cache for 10 minutes
+    refetchOnWindowFocus: false, // Don't refetch when window gains focus
+    // The schedule worker links the conversation before registering its stream
+    // and seeding the prompt. Wait for that prompt before attaching to replay,
+    // for about two minutes at most: a run that has not seeded by then is
+    // brought in by the conversation_updated push instead. Like every
+    // interval, this one pauses while the tab is hidden.
+    refetchInterval: (query) =>
+      query.state.data?.origin === "schedule_trigger" &&
+      query.state.data.messages.length === 0 &&
+      query.state.data.chatErrors.length === 0 &&
+      query.state.dataUpdateCount < SCHEDULE_SEED_MAX_POLLS
+        ? SCHEDULE_SEED_POLL_MS
+        : false,
+    refetchIntervalInBackground: false,
+    retry: false, // Don't retry on error to avoid multiple 404s
+  });
+}
+
+/** One conversation with its messages, for callers outside the chat page. */
+export function fetchConversation(conversationId: string) {
+  // 400/404 are handled gracefully by the UI, so suppress their toast.
+  // For an encrypted chat the stored key rides along; without it
+  // the server answers 200 with `contentLocked: true` and no messages.
+  return callApi(
+    () =>
+      getChatConversation({
+        path: { id: conversationId },
+        headers: encryptedChatRequestHeaders(conversationId),
+      }),
+    null,
+    {
+      silentStatuses: [400, 404],
+    },
+  );
+}
+
+export const openappaStatusQueryKey = (conversationId: string | undefined) =>
+  ["openappa-status", conversationId] as const;
+
+export function useOpenappaStatus(conversationId?: string) {
+  return useQuery({
+    queryKey: openappaStatusQueryKey(conversationId),
+    queryFn: async () => {
+      if (!conversationId) return null;
+      const { data, error } = await getChatOpenappaStatus({
+        path: { id: conversationId },
+        headers: encryptedChatRequestHeaders(conversationId),
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    enabled: !!conversationId,
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+export function useConversationFiles(conversationId?: string) {
+  return useQuery({
+    queryKey: ["conversation-files", conversationId],
+    queryFn: () => {
+      if (!conversationId) return null;
+      // The key opens the attachment filenames for an encrypted chat; without it
+      // the server still lists the files, under a placeholder name.
+      return callApi(
+        () =>
+          getChatConversationFiles({
+            path: { id: conversationId },
+            headers: encryptedChatRequestHeaders(conversationId),
+          }),
+        null,
+        { silent: true },
+      );
+    },
+    enabled: !!conversationId,
+    staleTime: CONVERSATION_STALE_TIME_MS,
+    gcTime: 10 * 60 * 1000,
+    refetchOnWindowFocus: false,
+  });
+}
+
+/**
+ * Refresh the Files list and the conversation (for a rewritten artifact) when
+ * a turn on this page ends: the status moving from submitted or streaming to
+ * ready. Opening or switching to a conversation is not a turn ending — those
+ * load through the queries themselves.
+ */
+export function useRefreshConversationFilesAfterTurn({
+  conversationId,
+  projectId,
+  status,
+}: {
+  conversationId?: string;
+  projectId?: string | null;
+  status: string;
+}) {
+  const queryClient = useQueryClient();
+  const previous = useRef({ conversationId, status });
+  // Read through a ref: the project id resolving must not count as a change.
+  const projectIdRef = useRef(projectId);
+  projectIdRef.current = projectId;
+
+  useEffect(() => {
+    const before = previous.current;
+    previous.current = { conversationId, status };
+    if (!conversationId || before.conversationId !== conversationId) return;
+    const turnEnded =
+      status === "ready" &&
+      (before.status === "streaming" || before.status === "submitted");
+    if (!turnEnded) return;
+    invalidateConversationFileQueries(queryClient, {
+      conversationId,
+      projectId: projectIdRef.current,
+    });
+  }, [conversationId, status, queryClient]);
+}
+
+/** Route a single file to its delete endpoint by source. */
+async function deleteConversationFileItem(item: ConversationFileItem) {
+  return deleteTargetFor(item).kind === "attachment"
+    ? deleteChatAttachment({ path: { id: item.id } })
+    : deleteSkillSandboxArtifact({ path: { artifactId: item.id } });
+}
+
+/** Delete one file from the chat Files panel (attachment or artifact). */
+export function useDeleteConversationFile(conversationId?: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (item: ConversationFileItem) => {
+      const { error } = await deleteConversationFileItem(item);
+      if (error) {
+        handleApiError(error);
+        throw error;
+      }
+    },
+    onSuccess: () => {
+      toast.success("File deleted");
+    },
+    onSettled: () => {
+      if (conversationId) {
+        queryClient.invalidateQueries({
+          queryKey: ["conversation-files", conversationId],
+        });
+      }
+    },
+  });
+}
+
+/**
+ * Delete several files at once. Runs the per-file deletes concurrently and
+ * reports a single summary toast and a single cache invalidation, instead of
+ * one of each per file.
+ */
+export function useBulkDeleteConversationFiles(conversationId?: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (items: ConversationFileItem[]) => {
+      const results = await Promise.allSettled(
+        items.map((item) => deleteConversationFileItem(item)),
+      );
+      // hey-api resolves with `{ error }` rather than throwing, so a failure is
+      // either a rejected promise or a present error payload. Report the ids
+      // that failed so the caller can keep them selected / still open.
+      const failedIds = items
+        .filter((_, i) => {
+          const r = results[i];
+          return r.status === "rejected" || r.value.error != null;
+        })
+        .map((item) => item.id);
+      return { total: items.length, failedIds };
+    },
+    onSuccess: ({ total, failedIds }) => {
+      const deleted = total - failedIds.length;
+      if (failedIds.length === 0) {
+        toast.success(`Deleted ${total} ${total === 1 ? "file" : "files"}`);
+      } else {
+        toast.error(
+          `Deleted ${deleted} of ${total}; ${failedIds.length} failed`,
+        );
+      }
+    },
+    onSettled: () => {
+      if (conversationId) {
+        queryClient.invalidateQueries({
+          queryKey: ["conversation-files", conversationId],
+        });
+      }
+    },
+  });
+}
+
+export function useConversations({
+  enabled = true,
+  search,
+  limit,
+}: {
+  enabled?: boolean;
+  search?: string;
+  /** Recent conversations to load when not searching; pinned ones always come. */
+  limit?: number;
+}) {
+  const queryKey = conversationsQueryKey({ search, limit });
+  return useQuery({
+    queryKey,
+    queryFn: async () => {
+      const trimmedSearch = search?.trim();
+      // List rows never show the artifact or todo list.
+      const { data, error } = await getChatConversations({
+        query: {
+          includeArtifacts: false,
+          ...(trimmedSearch
+            ? { search: trimmedSearch }
+            : { limit: queryKey[2] }),
+        },
+      });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? [];
+    },
+    enabled,
+    // Searches always go to the server. The plain list is kept current by the
+    // conversation_updated push and by every mutation, so it stays fresh across
+    // conversation switches instead of being re-read on each one.
+    staleTime: search ? 0 : 30_000,
+    gcTime: 10 * 60 * 1000,
+    // Backstop for the conversation_updated websocket push (see
+    // useConversationUpdatedCacheSync): if the socket was down when a message
+    // landed, refocusing or reconnecting still refreshes the unread indicators.
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
+    // The sidebar's list (not a search) comes back on refresh, so its rows
+    // show at once; titles are on screen already and the list revalidates.
+    meta: search ? undefined : PERSISTED_QUERY_META,
+  });
+}
+
+/**
+ * Mark a conversation read (owner-only on the server), clearing its sidebar
+ * new-messages dot. Optimistically flips `unread` to false across cached
+ * conversation lists so the dot disappears the instant the chat is opened; the
+ * optimistic write also stops {@link useKeepViewedConversationRead} from
+ * re-firing while the request is in flight.
+ */
+export function useMarkConversationRead() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id }: { id: string }) =>
+      callApi(() => markChatConversationRead({ path: { id } }), null),
+    onMutate: ({ id }) => {
+      queryClient.setQueriesData<
+        archestraApiTypes.GetChatConversationsResponses["200"]
+      >({ queryKey: ["conversations"] }, (old) =>
+        old
+          ? old.map((c) =>
+              c.id === id && c.unread ? { ...c, unread: false } : c,
+            )
+          : old,
+      );
+    },
+  });
+}
+
+/**
+ * Keep the conversation shown in the URL marked read: whenever it appears
+ * unread in the list cache — on open, or when the conversation_updated push
+ * refreshes the list while you're viewing it — POST a read. Keyed on the live
+ * pathname, not page-held state, so a freshly-created chat whose id lags the
+ * URL never clears a chat you have already navigated away from.
+ */
+export function useKeepViewedConversationRead() {
+  const pathname = usePathname();
+  const queryClient = useQueryClient();
+  const { mutate: markRead } = useMarkConversationRead();
+
+  const viewedConversationId = pathname.startsWith("/chat/")
+    ? (pathname.split("/").at(-1) ?? undefined)
+    : undefined;
+  // Read the lists the sidebar and palette already hold rather than observing
+  // one: an observer here started a list fetch on every conversation switch.
+  const isViewedUnread = useSyncExternalStore(
+    (onChange) => queryClient.getQueryCache().subscribe(onChange),
+    () =>
+      !!viewedConversationId &&
+      queryClient
+        .getQueriesData<archestraApiTypes.GetChatConversationsResponses["200"]>(
+          { queryKey: ["conversations"] },
+        )
+        .some(([, list]) =>
+          list?.some((c) => c.id === viewedConversationId && c.unread),
+        ),
+    () => false,
+  );
+
+  useEffect(() => {
+    if (viewedConversationId && isViewedUnread) {
+      markRead({ id: viewedConversationId });
+    }
+  }, [viewedConversationId, isViewedUnread, markRead]);
+}
+
+/**
+ * Refresh the sidebar's unread indicators when the server pushes a
+ * conversation_updated message (a turn finished in one of the owner's chats).
+ * This is what surfaces the dot on a backgrounded chat whose stream completion
+ * the client never witnessed. Mount once, app-wide.
+ */
+export function useConversationUpdatedCacheSync(enabled = true) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    websocketService.connect();
+    return websocketService.subscribe("conversation_updated", (message) => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // The conversation itself stays fresh for a while once loaded, so a turn
+      // that finished elsewhere must mark it stale here.
+      void queryClient.invalidateQueries({
+        queryKey: ["conversation", message.payload.conversationId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["conversation-files", message.payload.conversationId],
+      });
+    });
+  }, [enabled, queryClient]);
+}
+
+/**
+ * Restores `null` (auto) to a generated request body.
+ *
+ * The client generator drops `nullable: true` from enum schemas, so every
+ * nullable enum in the API reads as non-null here — `selectedProvider` has the
+ * same gap. Without this the narrower generated type would reject a depth the
+ * API accepts.
+ */
+type WithThinkingEffortSetting<TBody> = Omit<TBody, "thinkingEffort"> & {
+  thinkingEffort?: ThinkingEffortSetting;
+};
+
+function invalidateProjectRecents(
+  queryClient: QueryClient,
+  projectId: string | null,
+) {
+  if (projectId) {
+    void queryClient.invalidateQueries({
+      queryKey: ["projects", projectId, "conversations"],
+    });
+  }
+}
+
+export function useCreateConversation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      agentId,
+      modelId,
+      chatApiKeyId,
+      modelPoolId,
+      autoRouterId,
+      strictModelSelection,
+      title,
+      projectId,
+      encryptedChat,
+      encryptedChatKey,
+      thinkingEffort,
+    }: WithThinkingEffortSetting<
+      NonNullable<archestraApiTypes.CreateChatConversationData["body"]>
+    > & {
+      /**
+       * Browser-generated conversation DEK (base64url of 32 random bytes).
+       * Required when `encrypted-chat` is set: the server fingerprints and
+       * escrow-wraps it but never stores it.
+       */
+      encryptedChatKey?: string;
+    }) =>
+      callApi(
+        () =>
+          createChatConversation({
+            body: {
+              agentId,
+              modelId,
+              chatApiKeyId: chatApiKeyId ?? undefined,
+              modelPoolId: modelPoolId ?? undefined,
+              autoRouterId: autoRouterId ?? undefined,
+              strictModelSelection,
+              title,
+              projectId: projectId ?? undefined,
+              encryptedChat: encryptedChat || undefined,
+              // The generated body type drops `nullable: true` from enum
+              // schemas, so null (auto) has to be re-asserted here.
+              thinkingEffort: thinkingEffort as ThinkingEffort | undefined,
+            },
+            headers: encryptedChatKey
+              ? { [ENCRYPTED_CHAT_KEY_HEADER]: encryptedChatKey }
+              : undefined,
+          }),
+        null,
+      ),
+    onSuccess: (newConversation, variables) => {
+      if (!newConversation) return;
+      // Persist the DEK under the fresh conversation id FIRST — before any
+      // cache writes trigger navigation or the first stream request, both of
+      // which must find the key in localStorage.
+      if (variables.encryptedChat && variables.encryptedChatKey) {
+        storeEncryptedChatKey(newConversation.id, variables.encryptedChatKey);
+      }
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      invalidateProjectRecents(queryClient, newConversation.projectId);
+      // Immediately populate the individual conversation cache to avoid loading state
+      queryClient.setQueryData(
+        ["conversation", newConversation.id],
+        newConversation,
+      );
+    },
+  });
+}
+
+export function useUpdateConversation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      id,
+      title,
+      modelId,
+      chatApiKeyId,
+      modelPoolId,
+      autoRouterId,
+      strictModelSelection,
+      agentId,
+      projectId,
+      pinnedAt,
+      thinkingEffort,
+    }: { id: string } & WithThinkingEffortSetting<
+      NonNullable<archestraApiTypes.UpdateChatConversationData["body"]>
+    >) =>
+      callApi(
+        () =>
+          updateChatConversation({
+            path: { id },
+            body: {
+              title,
+              modelId,
+              chatApiKeyId,
+              modelPoolId,
+              autoRouterId,
+              strictModelSelection,
+              agentId,
+              projectId,
+              pinnedAt,
+              // The generated body type drops `nullable: true` from enum
+              // schemas, so null (auto) has to be re-asserted here.
+              thinkingEffort: thinkingEffort as ThinkingEffort | undefined,
+            },
+          }),
+        null,
+      ),
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      const previousProjectId =
+        queryClient.getQueryData<
+          archestraApiTypes.GetChatConversationResponses["200"]
+        >(["conversation", variables.id])?.projectId ??
+        queryClient
+          .getQueriesData<
+            archestraApiTypes.GetChatConversationsResponses["200"]
+          >({ queryKey: ["conversations"] })
+          .flatMap(([, conversations]) => conversations ?? [])
+          .find((conversation) => conversation.id === variables.id)?.projectId;
+      // `mergeUpdatedConversationIntoCache` deliberately has no branch for the
+      // reasoning depth: the composer owns what it displays, including the
+      // clicks its write queue coalesces away. Echoing a response back would
+      // flip the control to whichever request answered last.
+      queryClient.setQueryData(
+        ["conversation", variables.id],
+        (old: typeof data | undefined) =>
+          mergeUpdatedConversationIntoCache(old, data, variables),
+      );
+
+      // Update title in cache
+      if (variables.title !== undefined) {
+        queryClient.setQueriesData<
+          archestraApiTypes.GetChatConversationsResponses["200"]
+        >({ queryKey: ["conversations"] }, (old) =>
+          old?.map((c) =>
+            c.id === variables.id ? { ...c, title: data.title } : c,
+          ),
+        );
+      }
+      // Only invalidate the conversations list for sidebar-relevant changes
+      // (pin status, agent). Model/key updates don't affect the sidebar
+      // and unnecessary invalidation causes cascading re-renders.
+      if (
+        variables.pinnedAt !== undefined ||
+        variables.agentId ||
+        variables.projectId !== undefined
+      ) {
+        queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      }
+      if (variables.projectId !== undefined) {
+        toast.success(
+          variables.projectId
+            ? "Chat moved to project"
+            : "Chat removed from project",
+        );
+        queryClient.invalidateQueries({ queryKey: ["projects", "list"] });
+        queryClient.invalidateQueries({
+          queryKey: ["conversation-files", variables.id],
+        });
+        if (previousProjectId) {
+          queryClient.invalidateQueries({
+            queryKey: ["projects", previousProjectId, "conversations"],
+          });
+        }
+        if (variables.projectId) {
+          queryClient.invalidateQueries({
+            queryKey: ["projects", variables.projectId, "conversations"],
+          });
+        }
+      }
+      if (variables.agentId) {
+        // Agent changed — invalidate tools-related queries
+        queryClient.invalidateQueries({
+          queryKey: ["conversation", variables.id, "enabled-tools"],
+        });
+      }
+    },
+  });
+}
+
+export function usePinConversation() {
+  const updateMutation = useUpdateConversation();
+
+  return useMutation({
+    mutationFn: async ({ id, pinned }: { id: string; pinned: boolean }) => {
+      const pinnedAt = pinned ? new Date().toISOString() : null;
+      return updateMutation.mutateAsync({ id, pinnedAt });
+    },
+  });
+}
+
+export function useCompactConversation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id }: { id: string }) =>
+      callApi(() => compactChatConversation({ path: { id } }), null),
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.setQueryData(
+        ["conversation", variables.id],
+        data.conversation,
+      );
+      queryClient.invalidateQueries({
+        queryKey: ["conversation", variables.id],
+      });
+    },
+  });
+}
+
+/**
+ * Clear a conversation's recorded chat errors. Used by the chat session's
+ * regenerate flow ("Try again" on the error card, the regenerate action on a
+ * user message, edited resends) and the silent auto-retry success path.
+ *
+ * Optimistically drops the persisted error rows from the conversation cache and
+ * cancels any in-flight conversation refetch *before* the delete. The regenerate
+ * flow persists the (edited) user message just before calling this, which kicks
+ * off a conversation refetch that reads the error rows while they still exist —
+ * without the cancel + optimistic write, that refetch lands last and resurrects
+ * the stale error card above the freshly regenerated answer. Mirrors the
+ * optimistic-removal pattern in useDeleteConversation.
+ */
+export function useClearChatErrors() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ id }: { id: string }) => {
+      const { data, error } = await clearChatConversationErrors({
+        path: { id },
+      });
+      if (error) {
+        handleApiError(error);
+        // Throw to trigger onError rollback for the optimistic cache removal.
+        throw error;
+      }
+      return data;
+    },
+    onMutate: async ({ id }) => {
+      const queryKey = ["conversation", id];
+      // Cancel in-flight refetches so they can't overwrite the optimistic clear.
+      await queryClient.cancelQueries({ queryKey });
+      const previous =
+        queryClient.getQueryData<
+          archestraApiTypes.GetChatConversationResponses["200"]
+        >(queryKey);
+      // Drop the error rows immediately so the inline card disappears at once.
+      queryClient.setQueryData<
+        archestraApiTypes.GetChatConversationResponses["200"]
+      >(queryKey, (old) => (old ? { ...old, chatErrors: [] } : old));
+      return { previous, queryKey };
+    },
+    onError: (_error, _variables, context) => {
+      // The delete failed — restore the rows so the user still sees the error.
+      if (context?.previous !== undefined) {
+        queryClient.setQueryData(context.queryKey, context.previous);
+      }
+    },
+    onSettled: (_data, _error, variables) => {
+      // Reconcile with the server: confirms the rows are gone on success, or
+      // brings them back if the delete never took.
+      queryClient.invalidateQueries({
+        queryKey: ["conversation", variables.id],
+      });
+    },
+  });
+}
+
+/**
+ * Toggle per-conversation hook debug mode (admin only). Invalidating the
+ * conversation query re-runs the server read gate, and the chat page folds the
+ * refetched messages into the live chat state (mergePersistedMessageMetadata),
+ * so hook debug chips appear (enabled) or disappear (disabled) in place.
+ */
+export function useToggleHooksDebug() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      callApi(
+        () => setConversationHooksDebug({ path: { id }, body: { enabled } }),
+        null,
+      ),
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      toast.success(
+        data.hooksDebugEnabled
+          ? "Hook debug mode enabled"
+          : "Hook debug mode disabled",
+      );
+      queryClient.invalidateQueries({
+        queryKey: ["conversation", variables.id],
+      });
+    },
+  });
+}
+
+export function useDeleteConversation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const { data, error } = await deleteChatConversation({
+        path: { id },
+      });
+      if (error) {
+        handleApiError(error);
+        // Throw to trigger onError rollback for optimistic cache removal
+        throw error;
+      }
+      return data;
+    },
+    onMutate: async (deletedId) => {
+      // Cancel in-flight refetches so they don't overwrite our optimistic update
+      await queryClient.cancelQueries({ queryKey: ["conversations"] });
+
+      // Snapshot all conversation list caches (one per search query) for rollback
+      const previousQueries = queryClient.getQueriesData<
+        archestraApiTypes.GetChatConversationsResponses["200"]
+      >({
+        queryKey: ["conversations"],
+      });
+
+      // Capture the deleted conversation's project (if any) so onSettled can
+      // also refresh the project page's own conversation list.
+      const projectId = previousQueries
+        .flatMap(([, data]) => data ?? [])
+        .find((c) => c.id === deletedId)?.projectId;
+
+      // Optimistically remove the conversation from every cached list
+      queryClient.setQueriesData<
+        archestraApiTypes.GetChatConversationsResponses["200"]
+      >({ queryKey: ["conversations"] }, (old) =>
+        old ? old.filter((c) => c.id !== deletedId) : old,
+      );
+
+      return { previousQueries, projectId };
+    },
+    onError: (_error, _deletedId, context) => {
+      // Roll back optimistic removal on failure
+      if (context?.previousQueries) {
+        for (const [queryKey, data] of context.previousQueries) {
+          queryClient.setQueryData(queryKey, data);
+        }
+      }
+    },
+    onSuccess: (_data, deletedId) => {
+      queryClient.removeQueries({ queryKey: ["conversation", deletedId] });
+
+      // Clean up localStorage keys associated with this conversation
+      if (typeof window !== "undefined") {
+        const keys = conversationStorageKeys(deletedId);
+        localStorage.removeItem(keys.rightPanelOpen);
+        localStorage.removeItem(keys.rightPanelTab);
+        localStorage.removeItem(keys.draft);
+        // An encrypted chat's encryption key dies with the conversation. Every
+        // spelling, so a key written before a rename is not left behind.
+        localStorage.removeItem(keys.encryptedChatKey);
+        for (const legacyKey of keys.legacyEncryptedChatKeys) {
+          localStorage.removeItem(legacyKey);
+        }
+      }
+      // Drops both the in-memory queue and its persisted copy.
+      chatMessageQueue.clear(deletedId);
+
+      toast.success("Conversation deleted");
+    },
+    onSettled: (_data, _error, _deletedId, context) => {
+      // Always refetch to ensure server state is in sync
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // A project chat is also listed on its project page under a separate
+      // query key, which the sidebar invalidation above does not cover.
+      if (context?.projectId) {
+        queryClient.invalidateQueries({
+          queryKey: ["projects", context.projectId, "conversations"],
+        });
+      }
+    },
+  });
+}
+
+export function useStopChatStream() {
+  return useMutation({
+    mutationFn: async (conversationId: string) => {
+      const { data, error } = await stopChatStream({
+        path: { id: conversationId },
+      });
+      if (error) {
+        handleApiError(error);
+        throw toApiError(error);
+      }
+      return data;
+    },
+  });
+}
+
+export function useCancelChatMcpTask() {
+  return useMutation({
+    mutationFn: (taskId: string) =>
+      callApi(() => cancelChatMcpTask({ path: { taskId } }), null),
+  });
+}
+
+/**
+ * Answer a question the chat is waiting on. Resolves to `"answered"`,
+ * `"stale"` when the question is no longer waiting (409: answered already,
+ * timed out, or its run ended — nothing to report, the caller just drops it),
+ * or `"failed"` after reporting any other error.
+ */
+export function useResolveChatMcpElicitation() {
+  type ResolveChatMcpElicitationBody = NonNullable<
+    archestraApiTypes.ResolveChatMcpElicitationData["body"]
+  >;
+
+  return useMutation({
+    mutationFn: async ({
+      id,
+      conversationId,
+      action,
+      content,
+    }: {
+      id: string;
+      conversationId: string;
+      action: ResolveChatMcpElicitationBody["action"];
+      content?: ResolveChatMcpElicitationBody["content"];
+    }): Promise<"answered" | "stale" | "failed"> => {
+      const { error, response } = await resolveChatMcpElicitation({
+        path: { id },
+        body: { conversationId, action, content },
+      });
+      if (!error) {
+        return "answered";
+      }
+      if (response?.status === 409) {
+        return "stale";
+      }
+      handleApiError(error);
+      return "failed";
+    },
+  });
+}
+
+export function useGenerateConversationTitle() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      id,
+      regenerate = false,
+    }: {
+      id: string;
+      regenerate?: boolean;
+    }) =>
+      callApi(
+        () =>
+          generateChatConversationTitle({ path: { id }, body: { regenerate } }),
+        null,
+      ),
+    onSuccess: (data, variables) => {
+      if (!data) {
+        return;
+      }
+
+      queryClient.setQueryData(
+        ["conversation", variables.id],
+        (old: archestraApiTypes.GetChatConversationResponses["200"] | null) =>
+          old
+            ? {
+                ...old,
+                title: data.title,
+                titleIsPlaceholder: data.titleIsPlaceholder,
+              }
+            : old,
+      );
+      queryClient.setQueriesData<
+        archestraApiTypes.GetChatConversationsResponses["200"]
+      >({ queryKey: ["conversations"] }, (old) =>
+        old?.map((c) =>
+          c.id === variables.id
+            ? {
+                ...c,
+                title: data.title,
+                titleIsPlaceholder: data.titleIsPlaceholder,
+              }
+            : c,
+        ),
+      );
+      invalidateProjectRecents(queryClient, data.projectId);
+    },
+  });
+}
+
+export function useChatProfileMcpTools(
+  agentId: string | undefined,
+  options?: { silent?: boolean },
+) {
+  return useQuery({
+    queryKey: ["chat", "agents", agentId, "mcp-tools"],
+    queryFn: () => {
+      if (!agentId) return [];
+      return callApi(() => getChatAgentMcpTools({ path: { agentId } }), [], {
+        silent: options?.silent,
+      });
+    },
+    enabled: !!agentId,
+    staleTime: 5 * 60 * 1000, // 5 minutes
+    gcTime: 10 * 60 * 1000,
+  });
+}
+
+/**
+ * Fetch enabled tools for a conversation (non-hook version for use in callbacks)
+ * Returns { hasCustomSelection: boolean, enabledToolIds: string[] } or null on error
+ */
+export async function fetchConversationEnabledTools(conversationId: string) {
+  const response = await getConversationEnabledTools({
+    path: { id: conversationId },
+  });
+  if (response.error) {
+    return {
+      data: null,
+      status: response.response?.status,
+    };
+  }
+
+  return {
+    data: response.data,
+    status: response.response?.status,
+  };
+}
+
+/**
+ * Get enabled tools for a conversation
+ * Returns { hasCustomSelection: boolean, enabledToolIds: string[] }
+ * Empty enabledToolIds with hasCustomSelection=false means all tools enabled (default)
+ */
+export function useConversationEnabledTools(
+  conversationId: string | undefined,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: ["conversation", conversationId, "enabled-tools"],
+    queryFn: async () => {
+      if (!conversationId) return null;
+      const result = await fetchConversationEnabledTools(conversationId);
+      if (!result.data) {
+        if (result.status !== 404) {
+          handleApiError({
+            error: new Error("Failed to fetch enabled tools"),
+          });
+        }
+        return null;
+      }
+      return result.data;
+    },
+    enabled: !!conversationId && (options?.enabled ?? true),
+    staleTime: 30 * 1000, // 30 seconds
+    gcTime: 5 * 60 * 1000,
+  });
+}
+
+/**
+ * Update enabled tools for a conversation
+ * Pass toolIds to set specific enabled tools
+ */
+export function useUpdateConversationEnabledTools() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      conversationId,
+      toolIds,
+    }: {
+      conversationId: string;
+      toolIds: string[];
+    }) =>
+      callApi(
+        () =>
+          updateConversationEnabledTools({
+            path: { id: conversationId },
+            body: { toolIds },
+          }),
+        null,
+      ),
+    onSuccess: (data, variables) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["conversation", variables.conversationId, "enabled-tools"],
+      });
+    },
+  });
+}
+
+/**
+ * Clear custom tool selection for a conversation (revert to all tools enabled)
+ */
+export function useClearConversationEnabledTools() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (conversationId: string) =>
+      callApi(
+        () => deleteConversationEnabledTools({ path: { id: conversationId } }),
+        null,
+      ),
+    onSuccess: (data, conversationId) => {
+      if (!data) return;
+      queryClient.invalidateQueries({
+        queryKey: ["conversation", conversationId, "enabled-tools"],
+      });
+    },
+  });
+}
+
+/**
+ * Fetch MCP tools for an agent (raw function for use with useQueries).
+ */
+export async function fetchAgentMcpTools(agentId: string | undefined) {
+  if (!agentId) return [];
+  return callApi(() => getAgentTools({ path: { agentId } }), []);
+}
+
+/**
+ * Get profile tools with IDs (for the manage tools dialog)
+ * Returns full tool objects including IDs needed for enabled tools junction table
+ */
+export function useProfileToolsWithIds(
+  agentId: string | undefined,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: ["agents", agentId, "tools", "mcp-only"],
+    queryFn: () => fetchAgentMcpTools(agentId),
+    enabled: !!agentId && (options?.enabled ?? true),
+    staleTime: 5 * 60 * 1000, // 5 minutes
+    gcTime: 10 * 60 * 1000,
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Get delegation tools for an internal agent
+ * Returns delegation tools (tools that delegate to other agents) assigned to this agent
+ */
+export function useAgentDelegationTools(agentId: string | undefined) {
+  return useQuery({
+    queryKey: ["agents", agentId, "delegation-tools"],
+    queryFn: async () => {
+      if (!agentId) return [];
+      const data = await callApi(
+        () => getAgentTools({ path: { agentId } }),
+        [],
+      );
+      return (data ?? []).filter((tool) =>
+        tool.name.startsWith("delegate_to_"),
+      );
+    },
+    enabled: !!agentId,
+    staleTime: 5 * 60 * 1000, // 5 minutes
+    gcTime: 10 * 60 * 1000,
+  });
+}
+
+export function useHasPlaywrightMcpTools(
+  agentId: string | undefined,
+  options?: { enabled?: boolean },
+) {
+  // Only the Playwright catalog's tools: the full list carries every tool's
+  // schema and can run to megabytes for a well-equipped agent.
+  const toolsQuery = useQuery({
+    queryKey: agentCatalogToolsQueryKey(agentId, PLAYWRIGHT_MCP_CATALOG_ID),
+    queryFn: () =>
+      callApi(
+        () =>
+          getAgentTools({
+            path: { agentId: agentId as string },
+            query: { catalogId: PLAYWRIGHT_MCP_CATALOG_ID },
+          }),
+        [],
+      ),
+    enabled: !!agentId && (options?.enabled ?? true),
+    staleTime: 5 * 60 * 1000,
+    gcTime: 10 * 60 * 1000,
+    placeholderData: keepPreviousData,
+  });
+  const queryClient = useQueryClient();
+
+  // Mutation to assign all Playwright tools to the current agent
+  const assignToolsMutation = useMutation({
+    mutationFn: async ({
+      agentId: targetAgentId,
+      conversationId,
+    }: {
+      agentId: string;
+      conversationId?: string;
+    }) => {
+      const { data: catalogTools } = await getInternalMcpCatalogTools({
+        path: { id: PLAYWRIGHT_MCP_CATALOG_ID },
+        query: { view: "picker" },
+      });
+      if (!catalogTools?.length) {
+        throw new Error("No Playwright tools found");
+      }
+      const assignments = catalogTools.map((tool) => ({
+        agentId: targetAgentId,
+        toolId: tool.id,
+        resolveAtCallTime: true,
+      }));
+      const { data } = await bulkAssignTools({ body: { assignments } });
+      if (data?.failed?.length) {
+        throw new Error(data.failed[0].error);
+      }
+      // If conversation has custom tool selection, add new tools to enabled list
+      if (conversationId) {
+        const enabledData = await fetchConversationEnabledTools(conversationId);
+        if (enabledData?.data?.hasCustomSelection) {
+          const newToolIds = catalogTools.map((t) => t.id);
+          const merged = [
+            ...new Set([...enabledData.data.enabledToolIds, ...newToolIds]),
+          ];
+          await updateConversationEnabledTools({
+            path: { id: conversationId },
+            body: { toolIds: merged },
+          });
+        }
+      }
+    },
+    onSuccess: (_data, { agentId: targetAgentId, conversationId }) => {
+      invalidateToolAssignmentQueries(queryClient, targetAgentId);
+      if (conversationId) {
+        queryClient.invalidateQueries({
+          queryKey: ["conversation", conversationId, "enabled-tools"],
+        });
+      }
+    },
+    onError: (error: Error) => {
+      handleApiError({ error });
+    },
+  });
+
+  // Check if agent has Playwright tools assigned via agent_tools
+  const hasPlaywrightMcpTools =
+    toolsQuery.data?.some(
+      (tool) => tool.catalogId === PLAYWRIGHT_MCP_CATALOG_ID,
+    ) ?? false;
+
+  return {
+    hasPlaywrightMcpTools,
+    isLoading: toolsQuery.isLoading,
+    isAssigningTools: assignToolsMutation.isPending,
+    assignToolsToAgent: assignToolsMutation.mutateAsync,
+  };
+}

@@ -1,0 +1,161 @@
+# Archestra Platform Smoke Test Runbook
+
+This runbook is designed for Claude Code to execute as an interactive smoke test of the Archestra platform. Each test verifies core platform functionality using browser automation via Playwright MCP tools.
+
+## Prerequisites
+
+Before starting, verify the development environment is running:
+
+1. Run `tilt get uiresources` to verify Tilt is running
+2. Navigate to `http://localhost:3000` to verify frontend is accessible
+3. Navigate to `http://localhost:9000/health` to verify backend is accessible
+
+---
+
+## Test 1: Basic Chat with Empty Profile
+
+**Objective**: Verify the chat feature works with a fresh profile that has no MCP tools assigned.
+
+### Steps
+
+1. Navigate to `http://localhost:3000/profiles`
+2. Create a new profile named "Smoke Test Profile - Empty"
+3. Navigate to Chat (`http://localhost:3000/chat`)
+4. Select the newly created profile from the profile dropdown
+5. Start a new conversation
+6. Send message: "Hello, please introduce yourself briefly."
+
+### Expected Result
+
+- Chat responds with a coherent greeting/introduction
+- No errors in the console
+- Conversation appears in the sidebar
+
+### Cleanup
+
+- Note the profile ID for later deletion
+
+---
+
+## Test 2: GitHub MCP Server Installation and Tool Assignment
+
+**Objective**: Verify MCP server installation from catalog and tool assignment to a profile.
+
+### Steps
+
+1. Navigate to MCP Catalog (`http://localhost:3000/mcp/registry`)
+2. Search for "github" in the catalog
+3. Install the GitHub MCP server (if not already installed)
+4. Wait for installation to complete
+5. Navigate to the profile created in Test 1
+6. Go to the Tools tab
+7. Assign GitHub tools to the profile (at minimum: `list_issues`, `search_issues`, `whoami`)
+
+### Expected Result
+
+- GitHub MCP server appears in installed servers list
+- Tools are successfully assigned to the profile
+- Profile shows the assigned tools count
+
+---
+
+## Test 3: GitHub Issues Overview (Initial Request)
+
+**Objective**: Verify MCP tools execute correctly and return meaningful data.
+
+### Steps
+
+1. Navigate to Chat (`http://localhost:3000/chat`)
+2. Select the profile with GitHub tools assigned
+3. Start a new conversation
+4. Send message: "Give a short overview of the open issues in https://github.com/archestra-ai/archestra"
+
+### Expected Result
+
+- Chat invokes `list_issues` or `search_issues` tool
+- Returns a meaningful summary of issues (titles, counts, categories)
+- Tool calls visible in Logs (`http://localhost:3000/logs?type=llm`)
+
+### Verification
+
+1. Check Logs for the request
+2. Verify tool calls are recorded under the MCP Gateway type in Logs (`http://localhost:3000/logs?type=mcp`)
+3. Confirm response contains actual issue data
+
+---
+
+## Test 4: LLM Proxy Tool Discovery (External MCP Server)
+
+**Objective**: Verify tools can be discovered via LLM Proxy when MCP server runs externally (not in Archestra's K8s).
+
+### Precondition
+
+This test requires an MCP server configured with "LLM Proxy" origin (tools fetched at request time rather than from K8s pods).
+
+### Steps
+
+1. Navigate to MCP Servers (`http://localhost:3000/mcp-servers`)
+2. Create or verify an MCP server with:
+   - Remote URL configuration (not local K8s)
+   - Or use a catalog server that doesn't require K8s orchestration
+3. Assign tools from this server to a test profile
+4. In Chat, with that profile selected, send a message that would trigger tool discovery
+
+### Expected Result
+
+- Tools are discovered and available despite not running in Archestra's K8s
+- Tool origin shows "LLMProxy" in the tools list
+- Tools can be invoked successfully
+
+### Verification
+
+1. Check the Tools page for the profile
+2. Look for "LLMProxy" origin indicator on tools
+3. Verify tool invocation works in chat
+
+---
+
+## Cleanup Checklist
+
+After completing all tests, clean up test data via the UI:
+
+1. [ ] Delete "Smoke Test Profile - Empty" from Profiles page
+2. [ ] Delete any other test profiles created
+
+---
+
+## Claude Code Execution Notes
+
+When executing this runbook with Claude Code:
+
+### Browser Automation
+
+Use Playwright MCP tools:
+- `mcp__playwright__browser_navigate` - Navigate to URLs
+- `mcp__playwright__browser_snapshot` - Get page accessibility tree
+- `mcp__playwright__browser_click` - Click elements
+- `mcp__playwright__browser_type` - Type into inputs
+- `mcp__playwright__browser_fill_form` - Fill form fields
+
+### Test Isolation
+
+- Start each major test in a NEW chat conversation
+- Create fresh profiles rather than reusing
+- Document all created resources for cleanup
+
+### Failure Handling
+
+If a test fails:
+1. Capture a screenshot: `mcp__playwright__browser_take_screenshot`
+2. Check console messages: `mcp__playwright__browser_console_messages`
+3. Check network requests: `mcp__playwright__browser_network_requests`
+4. Document the failure condition before proceeding
+
+### Reporting
+
+After each test, report:
+- Test name and objective
+- Steps executed
+- Actual result vs expected result
+- PASS/FAIL status
+- Any relevant log entries or screenshots

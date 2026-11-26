@@ -1,0 +1,290 @@
+"use client";
+
+import { FieldDescription } from "@/components/ui/field-description";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { SecretInput, SecretTextarea } from "@/components/ui/secret-input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useAppName } from "@/lib/hooks/use-app-name";
+
+export type EnterpriseManagedConfigInput = {
+  resourceIdentifier?: string;
+  requestedIssuer?: string;
+  requestedCredentialType?:
+    | "bearer_token"
+    | "id_jag"
+    | "secret"
+    | "service_account"
+    | "opaque_json";
+  tokenInjectionMode?:
+    | "authorization_bearer"
+    | "raw_authorization"
+    | "header"
+    | "env"
+    | "body_field";
+  headerName?: string;
+  responseFieldPath?: string;
+  clientIdOverride?: string;
+  clientSecretOverride?: string;
+  privateKeyPemOverride?: string;
+  privateKeyIdOverride?: string;
+};
+
+interface EnterpriseManagedCredentialFieldsProps {
+  value: EnterpriseManagedConfigInput | null | undefined;
+  onChange: (value: EnterpriseManagedConfigInput) => void;
+}
+
+const DEFAULT_CONFIG: EnterpriseManagedConfigInput = {
+  requestedCredentialType: "secret",
+  tokenInjectionMode: "authorization_bearer",
+};
+
+export function EnterpriseManagedCredentialFields({
+  value,
+  onChange,
+}: EnterpriseManagedCredentialFieldsProps) {
+  const appName = useAppName();
+  const config = value ?? DEFAULT_CONFIG;
+
+  return (
+    <div className="space-y-3 rounded-md border border-dashed p-3">
+      <div className="grid gap-3 md:grid-cols-2">
+        <div className="space-y-1.5">
+          <Label className="text-xs">Requested Credential</Label>
+          <Select
+            value={config.requestedCredentialType ?? "secret"}
+            onValueChange={(requestedCredentialType) =>
+              onChange({
+                ...config,
+                requestedCredentialType:
+                  requestedCredentialType as EnterpriseManagedConfigInput["requestedCredentialType"],
+              })
+            }
+          >
+            <SelectTrigger size="sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="secret">Secret</SelectItem>
+              <SelectItem value="bearer_token">Bearer token</SelectItem>
+              <SelectItem value="id_jag">ID-JAG</SelectItem>
+              <SelectItem value="service_account">Service account</SelectItem>
+              <SelectItem value="opaque_json">Opaque JSON</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label className="text-xs">Injection Mode</Label>
+          <Select
+            value={config.tokenInjectionMode ?? "authorization_bearer"}
+            onValueChange={(tokenInjectionMode) =>
+              onChange({
+                ...config,
+                tokenInjectionMode:
+                  tokenInjectionMode as EnterpriseManagedConfigInput["tokenInjectionMode"],
+              })
+            }
+          >
+            <SelectTrigger size="sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="authorization_bearer">
+                Authorization: Bearer
+              </SelectItem>
+              <SelectItem value="raw_authorization">
+                Raw Authorization
+              </SelectItem>
+              <SelectItem value="header">Custom header</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="space-y-1.5">
+        <Label className="text-xs">Managed Resource Identifier</Label>
+        <Input
+          aria-label="Managed resource identifier"
+          value={config.resourceIdentifier ?? ""}
+          onChange={(event) =>
+            onChange({
+              ...config,
+              resourceIdentifier: event.target.value || undefined,
+            })
+          }
+          placeholder="Audience, resource ID, or other provider-specific identifier"
+        />
+      </div>
+
+      <div className="space-y-1.5">
+        <Label className="text-xs">External Provider Alias</Label>
+        <FieldDescription>
+          Optional. Use this when the identity provider brokers a token from an
+          external provider, for example a Keycloak identity provider alias such
+          as <code>github</code>.
+        </FieldDescription>
+        <Input
+          aria-label="External provider alias"
+          value={config.requestedIssuer ?? ""}
+          onChange={(event) =>
+            onChange({
+              ...config,
+              requestedIssuer: event.target.value || undefined,
+            })
+          }
+          placeholder="github"
+        />
+      </div>
+
+      <div className="space-y-1.5">
+        <Label className="text-xs">Response Field Path</Label>
+        <FieldDescription>
+          Required when the provider returns a structured secret and {appName}
+          needs to extract one field, for example <code>token</code>.
+        </FieldDescription>
+        <Input
+          aria-label="Response field path"
+          value={config.responseFieldPath ?? ""}
+          onChange={(event) =>
+            onChange({
+              ...config,
+              responseFieldPath: event.target.value || undefined,
+            })
+          }
+          placeholder="token"
+        />
+      </div>
+
+      <OverrideClientFields config={config} onChange={onChange} />
+
+      {config.tokenInjectionMode === "header" && (
+        <div className="space-y-1.5">
+          <Label className="text-xs">Header Name</Label>
+          <Input
+            aria-label="Header name"
+            value={config.headerName ?? ""}
+            onChange={(event) =>
+              onChange({
+                ...config,
+                headerName: event.target.value || undefined,
+              })
+            }
+            placeholder="X-Provider-Token"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The client this server's token exchange runs as. Credentials are write-only:
+ * the API never returns them, so a blank box keeps the stored value.
+ */
+function OverrideClientFields({
+  config,
+  onChange,
+}: {
+  config: EnterpriseManagedConfigInput;
+  onChange: (value: EnterpriseManagedConfigInput) => void;
+}) {
+  const appName = useAppName();
+  const hasOverride = Boolean(config.clientIdOverride);
+  const storedPlaceholder = "Leave blank to keep a stored value";
+
+  return (
+    <div className="space-y-3 border-t pt-3">
+      <div className="space-y-1">
+        <Label className="text-xs">Exchange Client (Optional)</Label>
+        <FieldDescription>
+          Run this server&apos;s token exchange as its own app registration,
+          instead of the identity provider&apos;s client, so the server gets its
+          own consent and appears by name in downstream tokens and logs. Agents
+          bound to an Entra agent identity use that identity instead.
+        </FieldDescription>
+      </div>
+
+      <div className="space-y-1.5">
+        <Label className="text-xs">Client ID</Label>
+        <Input
+          aria-label="Exchange client ID"
+          value={config.clientIdOverride ?? ""}
+          onChange={(event) =>
+            onChange({
+              ...config,
+              clientIdOverride: event.target.value.trim() || undefined,
+            })
+          }
+          placeholder="Application (client) ID"
+        />
+      </div>
+
+      {hasOverride && (
+        <>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Client Secret</Label>
+            <SecretInput
+              aria-label="Exchange client secret"
+              value={config.clientSecretOverride ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...config,
+                  clientSecretOverride: event.target.value || undefined,
+                })
+              }
+              placeholder={storedPlaceholder}
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Certificate Thumbprint or Key ID</Label>
+            <FieldDescription>
+              For a certificate credential. For Entra, the SHA-1 thumbprint
+              shown under the app&apos;s certificates.
+            </FieldDescription>
+            <Input
+              aria-label="Exchange client key ID"
+              className="font-mono"
+              value={config.privateKeyIdOverride ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...config,
+                  privateKeyIdOverride: event.target.value.trim() || undefined,
+                })
+              }
+              placeholder="40 hexadecimal characters"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Certificate Private Key</Label>
+            <FieldDescription>
+              PKCS#8 PEM. When set, {appName} signs a client assertion with it
+              instead of sending the client secret.
+            </FieldDescription>
+            <SecretTextarea
+              aria-label="Exchange client private key"
+              className="min-h-24 font-mono text-xs"
+              value={config.privateKeyPemOverride ?? ""}
+              onChange={(event) =>
+                onChange({
+                  ...config,
+                  privateKeyPemOverride: event.target.value || undefined,
+                })
+              }
+              placeholder={storedPlaceholder}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

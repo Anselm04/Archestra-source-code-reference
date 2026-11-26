@@ -1,0 +1,1141 @@
+import type {
+  AgentScope,
+  archestraApiTypes,
+  archestraCatalogTypes,
+  ImagePullPolicy,
+  ImagePullSecretConfig,
+} from "@archestra/shared";
+import {
+  argumentsFromText,
+  argumentsToText,
+} from "@/components/container-deployment-fields.utils";
+import {
+  desktopMcpTargetOf,
+  desktopMcpTargetToApi,
+} from "@/lib/mcp/desktop-mcp";
+import { parseDockerArgsToLocalConfig } from "./docker-args-parser";
+import type { McpCatalogFormValues } from "./mcp-catalog-form.types";
+
+type McpCatalogApiData =
+  archestraApiTypes.CreateInternalMcpCatalogItemData["body"];
+
+/**
+ * The starting point for an OAuth section the user has not filled in yet.
+ * Credentials, endpoints and the Scopes field start blank, so
+ * `transformFormToApiData` sends exactly what is on screen rather than
+ * inventing values; the remaining fields carry the defaults a new entry wants
+ * anyway. Shared by the new-entry form and by external-catalog import, which
+ * must not drift apart.
+ */
+export function emptyOauthFormConfig(): NonNullable<
+  McpCatalogFormValues["oauthConfig"]
+> {
+  return {
+    client_id: "",
+    client_secret: "",
+    audience: "",
+    resource: "",
+    redirect_uris:
+      typeof window !== "undefined"
+        ? `${window.location.origin}/oauth-callback`
+        : "",
+    scopes: "",
+    // offline_access is a behavioral scope, not an API one: it is appended to
+    // a configured or discovered scope set so the provider returns a refresh
+    // token, and is dropped along with everything else when there is no such
+    // set to append it to.
+    additional_scopes: "offline_access",
+    supports_resource_metadata: true,
+    grantType: "authorization_code",
+    authServerUrl: "",
+    authorizationEndpoint: "",
+    wellKnownUrl: "",
+    resourceMetadataUrl: "",
+    tokenEndpoint: "",
+  };
+}
+
+// Transform function to convert form values to API format
+export function transformFormToApiData(
+  values: McpCatalogFormValues,
+  originalAuthFields?: McpCatalogApiData["authFields"],
+): McpCatalogApiData {
+  const common = {
+    ...(values.initialGrants !== undefined && {
+      initialGrants: values.initialGrants.map(({ subject, actions }) => ({
+        subject,
+        actions,
+      })),
+    }),
+    name: values.name,
+    description: values.description || null,
+    icon: values.icon ?? null,
+    // The setup instructions a catalog entry brought along. A form that never
+    // held them sends nothing, so stored instructions stay as they are.
+    ...(values.instructions !== undefined && {
+      instructions: values.instructions || null,
+    }),
+  };
+
+  // A desktop MCP server runs on each user's own computer, so it has no server
+  // URL, no deployment and no authentication to send, whatever the form still
+  // holds from another hosting choice. It sends what each computer needs: the
+  // command or the URL.
+  if (values.serverType === "desktop_mcp") {
+    return {
+      ...common,
+      serverType: "desktop_mcp",
+      labels: values.labels ?? [],
+      environmentId: values.environmentId ?? null,
+      desktopConfig: desktopMcpTargetToApi({
+        kind: values.desktopConfig?.kind ?? "command",
+        value: values.desktopConfig?.value ?? "",
+      }),
+    };
+  }
+
+  const data: McpCatalogApiData = {
+    ...common,
+    serverType: values.serverType,
+    multitenant:
+      values.serverType === "local" ? Boolean(values.multitenant) : false,
+    ...(values.requiresAuth !== undefined && {
+      requiresAuth: values.requiresAuth,
+    }),
+  };
+
+  // Keep imported declarations in sync with the editable header rows. Otherwise
+  // a renamed or deleted header would be imported again on the next load.
+  if (values.managesAuthFields) {
+    data.authFields = [
+      ...(originalAuthFields ?? []).filter(
+        (field) => field.type.toLowerCase() !== "header",
+      ),
+      ...(values.additionalHeaders ?? [])
+        .filter((header) => header.sourceAuthFieldName)
+        .map((header) => ({
+          name: header.headerName,
+          label: header.description || header.headerName,
+          type: "header",
+          required: header.required,
+        })),
+    ];
+  }
+
+  if (values.serverUrl) {
+    data.serverUrl = values.serverUrl;
+  }
+
+  // Note: deploymentSpecYaml is handled separately via the "Edit K8S Deployment Yaml" dialog
+  // The main form does not touch the YAML - it's only stored when explicitly edited
+
+  // Handle local configuration
+  if (values.serverType === "local" && values.localConfig) {
+    // Parse arguments string into array
+    const argumentsArray = argumentsFromText(values.localConfig.arguments);
+
+    data.localConfig = {
+      command: values.localConfig.command || undefined,
+      arguments: argumentsArray.length > 0 ? argumentsArray : undefined,
+      environment: values.localConfig.environment,
+      envFrom:
+        values.localConfig.envFrom?.filter((e) => e.name.trim().length > 0) ||
+        undefined,
+      dockerImage: values.localConfig.dockerImage || undefined,
+      transportType: values.localConfig.transportType || undefined,
+      httpPort: values.localConfig.httpPort
+        ? Number(values.localConfig.httpPort)
+        : undefined,
+      httpPath: values.localConfig.httpPath || undefined,
+      serviceAccount: values.localConfig.serviceAccount || undefined,
+      imagePullPolicy: values.localConfig.imagePullPolicy || undefined,
+      runtimeTier: values.localConfig.runtimeTier,
+      imagePullSecrets:
+        values.localConfig.imagePullSecrets?.filter((s) => {
+          if (s.source === "existing") return s.name.trim().length > 0;
+          if (s.source === "credentials") return s.server.trim().length > 0;
+          return false;
+        }) || undefined,
+    };
+  }
+
+  // Handle OAuth configuration
+  if (
+    (values.authMethod === "oauth" ||
+      values.authMethod === "oauth_client_credentials") &&
+    values.oauthConfig
+  ) {
+    const isClientCredentials =
+      values.authMethod === "oauth_client_credentials";
+    const redirectUrisList = isClientCredentials
+      ? []
+      : (values.oauthConfig.redirect_uris ?? "")
+          .split(",")
+          .map((uri) => uri.trim())
+          .filter((uri) => uri.length > 0);
+    const scopesList = (values.oauthConfig.scopes ?? "")
+      .split(",")
+      .map((scope) => scope.trim())
+      .filter((scope) => scope.length > 0);
+    const additionalScopesList = (values.oauthConfig.additional_scopes ?? "")
+      .split(",")
+      .map((scope) => scope.trim())
+      .filter((scope) => scope.length > 0);
+
+    // For local servers, use oauthServerUrl; for remote servers, use serverUrl
+    const oauthServerUrl =
+      values.serverType === "local"
+        ? values.oauthConfig.oauthServerUrl || ""
+        : values.serverUrl || "";
+
+    data.oauthConfig = {
+      name: values.name, // Use name as OAuth provider name
+      server_url: oauthServerUrl, // OAuth server URL for discovery/authorization
+      grant_type: isClientCredentials
+        ? "client_credentials"
+        : "authorization_code",
+      auth_server_url: values.oauthConfig.authServerUrl || undefined,
+      authorization_endpoint: isClientCredentials
+        ? undefined
+        : values.oauthConfig.authorizationEndpoint || undefined,
+      well_known_url: values.oauthConfig.wellKnownUrl || undefined,
+      resource_metadata_url:
+        values.oauthConfig.resourceMetadataUrl || undefined,
+      token_endpoint: values.oauthConfig.tokenEndpoint || undefined,
+      client_id: isClientCredentials ? "" : values.oauthConfig.client_id || "",
+      requires_client_credentials: isClientCredentials
+        ? undefined
+        : values.oauthConfig.requires_client_credentials,
+      client_secret: isClientCredentials
+        ? undefined
+        : values.oauthConfig.client_secret || undefined,
+      audience: values.oauthConfig.audience || undefined,
+      resource: isClientCredentials
+        ? undefined
+        : values.oauthConfig.resource || undefined,
+      redirect_uris: redirectUrisList,
+      scopes: scopesList,
+      // default_scopes is the fallback used by the backend's scope resolution:
+      //   1. If `scopes` is non-empty, discovery is skipped and `scopes` is sent verbatim.
+      //   2. If `scopes` is empty, backend tries .well-known discovery
+      //      (oauth-protected-resource, then oauth-authorization-server).
+      //   3. If discovery yields nothing, backend falls back to `default_scopes`.
+      // The Scopes field is the sole source of both, so a blank field stays
+      // blank the whole way down and the authorization request omits `scope`
+      // altogether — `scope` is optional, and a server that advertises nothing
+      // applies its own default set. Never synthesize scope values here: a
+      // server that wants literal values such as "read, write" (some proxy MCP
+      // servers translate those into real provider scopes) gets them by having
+      // them typed into the field, where they are visible and editable.
+      default_scopes: scopesList,
+      supports_resource_metadata: values.oauthConfig.supports_resource_metadata,
+      additional_scopes: isClientCredentials ? undefined : additionalScopesList,
+    };
+
+    data.userConfig = isClientCredentials
+      ? {
+          ...buildStaticHeaderUserConfig(values),
+          client_id: {
+            type: "string",
+            title: "Client ID",
+            description:
+              "OAuth client ID used to fetch a client-credentials token for this remote MCP server.",
+            promptOnInstallation: true,
+            required: true,
+            default: values.oauthConfig.client_id || undefined,
+            sensitive: false,
+          },
+          client_secret: {
+            type: "string",
+            title: "Client Secret",
+            description:
+              "OAuth client secret used to fetch a client-credentials token for this remote MCP server.",
+            promptOnInstallation: true,
+            required: true,
+            sensitive: true,
+          },
+          audience: {
+            type: "string",
+            title: "Audience",
+            description:
+              "Audience included when requesting the client-credentials token.",
+            promptOnInstallation: true,
+            required: false,
+            default: values.oauthConfig.audience || undefined,
+            sensitive: false,
+          },
+        }
+      : buildStaticHeaderUserConfig(values);
+    data.enterpriseManagedConfig = null;
+  } else if (values.authMethod === "enterprise_managed") {
+    data.userConfig = buildStaticHeaderUserConfig(values);
+    data.oauthConfig = null;
+    data.enterpriseManagedConfig = values.enterpriseManagedConfig
+      ? {
+          ...values.enterpriseManagedConfig,
+          assertionMode: "exchange",
+        }
+      : null;
+  } else if (values.authMethod === "idp_jwt") {
+    data.userConfig = buildStaticHeaderUserConfig(values);
+    data.oauthConfig = null;
+    data.enterpriseManagedConfig = values.enterpriseManagedConfig
+      ? {
+          identityProviderId: values.enterpriseManagedConfig.identityProviderId,
+          assertionMode: "passthrough",
+          requestedCredentialType: "bearer_token",
+          tokenInjectionMode:
+            values.enterpriseManagedConfig.tokenInjectionMode ??
+            "authorization_bearer",
+          headerName: values.enterpriseManagedConfig.headerName,
+        }
+      : null;
+  } else if (values.authMethod === "aws_iam" && values.awsIamConfig) {
+    data.userConfig = buildStaticHeaderUserConfig(values);
+    data.oauthConfig = null;
+    data.enterpriseManagedConfig = null;
+  } else if (values.authMethod === "bearer") {
+    data.userConfig = buildStaticHeaderUserConfig(values, {
+      authFieldName: values.includeBearerPrefix
+        ? "access_token"
+        : "raw_access_token",
+      authDescription: values.includeBearerPrefix
+        ? "Bearer token for authentication"
+        : "Token for authentication (sent without Bearer prefix)",
+    });
+    data.oauthConfig = null;
+    data.enterpriseManagedConfig = null;
+  } else {
+    data.userConfig = buildStaticHeaderUserConfig(values);
+    data.oauthConfig = null;
+    data.enterpriseManagedConfig = null;
+  }
+  data.awsIamConfig =
+    values.serverType === "remote" &&
+    values.authMethod === "aws_iam" &&
+    values.awsIamConfig
+      ? {
+          roleArn: values.awsIamConfig.roleArn.trim(),
+          region: values.awsIamConfig.region.trim(),
+          service: values.awsIamConfig.service.trim(),
+          ...(values.awsIamConfig.audience?.trim() && {
+            audience: values.awsIamConfig.audience.trim(),
+          }),
+        }
+      : null;
+
+  // Handle labels
+  if (values.labels && values.labels.length > 0) {
+    data.labels = values.labels;
+  } else {
+    data.labels = [];
+  }
+
+  // Deployment environment assignment (null = the default environment)
+  data.environmentId = values.environmentId ?? null;
+
+  return data;
+}
+
+// Build create-form values from an existing catalog item for cloning. A clone
+// is a full copy of the source's configuration (secrets included); only the
+// name is suffixed with "-copy" so the create form is valid out of the box and
+// catalog name-uniqueness validation handles collisions on submit.
+export function buildCloneFormValues(
+  item: archestraApiTypes.GetInternalMcpCatalogResponses["200"][number],
+): McpCatalogFormValues {
+  const values = transformCatalogItemToFormValues(item);
+  return { ...values, name: `${values.name}-copy` };
+}
+
+// Transform catalog item to form values
+export function transformCatalogItemToFormValues(
+  item: archestraApiTypes.GetInternalMcpCatalogResponses["200"][number],
+): McpCatalogFormValues {
+  const staticHeaderFields = getHeaderMappedUserConfigEntries(item.userConfig);
+  // Entries written through the API, the built-in MCP tool or Terraform can
+  // declare their credentials as `requiresAuth` plus header `authFields`
+  // instead of header-mapped userConfig. Until a save writes them into
+  // userConfig, the form shows them as the install-time headers they describe.
+  const configuredHeaderNames = new Set(
+    Object.values(staticHeaderFields).map((field) =>
+      field.headerName.trim().toLowerCase(),
+    ),
+  );
+  const importedAuthHeaders = getAuthFieldHeaders(item);
+  const managedAuthFieldNames = importedAuthHeaders.map((field) =>
+    field.headerName.toLowerCase(),
+  );
+  const authFieldHeaders = importedAuthHeaders.filter(
+    (field) => !configuredHeaderNames.has(field.headerName.toLowerCase()),
+  );
+
+  // Determine auth method
+  let authMethod: McpCatalogFormValues["authMethod"] = "none";
+  let includeBearerPrefix = true;
+  if (item.serverType === "desktop_mcp") {
+    // A desktop MCP server has no authentication, whatever its name suggests.
+    authMethod = "none";
+  } else if (item.awsIamConfig) {
+    authMethod = "aws_iam";
+  } else if (item.enterpriseManagedConfig) {
+    authMethod =
+      item.enterpriseManagedConfig.assertionMode === "passthrough"
+        ? "idp_jwt"
+        : "enterprise_managed";
+  } else if (item.oauthConfig) {
+    authMethod =
+      item.oauthConfig.grant_type === "client_credentials"
+        ? "oauth_client_credentials"
+        : "oauth";
+  } else if (item.userConfig?.raw_access_token) {
+    authMethod = "bearer";
+    includeBearerPrefix = false;
+  } else if (item.userConfig?.access_token) {
+    authMethod = "bearer";
+  } else if (
+    item.requiresAuth &&
+    (authFieldHeaders.length > 0 ||
+      Object.values(staticHeaderFields).some(
+        (config) => config.promptOnInstallation !== false,
+      ))
+  ) {
+    authMethod = "auth_header";
+  } else if (
+    // Special case: GitHub server uses Bearer Token but external catalog doesn't define userConfig
+    item.requiresAuth !== false &&
+    (item.name.includes("githubcopilot") || item.name.includes("github"))
+  ) {
+    authMethod = "bearer";
+  } else if (
+    Object.entries(item.userConfig ?? {}).some(
+      ([fieldName, config]) =>
+        fieldName !== "access_token" &&
+        fieldName !== "raw_access_token" &&
+        (config as { valuePrefix?: string } | undefined)?.valuePrefix ===
+          "Bearer ",
+    )
+  ) {
+    authMethod = "auth_header";
+  }
+
+  // Extract OAuth config if present
+  let oauthConfig:
+    | {
+        client_id: string;
+        client_secret: string;
+        requires_client_credentials?: boolean;
+        audience: string;
+        resource: string;
+        redirect_uris: string;
+        scopes: string;
+        additional_scopes: string;
+        supports_resource_metadata: boolean;
+        grantType: "authorization_code" | "client_credentials";
+        authServerUrl?: string;
+        authorizationEndpoint?: string;
+        wellKnownUrl?: string;
+        resourceMetadataUrl?: string;
+        tokenEndpoint?: string;
+        oauthServerUrl?: string;
+      }
+    | undefined;
+  if (item.oauthConfig) {
+    oauthConfig = {
+      client_id: item.oauthConfig.client_id || "",
+      client_secret: item.oauthConfig.client_secret || "",
+      requires_client_credentials: item.oauthConfig.requires_client_credentials,
+      audience:
+        typeof item.userConfig?.audience?.default === "string"
+          ? item.userConfig.audience.default
+          : item.oauthConfig.audience || "",
+      resource: item.oauthConfig.resource || "",
+      redirect_uris: item.oauthConfig.redirect_uris?.join(", ") || "",
+      scopes: item.oauthConfig.scopes?.join(", ") || "",
+      // Undefined means the item predates this field, so show the default
+      // offline_access; an explicit empty array means the user cleared it.
+      additional_scopes:
+        item.oauthConfig.additional_scopes !== undefined
+          ? item.oauthConfig.additional_scopes.join(", ")
+          : "offline_access",
+      supports_resource_metadata:
+        item.oauthConfig.supports_resource_metadata ?? true,
+      grantType: item.oauthConfig.grant_type ?? "authorization_code",
+      authServerUrl: item.oauthConfig.auth_server_url || "",
+      authorizationEndpoint: item.oauthConfig.authorization_endpoint || "",
+      wellKnownUrl: item.oauthConfig.well_known_url || "",
+      resourceMetadataUrl: item.oauthConfig.resource_metadata_url || "",
+      tokenEndpoint: item.oauthConfig.token_endpoint || "",
+      // For local servers, populate oauthServerUrl from server_url
+      oauthServerUrl:
+        item.serverType === "local"
+          ? item.oauthConfig.server_url || ""
+          : undefined,
+    };
+  }
+
+  // Extract local config if present
+  let localConfig:
+    | {
+        command?: string;
+        arguments: string;
+        environment: Array<{
+          key: string;
+          type: "plain_text" | "secret" | "boolean" | "number";
+          value?: string;
+          promptOnInstallation: boolean;
+          required?: boolean;
+          description?: string;
+        }>;
+        envFrom?: Array<{
+          type: "secret" | "configMap";
+          name: string;
+          prefix?: string;
+        }>;
+        dockerImage?: string;
+        transportType?: "stdio" | "streamable-http";
+        httpPort?: string;
+        httpPath?: string;
+        serviceAccount?: string;
+        imagePullSecrets?: ImagePullSecretConfig[];
+        imagePullPolicy?: ImagePullPolicy;
+        runtimeTier?: string;
+      }
+    | undefined;
+  if (item.localConfig) {
+    // Convert arguments array back to string
+    const argumentsString = argumentsToText(item.localConfig.arguments);
+
+    const config = item.localConfig;
+
+    // Map environment variables and populate values from secret if available
+    const environment =
+      item.localConfig.environment?.map((env) => {
+        const envVar = {
+          ...env,
+          // Add promptOnInstallation with default value if missing
+          promptOnInstallation: env.promptOnInstallation ?? false,
+          // Preserve required and description fields
+          required: env.required ?? false,
+          description: env.description ?? "",
+        };
+
+        return envVar;
+      }) || [];
+
+    localConfig = {
+      command: item.localConfig.command || "",
+      arguments: argumentsString,
+      environment,
+      envFrom: item.localConfig.envFrom || [],
+      dockerImage: item.localConfig.dockerImage || "",
+      transportType: config.transportType || undefined,
+      httpPort: config.httpPort?.toString() || undefined,
+      httpPath: config.httpPath || undefined,
+      serviceAccount: config.serviceAccount || undefined,
+      imagePullPolicy: config.imagePullPolicy || undefined,
+      runtimeTier: config.runtimeTier,
+      // Normalize imagePullSecrets: legacy { name } → { source: "existing", name }
+      imagePullSecrets: (item.localConfig.imagePullSecrets || []).map(
+        (s: ImagePullSecretConfig | { name: string }) => {
+          if (!("source" in s)) {
+            return { source: "existing" as const, name: s.name };
+          }
+          return s;
+        },
+      ),
+    };
+  }
+
+  const authHeaderConfig =
+    staticHeaderFields.access_token ?? staticHeaderFields.raw_access_token;
+  const headersFromUserConfig = Object.entries(staticHeaderFields)
+    .filter(([fieldName]) => {
+      return fieldName !== "access_token" && fieldName !== "raw_access_token";
+    })
+    .map(([fieldName, config]) => ({
+      fieldName,
+      headerName: config.headerName,
+      sourceAuthFieldName: managedAuthFieldNames.includes(
+        config.headerName.trim().toLowerCase(),
+      )
+        ? config.headerName.trim().toLowerCase()
+        : undefined,
+      promptOnInstallation: config.promptOnInstallation ?? true,
+      required: config.required ?? false,
+      value: typeof config.default === "string" ? config.default : undefined,
+      description: config.description ?? "",
+      includeBearerPrefix: config.valuePrefix === "Bearer ",
+      sensitive: config.sensitive ?? false,
+    }));
+  const additionalHeaders = [...headersFromUserConfig, ...authFieldHeaders];
+
+  return {
+    name: item.name,
+    description: item.description || "",
+    instructions: item.instructions ?? undefined,
+    icon: item.icon ?? null,
+    serverType: item.serverType as McpCatalogFormValues["serverType"],
+    multitenant: item.serverType === "local" && Boolean(item.multitenant),
+    serverUrl: item.serverUrl || "",
+    requiresAuth: item.requiresAuth,
+    managesAuthFields: managedAuthFieldNames.length > 0,
+    authMethod,
+    includeBearerPrefix,
+    authHeaderName:
+      authHeaderConfig?.headerName &&
+      !isDefaultAuthorizationHeader(authHeaderConfig.headerName)
+        ? authHeaderConfig.headerName
+        : "",
+    additionalHeaders,
+    enterpriseManagedConfig: item.enterpriseManagedConfig ?? null,
+    awsIamConfig: item.awsIamConfig ?? null,
+    oauthConfig,
+    localConfig,
+    desktopConfig:
+      item.serverType === "desktop_mcp"
+        ? desktopMcpTargetOf(item.desktopConfig ?? {})
+        : undefined,
+    // Top-level deploymentSpecYaml from API (generated by backend if not saved)
+    deploymentSpecYaml: item.deploymentSpecYaml || undefined,
+    // Store original to detect user modifications
+    originalDeploymentSpecYaml: item.deploymentSpecYaml || undefined,
+
+    // Labels
+    labels: item.labels ?? [],
+    // Scope
+    scope: (item.scope as AgentScope) ?? "org",
+    // Teams, each with the access level it holds on this item
+    teams: item.teams?.map((t) => ({ id: t.id, level: t.level })) ?? [],
+    // Deployment environment (null = the default environment)
+    environmentId: item.environmentId ?? null,
+  } as McpCatalogFormValues;
+}
+
+// Transform an external catalog server manifest into form values for pre-filling
+export function transformExternalCatalogToFormValues(
+  server: archestraCatalogTypes.ArchestraMcpServerManifest,
+): McpCatalogFormValues {
+  const getValue = (
+    config: NonNullable<
+      archestraCatalogTypes.ArchestraMcpServerManifest["user_config"]
+    >[string],
+  ) => {
+    if (config.type === "boolean") {
+      return typeof config.default === "boolean"
+        ? String(config.default)
+        : "false";
+    }
+    if (config.type === "number" && typeof config.default === "number") {
+      return String(config.default);
+    }
+    return undefined;
+  };
+
+  const getEnvVarType = (
+    userConfigEntry: NonNullable<
+      archestraCatalogTypes.ArchestraMcpServerManifest["user_config"]
+    >[string],
+  ) => {
+    if (userConfigEntry.sensitive) return "secret" as const;
+    if (userConfigEntry.type === "boolean") return "boolean" as const;
+    if (userConfigEntry.type === "number") return "number" as const;
+    return "plain_text" as const;
+  };
+
+  // Determine auth method
+  let authMethod: McpCatalogFormValues["authMethod"] = "none";
+  let includeBearerPrefix = true;
+  const staticHeaderFields = getHeaderMappedUserConfigEntries(
+    server.user_config,
+  );
+  const authHeaderConfig =
+    staticHeaderFields.access_token ?? staticHeaderFields.raw_access_token;
+  const implicitAccessTokenConfig = server.user_config?.access_token;
+  const implicitRawAccessTokenConfig = server.user_config?.raw_access_token;
+
+  // Detect bearer/raw_token auth from header-mapped user_config entries.
+  if (authHeaderConfig?.fieldName === "raw_access_token") {
+    authMethod = "bearer";
+    includeBearerPrefix = false;
+  } else if (authHeaderConfig?.fieldName === "access_token") {
+    authMethod = "bearer";
+  } else if (implicitRawAccessTokenConfig) {
+    authMethod = "bearer";
+    includeBearerPrefix = false;
+  } else if (implicitAccessTokenConfig) {
+    authMethod = "bearer";
+  }
+
+  // Rewrite redirect URIs to prefer platform callback
+  let oauthConfig: McpCatalogFormValues["oauthConfig"] | undefined;
+  if (server.oauth_config && !server.oauth_config.requires_proxy) {
+    const oauthGrantType = getOAuthGrantType(server.oauth_config);
+    authMethod =
+      oauthGrantType === "client_credentials"
+        ? "oauth_client_credentials"
+        : "oauth";
+    const redirectUris =
+      server.oauth_config.redirect_uris
+        ?.map((u) =>
+          u === "http://localhost:8080/oauth/callback"
+            ? `${window.location.origin}/oauth-callback`
+            : u,
+        )
+        .join(", ") || "";
+    oauthConfig = {
+      client_id: server.oauth_config.client_id || "",
+      client_secret: server.oauth_config.client_secret || "",
+      // The hosted catalog and its generated client can deploy independently.
+      requires_client_credentials:
+        "requires_client_credentials" in server.oauth_config &&
+        typeof server.oauth_config.requires_client_credentials === "boolean"
+          ? server.oauth_config.requires_client_credentials
+          : undefined,
+      audience: "",
+      resource:
+        getOptionalStringProperty(server.oauth_config, "resource") || "",
+      redirect_uris:
+        redirectUris ||
+        (typeof window !== "undefined"
+          ? `${window.location.origin}/oauth-callback`
+          : ""),
+      scopes: server.oauth_config.scopes?.join(", ") ?? "",
+      // The external catalog manifest does not carry additional_scopes, so
+      // start from the default that requests a refresh token.
+      additional_scopes: "offline_access",
+      supports_resource_metadata:
+        server.oauth_config.supports_resource_metadata ?? true,
+      grantType:
+        oauthGrantType === "client_credentials"
+          ? "client_credentials"
+          : "authorization_code",
+      authServerUrl: server.oauth_config.auth_server_url || "",
+      authorizationEndpoint:
+        getOptionalStringProperty(
+          server.oauth_config,
+          "authorization_endpoint",
+        ) || "",
+      wellKnownUrl: server.oauth_config.well_known_url || "",
+      resourceMetadataUrl: server.oauth_config.resource_metadata_url || "",
+      tokenEndpoint: server.oauth_config.token_endpoint || "",
+      oauthServerUrl:
+        server.server.type === "local"
+          ? server.oauth_config.server_url || ""
+          : undefined,
+    };
+  }
+
+  // Build local config for local servers
+  let localConfig: McpCatalogFormValues["localConfig"];
+  if (server.server.type === "local") {
+    // Track which user_config keys are referenced in server.env
+    const referencedUserConfigKeys = new Set<string>();
+
+    // Parse server.env entries
+    const envFromServerEnv = server.server.env
+      ? Object.entries(server.server.env).map(([envKey, envValue]) => {
+          const match = envValue.match(/^\$\{user_config\.(.+)\}$/);
+          if (match && server.user_config) {
+            const userConfigKey = match[1];
+            const userConfigEntry = server.user_config[userConfigKey];
+            referencedUserConfigKeys.add(userConfigKey);
+            if (userConfigEntry) {
+              return {
+                key: envKey,
+                type: getEnvVarType(userConfigEntry),
+                value: "" as string | undefined,
+                promptOnInstallation: true,
+                required: userConfigEntry.required ?? false,
+                description: [
+                  userConfigEntry.title,
+                  userConfigEntry.description,
+                ]
+                  .filter(Boolean)
+                  .join(": "),
+                default: Array.isArray(userConfigEntry.default)
+                  ? undefined
+                  : userConfigEntry.default,
+                mounted: (
+                  userConfigEntry as typeof userConfigEntry & {
+                    mounted?: boolean;
+                  }
+                ).mounted,
+              };
+            }
+          }
+          return {
+            key: envKey,
+            type: "plain_text" as const,
+            value: envValue as string | undefined,
+            promptOnInstallation: false,
+            required: false,
+            description: "",
+            default: undefined,
+          };
+        })
+      : [];
+
+    // Add user_config entries NOT referenced in server.env
+    const envFromUnreferencedUserConfig = server.user_config
+      ? Object.entries(server.user_config)
+          .filter(([key]) => !referencedUserConfigKeys.has(key))
+          .map(([key, config]) => ({
+            key,
+            type: getEnvVarType(config),
+            value: getValue(config),
+            promptOnInstallation: true,
+            required: config.required ?? false,
+            description: [config.title, config.description]
+              .filter(Boolean)
+              .join(": "),
+            default: Array.isArray(config.default) ? undefined : config.default,
+            mounted: (config as typeof config & { mounted?: boolean }).mounted,
+          }))
+      : [];
+
+    const environment = [...envFromServerEnv, ...envFromUnreferencedUserConfig];
+
+    // Parse docker args
+    const dockerConfig = parseDockerArgsToLocalConfig(
+      server.server.command,
+      server.server.args,
+      server.server.docker_image,
+    );
+
+    const serviceAccount = (
+      server.server as typeof server.server & { service_account?: string }
+    ).service_account;
+    const normalizedServiceAccount = serviceAccount
+      ? serviceAccount.replace(
+          /\{\{ARCHESTRA_RELEASE_NAME\}\}/g,
+          "{{HELM_RELEASE_NAME}}",
+        )
+      : "";
+
+    if (dockerConfig) {
+      localConfig = {
+        command: dockerConfig.command || "",
+        arguments: dockerConfig.arguments?.join("\n") || "",
+        dockerImage: dockerConfig.dockerImage || "",
+        transportType: dockerConfig.transportType || "stdio",
+        httpPort: dockerConfig.httpPort?.toString() || "",
+        httpPath: "/mcp",
+        serviceAccount: normalizedServiceAccount,
+        imagePullSecrets: [],
+        envFrom: [],
+        environment,
+      };
+    } else {
+      localConfig = {
+        command: server.server.command || "",
+        arguments: server.server.args?.join("\n") || "",
+        dockerImage: server.server.docker_image || "",
+        transportType: "stdio",
+        httpPort: "",
+        httpPath: "/mcp",
+        serviceAccount: normalizedServiceAccount,
+        imagePullSecrets: [],
+        envFrom: [],
+        environment,
+      };
+    }
+  }
+
+  return {
+    name: server.display_name || server.name,
+    description: server.description || "",
+    instructions: server.instructions ?? undefined,
+    icon: server.icon ?? null,
+    serverType:
+      server.server.type === "desktop"
+        ? "desktop_mcp"
+        : (server.server.type as "remote" | "local"),
+    desktopConfig:
+      server.server.type === "desktop"
+        ? {
+            kind: "command",
+            value: desktopCommandLine(
+              server.server.command,
+              server.server.args,
+            ),
+          }
+        : undefined,
+    multitenant: server.server.type === "local" && authMethod !== "none",
+    serverUrl: server.server.type === "remote" ? server.server.url : "",
+    authMethod,
+    includeBearerPrefix,
+    authHeaderName:
+      authHeaderConfig?.headerName &&
+      !isDefaultAuthorizationHeader(authHeaderConfig.headerName)
+        ? authHeaderConfig.headerName
+        : "",
+    additionalHeaders: Object.entries(staticHeaderFields)
+      .filter(([fieldName]) => {
+        return fieldName !== "access_token" && fieldName !== "raw_access_token";
+      })
+      .map(([fieldName, config]) => ({
+        fieldName,
+        headerName: config.headerName,
+        promptOnInstallation: config.promptOnInstallation ?? true,
+        required: config.required ?? false,
+        value: typeof config.default === "string" ? config.default : undefined,
+        description: config.description ?? "",
+        includeBearerPrefix: config.valuePrefix === "Bearer ",
+        sensitive: config.sensitive ?? false,
+      })),
+    oauthConfig: oauthConfig ?? emptyOauthFormConfig(),
+    localConfig: localConfig ?? {
+      command: "",
+      arguments: "",
+      environment: [],
+      envFrom: [],
+      dockerImage: "",
+      transportType: "stdio",
+      httpPort: "",
+      httpPath: "/mcp",
+      serviceAccount: "",
+      imagePullSecrets: [],
+    },
+    scope: "personal",
+    teams: [],
+  } as McpCatalogFormValues;
+}
+
+function buildStaticHeaderUserConfig(
+  values: McpCatalogFormValues,
+  params?: {
+    authFieldName?: "access_token" | "raw_access_token";
+    authDescription?: string;
+  },
+): NonNullable<McpCatalogApiData["userConfig"]> {
+  const userConfig: NonNullable<McpCatalogApiData["userConfig"]> = {};
+
+  if (params?.authFieldName) {
+    userConfig[params.authFieldName] = {
+      type: "string",
+      title: "Access Token",
+      description: params.authDescription ?? "Token for authentication",
+      required: true,
+      sensitive: true,
+      headerName: values.authHeaderName?.trim() || undefined,
+    };
+  }
+
+  const usedFieldNames = new Set(Object.keys(userConfig));
+  for (const [index, header] of (values.additionalHeaders ?? []).entries()) {
+    const fieldName = getAdditionalHeaderFieldName({
+      fieldName: header.fieldName,
+      headerName: header.headerName,
+      index,
+      usedFieldNames,
+    });
+
+    usedFieldNames.add(fieldName);
+    // Static header fields cannot be sensitive (server validator rejects
+    // the combination, because `default` lives in plaintext jsonb on the
+    // catalog row). Fall back to non-sensitive for static regardless of
+    // what the form carries.
+    const isStaticHeader = !header.promptOnInstallation;
+    userConfig[fieldName] = {
+      type: "string",
+      title: header.headerName,
+      promptOnInstallation: header.promptOnInstallation,
+      required: header.promptOnInstallation ? header.required : false,
+      default:
+        !header.promptOnInstallation && header.value ? header.value : undefined,
+      description:
+        header.description ||
+        (header.includeBearerPrefix
+          ? `Sent as ${header.headerName} with a "Bearer " prefix`
+          : `Sent as ${header.headerName}`),
+      sensitive: isStaticHeader ? false : (header.sensitive ?? false),
+      headerName: header.headerName,
+      valuePrefix: header.includeBearerPrefix ? "Bearer " : undefined,
+    };
+  }
+
+  return userConfig;
+}
+
+function getAdditionalHeaderFieldName(params: {
+  fieldName?: string;
+  headerName: string;
+  index: number;
+  usedFieldNames: Set<string>;
+}): string {
+  const { fieldName, headerName, index, usedFieldNames } = params;
+  if (fieldName?.trim()) {
+    return fieldName;
+  }
+
+  const normalizedHeaderName = headerName
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const baseFieldName = `header_${normalizedHeaderName || "value"}`;
+
+  if (!usedFieldNames.has(baseFieldName)) {
+    return baseFieldName;
+  }
+
+  return `${baseFieldName}_${index + 1}`;
+}
+
+function getHeaderMappedUserConfigEntries(
+  userConfig:
+    | archestraApiTypes.GetInternalMcpCatalogResponses["200"][number]["userConfig"]
+    | archestraCatalogTypes.ArchestraMcpServerManifest["user_config"]
+    | null
+    | undefined,
+): Record<
+  string,
+  {
+    fieldName: string;
+    headerName: string;
+    promptOnInstallation?: boolean;
+    required?: boolean;
+    default?: string | number | boolean | Array<string>;
+    description?: string;
+    valuePrefix?: string;
+    sensitive?: boolean;
+  }
+> {
+  return Object.fromEntries(
+    Object.entries(userConfig ?? {})
+      .filter((entry) => {
+        const config = entry[1] as { headerName?: string } | undefined;
+        return (
+          typeof config?.headerName === "string" && config.headerName.length > 0
+        );
+      })
+      .map(([fieldName, config]) => {
+        const userConfigField = config as {
+          headerName: string;
+          promptOnInstallation?: boolean;
+          required?: boolean;
+          default?: string | number | boolean | Array<string>;
+          description?: string;
+          valuePrefix?: string;
+          sensitive?: boolean;
+        };
+        return [
+          fieldName,
+          {
+            fieldName,
+            headerName: userConfigField.headerName,
+            promptOnInstallation: userConfigField.promptOnInstallation,
+            required: userConfigField.required,
+            default: userConfigField.default,
+            description: userConfigField.description,
+            valuePrefix: userConfigField.valuePrefix,
+            sensitive: userConfigField.sensitive,
+          },
+        ];
+      }),
+  );
+}
+
+function getAuthFieldHeaders(
+  item: archestraApiTypes.GetInternalMcpCatalogResponses["200"][number],
+): NonNullable<McpCatalogFormValues["additionalHeaders"]> {
+  const sendsHeaders =
+    item.serverType === "remote" ||
+    (item.serverType === "local" &&
+      item.localConfig?.transportType === "streamable-http");
+  if (!item.requiresAuth || !sendsHeaders) {
+    return [];
+  }
+  return (item.authFields ?? [])
+    .filter(
+      (field) =>
+        field.type.toLowerCase() === "header" && field.name.trim().length > 0,
+    )
+    .map((field) => ({
+      fieldName: undefined,
+      headerName: field.name.trim(),
+      sourceAuthFieldName: field.name.trim().toLowerCase(),
+      promptOnInstallation: true,
+      required: field.required,
+      value: undefined,
+      description: field.description || field.label,
+      includeBearerPrefix: false,
+      sensitive: true,
+    }));
+}
+
+function isDefaultAuthorizationHeader(headerName: string): boolean {
+  return headerName.toLowerCase() === "authorization";
+}
+
+function getOptionalStringProperty(
+  value: unknown,
+  key: string,
+): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const propertyValue = (value as Record<string, unknown>)[key];
+  return typeof propertyValue === "string" ? propertyValue : undefined;
+}
+
+function getOAuthGrantType(
+  oauthConfig: unknown,
+): "authorization_code" | "client_credentials" {
+  return getOptionalStringProperty(oauthConfig, "grant_type") ===
+    "client_credentials"
+    ? "client_credentials"
+    : "authorization_code";
+}
+
+/**
+ * Strips surrounding quotes from an environment variable value.
+ * Handles both double quotes (") and single quotes (').
+ * Only strips quotes if they match at both the beginning and end.
+ *
+ * @param value - The raw environment variable value that may contain quotes
+ * @returns The value with surrounding quotes removed if present
+ *
+ * @example
+ * stripEnvVarQuotes('"http://grafana:80"') // returns 'http://grafana:80'
+ * stripEnvVarQuotes("'value'") // returns 'value'
+ * stripEnvVarQuotes('no-quotes') // returns 'no-quotes'
+ * stripEnvVarQuotes('"mismatched\'') // returns '"mismatched\''
+ * stripEnvVarQuotes('') // returns ''
+ */
+export function stripEnvVarQuotes(value: string): string {
+  if (!value || value.length < 2) {
+    return value;
+  }
+
+  const firstChar = value[0];
+  const lastChar = value[value.length - 1];
+
+  // Only strip if first and last chars are matching quotes
+  if (
+    (firstChar === '"' && lastChar === '"') ||
+    (firstChar === "'" && lastChar === "'")
+  ) {
+    return value.slice(1, -1);
+  }
+
+  return value;
+}
+
+/**
+ * One command line from a catalog entry's command and arguments, in the form
+ * the MCP bridge splits again: an argument with a space or a quote goes in
+ * double quotes, with `"` written as `\"`. Backslashes stay as they are,
+ * since the bridge on Windows keeps them as normal characters.
+ */
+function desktopCommandLine(command: string, args: string[] = []): string {
+  return [command, ...args]
+    .map((part) =>
+      part !== "" && /^[^\s"']+$/.test(part)
+        ? part
+        : `"${part.replaceAll('"', '\\"')}"`,
+    )
+    .join(" ");
+}

@@ -1,0 +1,98 @@
+import { archestraApiSdk } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook } from "@testing-library/react";
+import type React from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { handleApiError } from "@/lib/utils/api";
+import { useUpdateChatOpsConfigInQuickstart } from "./chatops-config.query";
+
+vi.mock("@archestra/shared/api-sdk", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@archestra/shared/api-sdk")>()),
+  updateChatOpsConfigInQuickstart: vi.fn(),
+  refreshChatOpsChannelDiscovery: vi.fn().mockResolvedValue({}),
+}));
+
+vi.mock("sonner");
+
+vi.mock("@/lib/utils/api", async () => {
+  const actual = await vi.importActual("@/lib/utils/api");
+  return {
+    ...actual,
+    handleApiError: vi.fn(),
+  };
+});
+
+function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+
+  return ({ children }: { children: React.ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+}
+
+describe("useUpdateChatOpsConfigInQuickstart", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns data on success", async () => {
+    vi.mocked(
+      archestraApiSdk.updateChatOpsConfigInQuickstart,
+    ).mockResolvedValue({
+      data: { success: true },
+    } as Awaited<
+      ReturnType<typeof archestraApiSdk.updateChatOpsConfigInQuickstart>
+    >);
+
+    const { result } = renderHook(() => useUpdateChatOpsConfigInQuickstart(), {
+      wrapper: createWrapper(),
+    });
+
+    const mutationResult = await result.current.mutateAsync({
+      enabled: true,
+      appId: "test-app-id",
+      appSecret: "test-secret",
+      tenantId: "test-tenant",
+    });
+
+    expect(mutationResult).toEqual({ success: true });
+    expect(handleApiError).not.toHaveBeenCalled();
+  });
+
+  it("returns null and handles API errors", async () => {
+    const apiError = {
+      error: {
+        message: "Only available in quickstart mode",
+        type: "api_authorization_error" as const,
+      },
+    };
+
+    vi.mocked(
+      archestraApiSdk.updateChatOpsConfigInQuickstart,
+    ).mockResolvedValue({
+      data: undefined,
+      error: apiError,
+    } as Awaited<
+      ReturnType<typeof archestraApiSdk.updateChatOpsConfigInQuickstart>
+    >);
+
+    const { result } = renderHook(() => useUpdateChatOpsConfigInQuickstart(), {
+      wrapper: createWrapper(),
+    });
+
+    const mutationResult = await result.current.mutateAsync({
+      enabled: true,
+      appId: "test-app-id",
+      appSecret: "test-secret",
+      tenantId: "test-tenant",
+    });
+
+    expect(mutationResult).toBeNull();
+    expect(handleApiError).toHaveBeenCalledWith(apiError);
+  });
+});

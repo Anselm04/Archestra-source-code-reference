@@ -1,0 +1,695 @@
+// @vitest-environment node
+import { describe, expect, it, vi } from "vitest";
+import {
+  getCompactToolState,
+  getCurrentEnabledToolIds,
+  getDefaultEnabledToolIds,
+  getHumanRulingDisplay,
+  getToolErrorText,
+  getToolHeaderState,
+  getToolNameFromPart,
+  hasToolAuthOrNoDevicePrompt,
+  hasToolRequest,
+  isCompactEligible,
+} from "./chat-tools-display.utils";
+
+function tool(id: string) {
+  return { id };
+}
+
+describe("getDefaultEnabledToolIds", () => {
+  it("returns all profile tool IDs", () => {
+    const tools = [tool("1"), tool("2"), tool("3")];
+    expect(getDefaultEnabledToolIds(tools)).toEqual(["1", "2", "3"]);
+  });
+
+  it("includes archestra tools (they are not filtered out)", () => {
+    const tools = [
+      { id: "a1", name: "archestra__web_search" },
+      { id: "a2", name: "archestra__todo_write" },
+      { id: "a3", name: "archestra__some_custom_tool" },
+      { id: "m1", name: "other_server__some_tool" },
+    ];
+    const result = getDefaultEnabledToolIds(tools);
+    expect(result).toEqual(["a1", "a2", "a3", "m1"]);
+  });
+
+  it("returns empty array for no tools", () => {
+    expect(getDefaultEnabledToolIds([])).toEqual([]);
+  });
+});
+
+describe("getCurrentEnabledToolIds", () => {
+  const defaults = ["t1", "t2", "t3"];
+
+  it("uses custom selection when conversation has one", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: "conv-1",
+      hasCustomSelection: true,
+      enabledToolIds: ["t1"],
+      defaultEnabledToolIds: defaults,
+      pendingActions: [],
+    });
+    expect(result).toEqual(["t1"]);
+  });
+
+  it("uses defaults when conversation has no custom selection", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: "conv-1",
+      hasCustomSelection: false,
+      enabledToolIds: [],
+      defaultEnabledToolIds: defaults,
+      pendingActions: [],
+    });
+    expect(result).toEqual(defaults);
+  });
+
+  it("uses defaults when there is no conversation and no pending actions", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: undefined,
+      hasCustomSelection: false,
+      enabledToolIds: [],
+      defaultEnabledToolIds: defaults,
+      pendingActions: [],
+    });
+    expect(result).toEqual(defaults);
+  });
+
+  it("applies pending disable action on top of defaults when no conversation", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: undefined,
+      hasCustomSelection: false,
+      enabledToolIds: [],
+      defaultEnabledToolIds: defaults,
+      pendingActions: [{ type: "disable", toolId: "t2" }],
+    });
+    expect(result).toEqual(["t1", "t3"]);
+  });
+
+  it("applies pending enable action on top of defaults when no conversation", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: undefined,
+      hasCustomSelection: false,
+      enabledToolIds: [],
+      defaultEnabledToolIds: ["t1"],
+      pendingActions: [{ type: "enable", toolId: "t2" }],
+    });
+    expect(result).toEqual(["t1", "t2"]);
+  });
+
+  it("applies disableAll pending action", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: undefined,
+      hasCustomSelection: false,
+      enabledToolIds: [],
+      defaultEnabledToolIds: defaults,
+      pendingActions: [{ type: "disableAll", toolIds: ["t1", "t3"] }],
+    });
+    expect(result).toEqual(["t2"]);
+  });
+
+  it("applies enableAll pending action", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: undefined,
+      hasCustomSelection: false,
+      enabledToolIds: [],
+      defaultEnabledToolIds: ["t1"],
+      pendingActions: [{ type: "enableAll", toolIds: ["t2", "t3"] }],
+    });
+    expect(result).toEqual(["t1", "t2", "t3"]);
+  });
+
+  it("ignores pending actions when conversation exists (even without custom selection)", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: "conv-1",
+      hasCustomSelection: false,
+      enabledToolIds: [],
+      defaultEnabledToolIds: defaults,
+      pendingActions: [{ type: "disable", toolId: "t1" }],
+    });
+    expect(result).toEqual(defaults);
+  });
+
+  it("custom selection takes priority over pending actions", () => {
+    const result = getCurrentEnabledToolIds({
+      conversationId: "conv-1",
+      hasCustomSelection: true,
+      enabledToolIds: ["t2"],
+      defaultEnabledToolIds: defaults,
+      pendingActions: [{ type: "enable", toolId: "t3" }],
+    });
+    expect(result).toEqual(["t2"]);
+  });
+});
+
+describe("tool display helpers", () => {
+  it("extracts tool names from toolName or type", () => {
+    expect(
+      getToolNameFromPart({ toolName: "archestra__query_knowledge_sources" }),
+    ).toBe("archestra__query_knowledge_sources");
+    expect(
+      getToolNameFromPart({ type: "tool-archestra__query_knowledge_sources" }),
+    ).toBe("archestra__query_knowledge_sources");
+  });
+
+  it("falls back to parsing JSON output errors", () => {
+    expect(
+      getToolErrorText({
+        part: {
+          type: "tool-github__create_issue",
+          state: "input-available",
+          output: JSON.stringify({
+            _meta: {
+              archestraError: {
+                type: "generic",
+                message: "output error",
+              },
+            },
+          }),
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe("output error");
+  });
+
+  it("extracts auth errors from structured tool output", () => {
+    expect(
+      getToolErrorText({
+        part: {
+          type: "tool-id-jag_test__get-server-info",
+          state: "output-available",
+          output: {
+            _meta: {
+              archestraError: {
+                type: "auth_expired",
+                message:
+                  'Expired or invalid authentication for "id-jag test".\n\nYour credentials failed authentication.',
+                catalogId: "cat_abc",
+                catalogName: "id-jag test",
+                serverId: "srv_xyz",
+                reauthUrl:
+                  "http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz",
+              },
+            },
+          },
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toContain('Expired or invalid authentication for "id-jag test"');
+  });
+
+  it.each([
+    "preview_guardrails_policy_change",
+    "preview_guardrails_validation_change",
+  ] as const)("shows %s in a circle like other calls", (shortName) => {
+    expect(
+      isCompactEligible({
+        toolName: `archestra__${shortName}`,
+        getToolShortName: (name) =>
+          name === `archestra__${shortName}` ? shortName : null,
+        part: {
+          type: `tool-archestra__${shortName}`,
+          state: "output-available",
+          output: { structuredContent: { stage: "preview" } },
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("folds a saved policy change into a circle like other calls", () => {
+    expect(
+      isCompactEligible({
+        toolName: "archestra__update_guardrails_policy",
+        getToolShortName: (name) =>
+          name === "archestra__update_guardrails_policy"
+            ? "update_guardrails_policy"
+            : null,
+        part: {
+          type: "tool-archestra__update_guardrails_policy",
+          state: "output-available",
+          output: { structuredContent: { delivery: "revision" } },
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("marks generic tool failures as compact-eligible", () => {
+    expect(
+      isCompactEligible({
+        toolName: "github__create_issue",
+        part: {
+          type: "tool-github__create_issue",
+          state: "input-available",
+          errorText: "Request failed",
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps todo_write outside compact circles", () => {
+    expect(
+      isCompactEligible({
+        toolName: "archestra__todo_write",
+        part: {
+          type: "tool-archestra__todo_write",
+          state: "output-available",
+        } as never,
+        toolResultPart: null,
+        getToolShortName: (name) =>
+          name === "archestra__todo_write" ? "todo_write" : null,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps auth-required responses compact-eligible and flags their auth prompt", () => {
+    const part = {
+      type: "tool-jira__create_issue",
+      state: "input-available",
+      errorText:
+        'Authentication required for "jira-atlassian-remote".\n\nNo credentials found for this MCP server. To continue, visit this URL: http://localhost:3000/mcp/registry?install=cat_demo',
+    } as never;
+    expect(
+      isCompactEligible({
+        toolName: "jira__create_issue",
+        part,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+    expect(hasToolAuthOrNoDevicePrompt({ part, toolResultPart: null })).toBe(
+      true,
+    );
+  });
+
+  it("keeps structured auth-expired responses compact-eligible and flags their auth prompt", () => {
+    const part = {
+      type: "tool-id-jag_test__get_server_info",
+      state: "output-available",
+      output: {
+        isError: true,
+        _meta: {
+          archestraError: {
+            type: "auth_expired",
+            message: 'Expired or invalid authentication for "id-jag test".',
+            catalogId: "cat_abc",
+            catalogName: "id-jag test",
+            serverId: "srv_xyz",
+            reauthUrl:
+              "http://localhost:3000/mcp/registry?reauth=cat_abc&server=srv_xyz",
+          },
+        },
+      },
+    } as never;
+    expect(
+      isCompactEligible({
+        toolName: "id-jag_test__get_server_info",
+        part,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+    expect(hasToolAuthOrNoDevicePrompt({ part, toolResultPart: null })).toBe(
+      true,
+    );
+  });
+
+  it("keeps assigned-credential-unavailable responses compact-eligible and flags their auth prompt", () => {
+    const part = {
+      type: "tool-githubcopilot__remote-mcp__issue_write",
+      state: "output-available",
+      output: {
+        isError: true,
+        _meta: {
+          archestraError: {
+            type: "assigned_credential_unavailable",
+            message: "Assigned credential unavailable",
+            catalogId: "cat_abc",
+            catalogName: "githubcopilot__remote-mcp",
+          },
+        },
+      },
+    } as never;
+    expect(
+      isCompactEligible({
+        toolName: "githubcopilot__remote-mcp__issue_write",
+        part,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+    expect(hasToolAuthOrNoDevicePrompt({ part, toolResultPart: null })).toBe(
+      true,
+    );
+  });
+
+  it("keeps approval-requested tools compact-eligible so their approval card opens under a circle", () => {
+    const part = {
+      type: "tool-github__delete_branch",
+      state: "approval-requested",
+    } as never;
+    expect(
+      isCompactEligible({
+        toolName: "github__delete_branch",
+        part,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+    expect(hasToolAuthOrNoDevicePrompt({ part, toolResultPart: null })).toBe(
+      false,
+    );
+  });
+
+  it("computes compact tool state from output state", () => {
+    expect(
+      getCompactToolState({
+        part: {
+          type: "tool-github__create_issue",
+          state: "input-available",
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe("running");
+
+    expect(
+      getCompactToolState({
+        part: {
+          type: "tool-github__create_issue",
+          state: "approval-requested",
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe("approval-requested");
+
+    expect(
+      getCompactToolState({
+        part: {
+          type: "tool-github__create_issue",
+          state: "output-available",
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe("completed");
+
+    // A declined approval is terminal: it must map to "denied" (orange dot), not
+    // fall through to "running" (a blue pulsing dot that never resolves).
+    expect(
+      getCompactToolState({
+        part: {
+          type: "tool-github__create_issue",
+          state: "output-denied",
+        } as never,
+        toolResultPart: null,
+      }),
+    ).toBe("denied");
+  });
+});
+
+describe("a result its tool marked as an error", () => {
+  const failed = (output: unknown) =>
+    ({
+      type: "tool-fixtures__fail_with_error",
+      toolCallId: "call-1",
+      state: "output-available",
+      input: {},
+      output,
+    }) as never;
+
+  it("reads as an error with the tool's own words, not as completed", () => {
+    const part = failed({ content: "Out of quota", isError: true });
+
+    expect(getToolErrorText({ part, toolResultPart: null })).toBe(
+      "Out of quota",
+    );
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe("error");
+  });
+
+  it("still reads as an error when the tool sent no words", () => {
+    const part = failed({ content: "", isError: true });
+
+    expect(getToolErrorText({ part, toolResultPart: null })).toBe(
+      "The tool reported an error and returned no details.",
+    );
+  });
+
+  it("leaves a result without the mark completed, whatever its text says", () => {
+    const part = failed({ content: "Error: nothing to do" });
+
+    expect(getToolErrorText({ part, toolResultPart: null })).toBeUndefined();
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe(
+      "completed",
+    );
+  });
+
+  it("leaves a Guardrails refusal that offers a way to continue as a step, not a failure", () => {
+    const part = failed({
+      content:
+        '[appa] Blocked: this message cannot be read yet.\n  - archestra__execute_remedy_plan(offer_id: "0a0a")',
+      isError: true,
+    });
+
+    expect(getToolErrorText({ part, toolResultPart: null })).toBeUndefined();
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe(
+      "completed",
+    );
+  });
+
+  it("keeps a reviewed call on its ruling", () => {
+    const part = failed({
+      content: "[appa] Denied: the human reviewer refused this call.",
+      isError: true,
+      _meta: { archestraHumanRuling: "deny" },
+    });
+
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe("denied");
+    expect(getHumanRulingDisplay({ part, toolResultPart: null })?.label).toBe(
+      "Denied by you",
+    );
+  });
+});
+
+describe("a call that did not finish", () => {
+  const running = {
+    type: "tool-fixtures__wait_then_reply",
+    toolCallId: "call-1",
+    state: "input-available",
+    input: { seconds: 60 },
+  } as never;
+  const stopped = {
+    type: "tool-fixtures__wait_then_reply",
+    toolCallId: "call-1",
+    state: "output-available",
+    input: { seconds: 60 },
+    output: {
+      content: "The run was stopped before this call finished.",
+      _meta: {
+        archestraError: {
+          type: "cancelled",
+          message: "The run was stopped before this call finished.",
+        },
+      },
+    },
+  } as never;
+
+  it("runs while its turn runs, and is cancelled once the turn has ended", () => {
+    expect(getCompactToolState({ part: running, toolResultPart: null })).toBe(
+      "running",
+    );
+    expect(
+      getCompactToolState({
+        part: running,
+        toolResultPart: null,
+        turnActive: false,
+      }),
+    ).toBe("cancelled");
+    expect(
+      getToolHeaderState({
+        state: "input-available",
+        toolResultPart: null,
+        errorText: undefined,
+        turnActive: false,
+      }),
+    ).toBe("output-cancelled");
+  });
+
+  it("stays cancelled after a reload, from the result the stop left on it", () => {
+    // Not an error: stopping a call is the user's choice, not a failure.
+    expect(
+      getToolErrorText({ part: stopped, toolResultPart: null }),
+    ).toBeUndefined();
+    expect(getCompactToolState({ part: stopped, toolResultPart: null })).toBe(
+      "cancelled",
+    );
+    expect(
+      getToolHeaderState({
+        state: "output-available",
+        toolResultPart: null,
+        errorText: undefined,
+        output: (stopped as { output: unknown }).output,
+      }),
+    ).toBe("output-cancelled");
+  });
+
+  it("keeps an answered approval running: it is on its way to run", () => {
+    expect(
+      getCompactToolState({
+        part: { ...(running as object), state: "approval-responded" } as never,
+        toolResultPart: null,
+        turnActive: false,
+      }),
+    ).toBe("running");
+  });
+
+  it("keeps a call waiting for approval as it is after its turn ends", () => {
+    expect(
+      getCompactToolState({
+        part: { ...(running as object), state: "approval-requested" } as never,
+        toolResultPart: null,
+        turnActive: false,
+      }),
+    ).toBe("approval-requested");
+  });
+});
+
+describe("hasToolRequest", () => {
+  it("counts a call with no arguments as a request, and waits for arguments still on their way", () => {
+    expect(hasToolRequest({})).toBe(true);
+    expect(hasToolRequest({ id: 7 })).toBe(true);
+    expect(hasToolRequest(undefined)).toBe(false);
+    expect(hasToolRequest(null)).toBe(false);
+  });
+});
+
+describe("reviewed remedy rulings", () => {
+  function remedyPart(output: unknown) {
+    return {
+      type: "tool-archestra__execute_remedy_plan",
+      toolCallId: "call-remedy",
+      state: "output-available",
+      input: { offer_id: "offer-1" },
+      output,
+    } as never;
+  }
+
+  it("shows a remedy the viewer denied as denied, not completed", () => {
+    const part = remedyPart({
+      content: "[appa] Denied: the human reviewer refused this call.",
+      _meta: { archestraHumanRuling: "deny" },
+    });
+
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe("denied");
+    expect(getHumanRulingDisplay({ part, toolResultPart: null })).toEqual({
+      ruling: "deny",
+      label: "Denied by you",
+    });
+  });
+
+  it("reads the ruling off the result part when the call and result are split", () => {
+    const toolResultPart = remedyPart({
+      content: "[appa] Denied: the human reviewer refused this call.",
+      _meta: { archestraHumanRuling: "deny" },
+    });
+    const part = {
+      type: "tool-archestra__execute_remedy_plan",
+      toolCallId: "call-remedy",
+      state: "input-available",
+      input: { offer_id: "offer-1" },
+    } as never;
+
+    expect(getCompactToolState({ part, toolResultPart })).toBe("denied");
+  });
+
+  it("keeps an approved remedy completed, labelled as the viewer's approval", () => {
+    const part = remedyPart({
+      content: "[appa] Authorized.",
+      _meta: { archestraHumanRuling: "approve" },
+    });
+
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe(
+      "completed",
+    );
+    expect(getHumanRulingDisplay({ part, toolResultPart: null })?.label).toBe(
+      "Approved by you",
+    );
+  });
+
+  it("lets an error outrank the ruling it answered", () => {
+    const part = remedyPart({
+      content: "[appa] offer invalidated",
+      _meta: {
+        archestraError: { type: "generic", message: "offer invalidated" },
+        archestraHumanRuling: "deny",
+      },
+    });
+
+    expect(getCompactToolState({ part, toolResultPart: null })).toBe("error");
+    expect(getHumanRulingDisplay({ part, toolResultPart: null })).toBeNull();
+  });
+});
+
+describe("hasToolAuthOrNoDevicePrompt auth check", () => {
+  it("parses a part's output once across renders, and again when it changes", () => {
+    const part = {
+      type: "tool-github__search",
+      state: "output-available",
+      output:
+        'Authentication required for "GitHub". To authenticate, visit: https://example.com/connect/github',
+    };
+    const check = () =>
+      hasToolAuthOrNoDevicePrompt({
+        part: part as never,
+        toolResultPart: null,
+      });
+    // The auth parsers JSON.parse text that carries their marker; count those.
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect(check()).toBe(true);
+      const parsesForFirstRender = parse.mock.calls.length;
+      expect(parsesForFirstRender).toBeGreaterThan(0);
+      expect(check()).toBe(true);
+      // Other readers of the output parse it every time; the auth check's
+      // parse is the one the second render no longer pays for.
+      expect(parse.mock.calls.length - parsesForFirstRender).toBe(
+        parsesForFirstRender - 1,
+      );
+
+      part.output = "plain result";
+      expect(check()).toBe(false);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+});
+
+describe("hasToolAuthOrNoDevicePrompt for a tool call that found no device", () => {
+  it("detects no-device errors while keeping the tool call compact-eligible", () => {
+    const buildPart = (errorText: string) =>
+      ({
+        type: "tool-archestra__run_tool",
+        state: "output-error",
+        errorText,
+      }) as never;
+    const noDevicePart = buildPart(
+      "MCP error -32603: No device is linked. Set up the MCP bridge on your device from the Device tab of Personal Settings and try again.",
+    );
+    expect(
+      isCompactEligible({
+        toolName: "archestra__run_tool",
+        part: noDevicePart,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+    expect(
+      hasToolAuthOrNoDevicePrompt({
+        part: noDevicePart,
+        toolResultPart: null,
+      }),
+    ).toBe(true);
+    // Any other failure is not flagged as a device/auth prompt.
+    expect(
+      hasToolAuthOrNoDevicePrompt({
+        part: buildPart("MCP error -32603: Request failed"),
+        toolResultPart: null,
+      }),
+    ).toBe(false);
+  });
+});

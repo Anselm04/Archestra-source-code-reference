@@ -1,0 +1,388 @@
+"use client";
+
+import { ChatErrorCode } from "@archestra/shared";
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Gauge,
+  MessageSquareDashed,
+  RefreshCw,
+} from "lucide-react";
+import { useState } from "react";
+import { toast } from "sonner";
+import { Message, MessageContent } from "@/components/ai-elements/message";
+import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import type { ModelSource } from "@/lib/chat/use-chat-preferences";
+import { copyToClipboard } from "@/lib/clipboard";
+import { useAppName } from "@/lib/hooks/use-app-name";
+import {
+  formatOriginalError,
+  getSimplifiedChatErrorMessage,
+  mapClientError,
+  parseErrorResponse,
+} from "./chat-error.utils";
+import { ProviderAuthRequiredCard } from "./provider-auth-required-card";
+
+interface InlineChatErrorProps {
+  error: Error;
+  conversationId?: string;
+  supportMessage?: string | null;
+  slimChatErrorUi?: boolean;
+  agentName?: string;
+  selectedModel?: string;
+  modelSource?: ModelSource | null;
+  /** Re-run the original prompt after the user connects a per-user provider. */
+  onProviderConnected?: () => void;
+  /**
+   * When set and the error is retryable, render a "Try again" button that resends
+   * the last user turn and clears this error. Read-only viewers omit it.
+   */
+  onRetry?: () => void | Promise<void>;
+}
+
+export function InlineChatError({
+  error,
+  conversationId,
+  supportMessage,
+  slimChatErrorUi = false,
+  agentName,
+  selectedModel,
+  modelSource,
+  onProviderConnected,
+  onRetry,
+}: InlineChatErrorProps) {
+  const [isDetailsOpen, setIsDetailsOpen] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const { data: isAdmin } = useHasPermissions({
+    organizationSettings: ["read"],
+  });
+  const appName = useAppName();
+  const chatError = parseErrorResponse(error) ?? mapClientError(error, appName);
+
+  const simplifiedMessage = getSimplifiedChatErrorMessage(chatError, appName);
+  const trimmedSupportMessage = supportMessage?.trim();
+
+  // A per-user provider the user hasn't linked yet → an inline "connect your
+  // account" card instead of a generic error.
+  if (
+    chatError.code === ChatErrorCode.ProviderAuthRequired &&
+    chatError.authAction
+  ) {
+    return (
+      <ProviderAuthRequiredCard
+        provider={chatError.authAction.provider}
+        providerLabel={chatError.authAction.providerLabel}
+        onConnected={onProviderConnected}
+      />
+    );
+  }
+
+  const isUsageLimitExceeded = chatError.usageLimitExceeded === true;
+  // An empty turn that survived the backend's auto-retries is the model's
+  // answer for this conversation, not a system failure — render it as a
+  // neutral outcome rather than a destructive error.
+  // A cut-short reply is shown next to the reply itself — same neutral tone.
+  const isModelTurnOutcome =
+    chatError.code === ChatErrorCode.EmptyResponse ||
+    chatError.code === ChatErrorCode.IncompleteResponse;
+  const isNeutralOutcome = isUsageLimitExceeded || isModelTurnOutcome;
+  const StatusIcon = isUsageLimitExceeded
+    ? Gauge
+    : isModelTurnOutcome
+      ? MessageSquareDashed
+      : AlertCircle;
+  // Padding is explicit: assistant MessageContent is flat/unpadded by default,
+  // but this renders as a bordered card and needs the inset back.
+  const containerClassName = isNeutralOutcome
+    ? "bg-muted/30 border border-border rounded-lg px-4 py-3"
+    : "bg-destructive/10 border border-destructive/20 rounded-lg px-4 py-3";
+  const iconClassName = isNeutralOutcome
+    ? "text-muted-foreground"
+    : "text-destructive";
+  const usageLimitMessage =
+    isUsageLimitExceeded && supportMessage ? chatError.message : undefined;
+  // Conversation IDs double as chat session IDs for the end-user chat flow.
+  const sessionId = chatError.sessionId ?? conversationId;
+
+  const refEntries: { label: string; value: string }[] = [];
+  if (sessionId) refEntries.push({ label: "Session", value: sessionId });
+  if (chatError.traceId)
+    refEntries.push({ label: "Trace", value: chatError.traceId });
+  if (chatError.spanId)
+    refEntries.push({ label: "Span", value: chatError.spanId });
+
+  const copyDebugInfo = async () => {
+    const lines: string[] = [];
+
+    if (slimChatErrorUi) {
+      lines.push(simplifiedMessage);
+      if (trimmedSupportMessage) lines.push(trimmedSupportMessage);
+    } else {
+      lines.push(trimmedSupportMessage || chatError.message);
+    }
+    if (!slimChatErrorUi) {
+      if (agentName) lines.push(`Agent: ${agentName}`);
+      if (selectedModel) lines.push(`Model: ${selectedModel}`);
+      if (chatError.subagent) {
+        lines.push(`Failed in subagent: ${chatError.subagent.name}`);
+        if (chatError.subagent.model) {
+          lines.push(`Subagent model: ${chatError.subagent.model}`);
+        }
+      }
+      if (chatError.originalError?.provider) {
+        lines.push(`Provider: ${chatError.originalError.provider}`);
+      }
+      lines.push(`Model source: ${formatModelSource(modelSource)}`);
+      lines.push("");
+      lines.push(
+        `Code: ${chatError.code}${chatError.isRetryable ? " (retryable)" : ""}`,
+      );
+      if (chatError.originalError) {
+        lines.push(formatOriginalError(chatError.originalError));
+      }
+    }
+    for (const entry of refEntries) {
+      lines.push(`${entry.label}: ${entry.value}`);
+    }
+
+    try {
+      await copyToClipboard(lines.join("\n"));
+      toast.success(
+        slimChatErrorUi ? "Error details copied" : "Debug info copied",
+      );
+    } catch {
+      toast.error("Couldn't copy to clipboard");
+    }
+  };
+
+  const retryButton =
+    chatError.isRetryable && onRetry ? (
+      <Button
+        variant="outline"
+        size="xs"
+        className="gap-1.5 self-start"
+        disabled={isRetrying}
+        onClick={() => {
+          setIsRetrying(true);
+          void (async () => {
+            try {
+              await onRetry();
+            } catch (error) {
+              console.error("[InlineChatError] Retry failed", error);
+            } finally {
+              setIsRetrying(false);
+            }
+          })();
+        }}
+      >
+        <RefreshCw
+          className={`h-3.5 w-3.5 ${isRetrying ? "animate-spin" : ""}`}
+        />
+        Try again
+      </Button>
+    ) : null;
+
+  if (slimChatErrorUi) {
+    return (
+      <Message from="assistant">
+        <MessageContent
+          className={`${containerClassName} group-[.is-assistant]:[&_p]:my-0`}
+        >
+          <div className="flex items-start gap-2">
+            <StatusIcon
+              className={`h-4 w-4 mt-0.5 flex-shrink-0 ${iconClassName}`}
+            />
+            <div className="flex flex-1 flex-col gap-2">
+              <p className="text-sm text-foreground">{simplifiedMessage}</p>
+              {trimmedSupportMessage && (
+                <p className="text-xs text-muted-foreground">
+                  {trimmedSupportMessage}
+                </p>
+              )}
+
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {refEntries.map((entry) => (
+                  <span
+                    key={entry.label}
+                    className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono"
+                  >
+                    <span className="opacity-60">{entry.label}</span>
+                    <span>{entry.value}</span>
+                  </span>
+                ))}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-5 w-5 p-0 text-muted-foreground hover:text-foreground"
+                  onClick={copyDebugInfo}
+                  aria-label="Copy error details"
+                  title="Copy error details"
+                >
+                  <Copy className="h-3 w-3" />
+                </Button>
+              </div>
+              {retryButton}
+            </div>
+          </div>
+        </MessageContent>
+      </Message>
+    );
+  }
+
+  return (
+    <Message from="assistant">
+      <MessageContent
+        className={`${containerClassName} group-[.is-assistant]:[&_p]:my-0`}
+      >
+        <div className="flex items-start gap-2">
+          <StatusIcon
+            className={`h-4 w-4 mt-0.5 flex-shrink-0 ${iconClassName}`}
+          />
+          <div className="flex flex-1 flex-col gap-2">
+            {supportMessage ? (
+              <p className="text-sm text-foreground">{supportMessage}</p>
+            ) : (
+              <p className="text-sm text-foreground">{chatError.message}</p>
+            )}
+
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {agentName && (
+                <span className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono">
+                  <span className="opacity-60">Agent</span>
+                  <span>{agentName}</span>
+                </span>
+              )}
+              {selectedModel && (
+                <span className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono">
+                  <span className="opacity-60">Model</span>
+                  <span>{selectedModel}</span>
+                </span>
+              )}
+              {chatError.subagent && (
+                <span className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono">
+                  <span className="opacity-60">Failed in subagent</span>
+                  <span>{chatError.subagent.name}</span>
+                </span>
+              )}
+              {chatError.subagent?.model && (
+                <span className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono">
+                  <span className="opacity-60">Subagent model</span>
+                  <span>{chatError.subagent.model}</span>
+                </span>
+              )}
+              {chatError.originalError?.provider && (
+                <span className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono">
+                  <span className="opacity-60">Provider</span>
+                  <span>{chatError.originalError.provider}</span>
+                </span>
+              )}
+              <span className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono">
+                <span className="opacity-60">Model source</span>
+                <span>{formatModelSource(modelSource)}</span>
+              </span>
+              {refEntries.map((entry) => (
+                <span
+                  key={entry.label}
+                  className="inline-flex items-center gap-1 rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground font-mono"
+                >
+                  <span className="opacity-60">{entry.label}</span>
+                  <span>{entry.value}</span>
+                </span>
+              ))}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-5 w-5 p-0 text-muted-foreground hover:text-foreground"
+                onClick={copyDebugInfo}
+                aria-label="Copy debug info"
+                title="Copy debug info"
+              >
+                <Copy className="h-3 w-3" />
+              </Button>
+            </div>
+            {usageLimitMessage && (
+              <p className="text-xs text-muted-foreground">
+                {usageLimitMessage}
+              </p>
+            )}
+
+            {retryButton}
+
+            {isAdmin && (
+              <Collapsible open={isDetailsOpen} onOpenChange={setIsDetailsOpen}>
+                <CollapsibleTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-auto p-0 text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    {isDetailsOpen ? (
+                      <ChevronDown className="h-3 w-3 mr-1" />
+                    ) : (
+                      <ChevronRight className="h-3 w-3 mr-1" />
+                    )}
+                    <span>Error Details</span>
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="space-y-2 mt-1">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-muted text-muted-foreground">
+                      {chatError.code}
+                    </span>
+                    {chatError.isRetryable && (
+                      <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                        <RefreshCw className="h-3 w-3" />
+                        Retryable
+                      </span>
+                    )}
+                  </div>
+                  {supportMessage && (
+                    <p className="text-sm text-foreground">
+                      {chatError.message}
+                    </p>
+                  )}
+                  {chatError.originalError && (
+                    <>
+                      {/* biome-ignore-start lint/a11y/noNoninteractiveTabindex: scrollable error detail must be keyboard focusable (WCAG 2.1.1) */}
+                      <section
+                        tabIndex={0}
+                        aria-label="Error details"
+                        className="max-h-48 overflow-auto rounded-md bg-muted/50"
+                      >
+                        {/* biome-ignore-end lint/a11y/noNoninteractiveTabindex: scrollable error detail must be keyboard focusable (WCAG 2.1.1) */}
+                        <pre className="p-3 text-xs font-mono whitespace-pre-wrap break-words text-foreground">
+                          {formatOriginalError(chatError.originalError)}
+                        </pre>
+                      </section>
+                    </>
+                  )}
+                </CollapsibleContent>
+              </Collapsible>
+            )}
+          </div>
+        </div>
+      </MessageContent>
+    </Message>
+  );
+}
+
+function formatModelSource(source: ModelSource | null | undefined): string {
+  switch (source) {
+    case "agent":
+      return "agent";
+    case "organization":
+      return "organization";
+    case "user":
+      return "user override";
+    default:
+      return "auto-selected (best available)";
+  }
+}

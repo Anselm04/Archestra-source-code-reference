@@ -1,0 +1,655 @@
+import {
+  BLOCKED_PASSTHROUGH_HEADERS,
+  BUILT_IN_AGENT_IDS,
+  CreatedByNullableSchema,
+  DOMAIN_VALIDATION_REGEX,
+  GitHubActionsAccessSchema,
+  HEADER_NAME_REGEX,
+  HEADER_NAME_VALIDATION_MESSAGE,
+  IncomingEmailSecurityModeSchema,
+  MAX_DOMAIN_LENGTH,
+  MAX_PASSTHROUGH_HEADERS,
+  MAX_SUGGESTED_PROMPTS,
+  ResourcePermissionGrantSchema,
+  StoredGitHubActionsAccessSchema,
+  StoredSubagentLoadBalancingConfigSchema,
+  SubagentLoadBalancingConfigSchema,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
+import {
+  createInsertSchema,
+  createSelectSchema,
+  createUpdateSchema,
+} from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database/schema";
+import {
+  AgentActivationSkillModeSchema,
+  CreateAgentActivationSkillPolicySchema,
+} from "./agent-activation-skill-policy";
+import { AgentRuntimeSchema } from "./agent-runtime";
+import { SuggestedPromptInputSchema } from "./agent-suggested-prompt";
+import { NetworkPolicyInputSchema, NetworkPolicySchema } from "./environment";
+import { LabelWithDetailsSchema } from "./label";
+import { SelectToolSchema } from "./tool";
+import {
+  type ResourceVisibilityScope,
+  ResourceVisibilityScopeSchema,
+  RetiredSharingFieldSchema,
+} from "./visibility";
+
+/**
+ * Agent type:
+ * - profile: External profiles for API gateway routing
+ * - mcp_gateway: MCP gateway specific configuration
+ * - llm_proxy: LLM proxy specific configuration
+ * - agent: Internal agents with prompts for chat
+ */
+export const AgentTypeSchema = z.enum([
+  "profile",
+  "mcp_gateway",
+  "llm_proxy",
+  "agent",
+]);
+export type AgentType = z.infer<typeof AgentTypeSchema>;
+
+/**
+ * Agent types that can serve as an MCP gateway — the agents external MCP
+ * clients register via the connect page (legacy `profile` agents serve both
+ * gateway and proxy surfaces).
+ */
+export const GATEWAY_CAPABLE_AGENT_TYPES = [
+  "mcp_gateway",
+  "profile",
+] as const satisfies readonly AgentType[];
+
+export const AgentScopeSchema = ResourceVisibilityScopeSchema;
+export type AgentScope = ResourceVisibilityScope;
+
+export const ToolExposureModeSchema = z.enum(["full", "search_and_run_only"]);
+export type ToolExposureMode = z.infer<typeof ToolExposureModeSchema>;
+
+/**
+ * What happens when someone starts a conversation with an agent whose tools
+ * come from MCP servers they have no usable connection to.
+ *
+ * - `allow`  — nothing up front; the caller only learns about it when a tool
+ *              from the unconnected server is actually invoked (default, and
+ *              the behavior that predates this setting).
+ * - `warn`   — the caller may still use the agent, but the chat surfaces which
+ *              connections are missing before they send anything.
+ * - `block`  — the agent cannot be started at all until every connection its
+ *              tools need resolves for the caller.
+ */
+export const MissingCredentialBehaviorSchema = z.enum([
+  "allow",
+  "warn",
+  "block",
+]);
+export type MissingCredentialBehavior = z.infer<
+  typeof MissingCredentialBehaviorSchema
+>;
+
+/**
+ * The agent fields a missing-credential readiness check needs. Any richer agent
+ * shape satisfies it.
+ */
+export type ReadinessAgent = {
+  id: string;
+  missingCredentialBehavior: MissingCredentialBehavior;
+  accessAllTools: boolean;
+};
+
+/** An MCP server an agent needs but the caller has no usable connection to. */
+const MissingAgentConnectionSchema = z.object({
+  catalogId: z.string(),
+  catalogName: z.string(),
+});
+
+/**
+ * Pre-flight answer to "can this caller actually run this agent's tools?".
+ * Only computed for agents that opted out of `allow`, so an empty
+ * `missingConnections` on a `warn`/`block` agent means the caller is fully
+ * connected.
+ */
+export const AgentCredentialReadinessSchema = z.object({
+  agentId: z.string(),
+  missingCredentialBehavior: MissingCredentialBehaviorSchema,
+  missingConnections: z.array(MissingAgentConnectionSchema),
+});
+export type AgentCredentialReadiness = z.infer<
+  typeof AgentCredentialReadinessSchema
+>;
+
+export const AgentScopeFilterSchema = z.enum([
+  "personal",
+  "team",
+  "org",
+  "built_in",
+]);
+export type AgentScopeFilter = z.infer<typeof AgentScopeFilterSchema>;
+
+// Built-in agent config — discriminated union by name
+const OpenAppaConfigAgentConfigSchema = z.object({
+  name: z.literal(BUILT_IN_AGENT_IDS.OPENAPPA_CONFIG),
+});
+const ContextCompactionAgentConfigSchema = z.object({
+  name: z.literal(BUILT_IN_AGENT_IDS.CONTEXT_COMPACTION),
+});
+
+const ChatTitleGenerationAgentConfigSchema = z.object({
+  name: z.literal(BUILT_IN_AGENT_IDS.CHAT_TITLE_GENERATION),
+});
+
+const AppRuntimeAgentConfigSchema = z.object({
+  name: z.literal(BUILT_IN_AGENT_IDS.APP_RUNTIME),
+});
+const SreAgentConfigSchema = z.object({
+  name: z.literal(BUILT_IN_AGENT_IDS.SRE),
+});
+
+// Discriminated union — add future built-in agents here
+export const BuiltInAgentConfigSchema = z.discriminatedUnion("name", [
+  OpenAppaConfigAgentConfigSchema,
+  ContextCompactionAgentConfigSchema,
+  ChatTitleGenerationAgentConfigSchema,
+  AppRuntimeAgentConfigSchema,
+  SreAgentConfigSchema,
+]);
+
+export type BuiltInAgentConfig = z.infer<typeof BuiltInAgentConfigSchema>;
+export type ContextCompactionAgentConfig = z.infer<
+  typeof ContextCompactionAgentConfigSchema
+>;
+export type ChatTitleGenerationAgentConfig = z.infer<
+  typeof ChatTitleGenerationAgentConfigSchema
+>;
+
+// Team info schema for agent responses (just id and name)
+export const AgentTeamInfoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+});
+
+const PassthroughHeaderSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(HEADER_NAME_REGEX, HEADER_NAME_VALIDATION_MESSAGE)
+  .transform((h) => h.toLowerCase())
+  .refine((h) => !BLOCKED_PASSTHROUGH_HEADERS.has(h), {
+    message: "This header name is not allowed (hop-by-hop or protocol-level)",
+  });
+
+export const PassthroughHeadersSchema = z
+  .array(PassthroughHeaderSchema)
+  .max(MAX_PASSTHROUGH_HEADERS)
+  .nullable()
+  .optional();
+
+// Extended field schemas for drizzle-zod
+// agentType override is needed because the column uses text().$type<AgentType>()
+// which drizzle-zod infers as z.string() instead of the narrower enum schema
+const selectExtendedFields = {
+  incomingEmailSecurityMode: IncomingEmailSecurityModeSchema,
+  agentType: AgentTypeSchema,
+  scope: AgentScopeSchema,
+  toolExposureMode: ToolExposureModeSchema,
+  missingCredentialBehavior: MissingCredentialBehaviorSchema,
+  builtInAgentConfig: BuiltInAgentConfigSchema.nullable(),
+  passthroughHeaders: z.array(z.string()).nullable(),
+  /**
+   * MCP gateways' GitHub Actions token exchange setting. Optional, like
+   * `lastUsedAt`, so agent objects built in code without it still fit. Read
+   * without the entry rules, so a row saved under other rules still loads.
+   */
+  githubActionsAccess: StoredGitHubActionsAccessSchema.nullable().optional(),
+  /**
+   * MCP gateways' subagent load-balancing and fallback setting. Optional so
+   * agent objects built in code without it still fit.
+   */
+  subagentLoadBalancing:
+    StoredSubagentLoadBalancingConfigSchema.nullable().optional(),
+  runtime: AgentRuntimeSchema.nullable(),
+  /**
+   * Per-agent egress override for its Agent Runtime and Code Sandbox. Null
+   * inherits the environment's policy. Optional so agent objects built in code
+   * without it still fit.
+   */
+  networkPolicy: NetworkPolicySchema.nullable().optional(),
+  activationSkillMode: AgentActivationSkillModeSchema,
+  /**
+   * When anything last ran through this agent: the later of its newest MCP
+   * request (any JSON-RPC method) and its newest LLM call. Null when neither
+   * ever happened. Optional, as it was before the column existed, so agent
+   * objects built in code without it still fit.
+   */
+  lastUsedAt: z.date().nullable().optional(),
+};
+
+const insertExtendedFields = {
+  incomingEmailSecurityMode: IncomingEmailSecurityModeSchema.optional(),
+  agentType: AgentTypeSchema.optional(),
+  scope: AgentScopeSchema.optional(),
+  toolExposureMode: ToolExposureModeSchema.optional(),
+  missingCredentialBehavior: MissingCredentialBehaviorSchema.optional(),
+  builtInAgentConfig: BuiltInAgentConfigSchema.nullable().optional(),
+  passthroughHeaders: PassthroughHeadersSchema,
+  githubActionsAccess: GitHubActionsAccessSchema.nullable().optional(),
+  subagentLoadBalancing:
+    SubagentLoadBalancingConfigSchema.nullable().optional(),
+  runtime: AgentRuntimeSchema.nullable().optional(),
+  networkPolicy: NetworkPolicyInputSchema.nullable().optional(),
+  activationSkillMode: AgentActivationSkillModeSchema.optional(),
+};
+
+/**
+ * Validates incoming email domain settings.
+ * When incomingEmailEnabled is true and incomingEmailSecurityMode is "internal",
+ * the incomingEmailAllowedDomain must be provided and match the domain regex.
+ */
+function validateIncomingEmailDomain(
+  data: {
+    incomingEmailEnabled?: boolean | null;
+    incomingEmailSecurityMode?: string | null;
+    incomingEmailAllowedDomain?: string | null;
+  },
+  ctx: z.RefinementCtx,
+) {
+  // Only validate when email is enabled and mode is internal
+  if (
+    data.incomingEmailEnabled === true &&
+    data.incomingEmailSecurityMode === "internal"
+  ) {
+    const domain = data.incomingEmailAllowedDomain?.trim();
+
+    if (!domain) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Allowed domain is required when security mode is set to internal",
+        path: ["incomingEmailAllowedDomain"],
+      });
+      return;
+    }
+
+    if (domain.length > MAX_DOMAIN_LENGTH) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Domain must not exceed ${MAX_DOMAIN_LENGTH} characters`,
+        path: ["incomingEmailAllowedDomain"],
+      });
+      return;
+    }
+
+    if (!DOMAIN_VALIDATION_REGEX.test(domain)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Invalid domain format. Please enter a valid domain (e.g., company.com)",
+        path: ["incomingEmailAllowedDomain"],
+      });
+    }
+  }
+}
+
+const AgentRowSchema = createSelectSchema(
+  schema.agentsTable,
+  selectExtendedFields,
+  // Deprecated column, superseded by agent_identity_bindings.
+).omit({ entraAgentIdentityId: true });
+
+/**
+ * Hot-path agent shape for the MCP gateway: the raw agents row plus labels,
+ * without the tools/teams/knowledge/connector/author/prompt/resolved-LLM
+ * hydration a full `Agent` carries. See `AgentModel.findGatewayAgentById`.
+ */
+const GatewayAgentSchema = AgentRowSchema.extend({
+  labels: z.array(LabelWithDetailsSchema),
+});
+export type GatewayAgent = z.infer<typeof GatewayAgentSchema>;
+
+/**
+ * Slim tool reference embedded in agent payloads. Full tool definitions
+ * (parameters, policy fields, timestamps) are served by the dedicated
+ * per-agent tools endpoints; embedding them here multiplied agent list
+ * responses by the org's agent × tool fan-out, with the parameter JSON
+ * schemas duplicated once per assignment.
+ */
+export const AgentToolRefSchema = SelectToolSchema.pick({
+  id: true,
+  agentId: true,
+  catalogId: true,
+  delegateToAgentId: true,
+  delegateToA2aConnectionId: true,
+  name: true,
+  rawName: true,
+  description: true,
+});
+export type AgentToolRef = z.infer<typeof AgentToolRefSchema>;
+
+export const SelectAgentSchema = AgentRowSchema.extend({
+  tools: z.array(AgentToolRefSchema),
+  teams: z.array(AgentTeamInfoSchema),
+  // People the agent is shared with individually. A personal-scoped agent with
+  // a non-empty list is shared, not private — the settings form reads the pair
+  // as its Users choice.
+  // Optional like authorName: only the read paths that surface sharing
+  // populate it, so the many internal Agent assemblies stay unchanged.
+  users: z
+    .array(z.object({ id: z.string(), name: z.string(), email: z.string() }))
+    .optional(),
+  labels: z.array(LabelWithDetailsSchema),
+  authorName: z.string().nullable().optional(),
+  authorEmail: z.string().nullable().optional(),
+  /**
+   * The author again, in the shape shared by every major object. Optional for
+   * the same reason as `authorName`: only the read paths that hydrate the
+   * author populate it, leaving internal agent assemblies untouched.
+   */
+  createdBy: CreatedByNullableSchema.optional(),
+  knowledgeBaseIds: z.array(z.string()),
+  connectorIds: z.array(z.string()),
+  suggestedPrompts: z
+    .array(SuggestedPromptInputSchema)
+    .max(MAX_SUGGESTED_PROMPTS)
+    .default([]),
+  /**
+   * The provider of the agent's configured default LLM, resolved server-side
+   * from `llmApiKeyId` (or `modelId` when only a model is pinned) so every
+   * viewer sees the agent's true provider — even one who can't access the
+   * owner's per-user key. Null when the agent has no LLM configured. Populated
+   * on read paths (list/get); absent on mutation responses (clients re-fetch).
+   */
+  resolvedLlmProvider: SupportedProvidersSchema.nullable().optional(),
+  /** Human-facing name of the configured provider key. */
+  resolvedLlmProviderKeyName: z.string().nullable().optional(),
+  /**
+   * The human-facing name of the agent's configured model (e.g. "gpt-4"),
+   * resolved server-side from `modelId` so a viewer who can't access the
+   * configured key still sees the model name rather than its UUID. Null when no
+   * model is configured.
+   */
+  resolvedLlmModelName: z.string().nullable().optional(),
+  /**
+   * The runs of this Agent Runtime agent use each person's own subscription
+   * unless that person chooses otherwise: `resolvedLlmProvider` is then the
+   * subscription's provider, and no company connection is named. Set on the
+   * Agents list only.
+   */
+  resolvedLlmPersonalSubscription: z.boolean().optional(),
+  /**
+   * Whether the agent's configured provider requires a per-user credential
+   * (e.g. GitHub Copilot). Lets the chat/dialog show a read-only model and
+   * prompt the viewer to connect their own account instead of silently
+   * substituting another model.
+   */
+  llmProviderRequiresPerUserCredential: z.boolean().optional(),
+  /**
+   * Whether the code-execution sandbox is usable for this agent by the
+   * requesting user (`isSkillSandboxAvailableForAgent`: feature enabled +
+   * `agent:read` permission + the sandbox tools assigned/accessible). The
+   * chat composer widens the accepted upload types to any file when true.
+   * Populated on read paths (list/get); absent on mutation responses.
+   */
+  sandboxAvailable: z.boolean().optional(),
+  /**
+   * Number of skills the requesting user can activate through this agent.
+   * Populated only on paginated agent-list reads that request
+   * `includeActivationSkillsCount=true`, for internal agents when the caller
+   * may read skills; absent on other reads, unauthorized reads, and non-agent
+   * rows.
+   */
+  activationSkillsCount: z.number().int().nonnegative().optional(),
+});
+
+/** Bootstrap identity and model references; selected-agent details load separately. */
+export const ChatAgentRosterSchema = SelectAgentSchema.pick({
+  id: true,
+  organizationId: true,
+  name: true,
+  description: true,
+  icon: true,
+  scope: true,
+  authorId: true,
+  agentType: true,
+  builtIn: true,
+  builtInAgentConfig: true,
+  runtime: true,
+  modelId: true,
+  llmApiKeyId: true,
+  modelPoolId: true,
+  autoRouterId: true,
+}).extend({
+  /**
+   * Another user's agent whose own policy grants the caller read by name. A
+   * personal agent the caller reads only through admin oversight is false, so
+   * the chat picker can tell a share from a reference it should not offer.
+   */
+  sharedByName: z.boolean(),
+});
+export type ChatAgentRoster = z.infer<typeof ChatAgentRosterSchema>;
+
+/** Fields rendered by resource pickers; editing loads the individual resource. */
+export const AgentOptionSchema = SelectAgentSchema.pick({
+  id: true,
+  name: true,
+  slug: true,
+  agentType: true,
+  icon: true,
+  scope: true,
+  authorId: true,
+  authorName: true,
+  authorEmail: true,
+  isPersonalGateway: true,
+  runtime: true,
+  description: true,
+  teams: true,
+}).extend({
+  users: z.array(
+    SelectAgentSchema.shape.users.unwrap().element.pick({ id: true }),
+  ),
+});
+
+export type AgentOption = z.infer<typeof AgentOptionSchema>;
+
+/** Filters applied before a bounded selector page is fetched. */
+export const AgentOptionFiltersSchema = z.object({
+  search: z.string().max(512).optional(),
+  searchMode: z.enum(["name", "selector", "name_or_description"]).optional(),
+  sortBy: z.enum(["createdAt", "name"]).optional(),
+  exactName: z.string().optional(),
+  authorId: z.string().optional(),
+  excludeIds: z
+    .preprocess(
+      (value) =>
+        typeof value === "string" ? value.split(",").filter(Boolean) : value,
+      z.array(z.uuid()),
+    )
+    .optional(),
+  runtimeCommand: z.string().optional(),
+  onlyOwnPersonalAgents: z
+    .preprocess((value) => value === "true" || value === true, z.boolean())
+    .optional(),
+  excludePersonalGateways: z
+    .preprocess((value) => value === "true" || value === true, z.boolean())
+    .optional(),
+  audienceVisibility: z
+    .enum(["none", "organization", "team", "user"])
+    .optional(),
+  audienceTeamIds: z
+    .preprocess(
+      (value) =>
+        typeof value === "string" ? value.split(",").filter(Boolean) : value,
+      z.array(z.string()),
+    )
+    .optional(),
+  audienceUserIds: z
+    .preprocess(
+      (value) =>
+        typeof value === "string" ? value.split(",").filter(Boolean) : value,
+      z.array(z.string()),
+    )
+    .optional(),
+  audienceEditorIsOwner: z
+    .preprocess((value) => value === "true" || value === true, z.boolean())
+    .optional(),
+});
+export type AgentOptionFilters = z.infer<typeof AgentOptionFiltersSchema>;
+
+/** Paginated Agents-surface row with the current user's pin marker. */
+export const AgentListItemSchema = SelectAgentSchema.extend({
+  pinnedAt: z.date().nullable(),
+  toolsCount: z
+    .number()
+    .int()
+    .describe(
+      "Assigned tools other than subagent delegations, as the Agents and MCP Gateways pages count them. Always present, even when `tools` is not requested.",
+    ),
+  subagentsCount: z
+    .number()
+    .int()
+    .describe(
+      "Agents this agent delegates to. Always present, even when `tools` is not requested.",
+    ),
+});
+
+// Base schema without refinement - can be used with .partial()
+export const InsertAgentSchemaBase = createInsertSchema(
+  schema.agentsTable,
+  insertExtendedFields,
+)
+  .extend({
+    teams: z.array(z.string()).default([]),
+    // Individuals the agent is shared with by name. Additive to the scope,
+    // so a personal agent can reach a colleague without going team-wide.
+    users: z.array(z.string()).default([]),
+    labels: z.array(LabelWithDetailsSchema).optional(),
+    // Make organizationId optional - model will auto-assign if not provided
+    organizationId: z.string().optional(),
+    scope: AgentScopeSchema,
+    knowledgeBaseIds: z.array(z.string()).default([]),
+    connectorIds: z.array(z.string()).default([]),
+    suggestedPrompts: z
+      .array(SuggestedPromptInputSchema)
+      .max(MAX_SUGGESTED_PROMPTS)
+      .optional(),
+    activationSkillPolicy: CreateAgentActivationSkillPolicySchema.optional(),
+  })
+  .omit({
+    id: true,
+    slug: true,
+    createdAt: true,
+    updatedAt: true,
+    authorId: true,
+    createdByServiceAccountId: true,
+    isPersonalGateway: true,
+    runtimeSecretId: true,
+    // Which skills a gateway publishes over skill:// is decided by the
+    // skill-assignment routes, which carry a `skill:read` floor. Accepting the
+    // flag in the generic agent body would let a caller without that
+    // permission flip a gateway to publish-all.
+    accessAllSkills: true,
+    activationSkillMode: true,
+    activationSkillPolicyRevision: true,
+    // Server-managed head pointer into agent_versions — forked by
+    // AgentVersionModel, never client-settable (a supplied value would corrupt
+    // the version counter and can collide on the (agent_id, version) index).
+    latestVersion: true,
+    // Stamped by AgentUsageModel when the agent is used; never client-settable.
+    lastUsedAt: true,
+    // Deprecated column, superseded by agent_identity_bindings.
+    entraAgentIdentityId: true,
+    // Set on an existing gateway by the update route, which checks the
+    // editor may use the GitHub App it names. A new agent starts without it.
+    githubActionsAccess: true,
+  });
+
+// Full schema with validation refinement
+export const InsertAgentSchema = InsertAgentSchemaBase.superRefine(
+  validateIncomingEmailDomain,
+);
+
+/**
+ * The body of `POST /api/agents`. Who can reach the new agent is its
+ * `initialGrants` alone. The retired `scope`, `teams` and `users` fields are
+ * refused with a 400 rather than silently dropped, which would create an
+ * agent narrower than the caller asked for.
+ */
+export const CreateAgentBodySchema = InsertAgentSchemaBase.omit({
+  scope: true,
+  teams: true,
+  users: true,
+})
+  .extend({
+    initialGrants: z.array(ResourcePermissionGrantSchema).max(200).optional(),
+    scope: RetiredSharingFieldSchema,
+    teams: RetiredSharingFieldSchema,
+    users: RetiredSharingFieldSchema,
+  })
+  .superRefine(validateIncomingEmailDomain);
+
+// Base schema without refinement - can be used with .partial()
+export const UpdateAgentSchemaBase = createUpdateSchema(
+  schema.agentsTable,
+  insertExtendedFields,
+)
+  .extend({
+    labels: z.array(LabelWithDetailsSchema).optional(),
+    knowledgeBaseIds: z.array(z.string()).optional(),
+    connectorIds: z.array(z.string()).optional(),
+    suggestedPrompts: z
+      .array(SuggestedPromptInputSchema)
+      .max(MAX_SUGGESTED_PROMPTS)
+      .optional(),
+  })
+  .omit({
+    id: true,
+    slug: true,
+    createdAt: true,
+    updatedAt: true,
+    authorId: true,
+    createdByServiceAccountId: true,
+    isPersonalGateway: true,
+    runtimeSecretId: true,
+    // Who can reach an agent is decided by its resource permission policy,
+    // which the permissions API writes on its own. The retired visibility
+    // column is carried through an update untouched.
+    scope: true,
+    // Which skills a gateway publishes over skill:// is decided by the
+    // skill-assignment routes, which carry a `skill:read` floor. Accepting the
+    // flag in the generic agent body would let a caller without that
+    // permission flip a gateway to publish-all.
+    accessAllSkills: true,
+    activationSkillMode: true,
+    activationSkillPolicyRevision: true,
+    // Server-managed head pointer into agent_versions — forked by
+    // AgentVersionModel, never client-settable (a supplied value would corrupt
+    // the version counter and can collide on the (agent_id, version) index).
+    latestVersion: true,
+    // Stamped by AgentUsageModel when the agent is used; never client-settable.
+    lastUsedAt: true,
+    // Deprecated column, superseded by agent_identity_bindings.
+    entraAgentIdentityId: true,
+  });
+
+// Full schema with validation refinement
+export const UpdateAgentSchema = UpdateAgentSchemaBase.superRefine(
+  validateIncomingEmailDomain,
+);
+
+export const CloneAgentBodySchema = z.object({
+  initialGrants: z.array(ResourcePermissionGrantSchema).max(200).optional(),
+  scope: RetiredSharingFieldSchema,
+  teams: RetiredSharingFieldSchema,
+  users: RetiredSharingFieldSchema,
+});
+
+export type Agent = z.infer<typeof SelectAgentSchema>;
+export type AgentListItem = z.infer<typeof AgentListItemSchema>;
+export type AgentAccessContext = Pick<
+  Agent,
+  "id" | "organizationId" | "scope" | "authorId" | "agentType"
+>;
+export type InsertAgent = z.input<typeof InsertAgentSchema>;
+export type UpdateAgent = z.infer<typeof UpdateAgentSchema>;

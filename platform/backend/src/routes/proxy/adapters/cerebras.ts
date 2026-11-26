@@ -1,0 +1,40 @@
+/**
+ * Cerebras LLM Proxy Adapter - OpenAI-compatible
+ *
+ * Cerebras exposes an OpenAI-compatible API at https://api.cerebras.ai/v1, so the
+ * whole adapter is OpenAI's, configured for Cerebras via
+ * createOpenAiCompatibleAdapterFactory.
+ */
+import OpenAIProvider from "openai";
+import config from "@/config";
+import { metrics } from "@/observability";
+import type { CreateClientOptions } from "@/types";
+import { fetchWithAbortSignal } from "@/utils/client-disconnect-signal";
+import { createOpenAiCompatibleAdapterFactory } from "./openai-compatible-adapter";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+
+export const cerebrasAdapterFactory = createOpenAiCompatibleAdapterFactory({
+  provider: "cerebras",
+  interactionType: "cerebras:chatCompletions",
+  getBaseUrl: () => config.llm.cerebras.baseUrl,
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): OpenAIProvider {
+    const customFetch = options.agent
+      ? metrics.llm.getObservableFetch(
+          "cerebras",
+          options.agent,
+          options.source,
+        )
+      : undefined;
+
+    return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      apiKey,
+      baseURL: options.baseUrl,
+      fetch: fetchWithAbortSignal(customFetch, options.abortSignal),
+      defaultHeaders: options.defaultHeaders,
+    });
+  },
+});

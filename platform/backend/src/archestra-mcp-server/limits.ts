@@ -1,0 +1,525 @@
+import {
+  TOOL_CREATE_LIMIT_SHORT_NAME,
+  TOOL_DELETE_LIMIT_SHORT_NAME,
+  TOOL_GET_AGENT_TOKEN_USAGE_SHORT_NAME,
+  TOOL_GET_LIMITS_SHORT_NAME,
+  TOOL_GET_LLM_PROXY_TOKEN_USAGE_SHORT_NAME,
+  TOOL_UPDATE_LIMIT_SHORT_NAME,
+} from "@archestra/shared";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+import logger from "@/logging";
+import { AgentModel, LimitModel } from "@/models";
+import LlmThroughputModel from "@/models/llm-throughput";
+import { createLimit } from "@/services/limit";
+import {
+  ApiError,
+  LimitBehaviorSchema,
+  LimitCleanupIntervalSchema,
+  LimitEntityTypeSchema,
+  LimitTypeSchema,
+  UuidIdSchema,
+} from "@/types";
+import { EmptyToolArgsSchema } from "./empty-tool-args-schema";
+import {
+  catchError,
+  defineArchestraTool,
+  defineArchestraTools,
+  errorResult,
+  structuredSuccessResult,
+} from "./helpers";
+import type { ArchestraContext } from "./types";
+
+// === Constants ===
+
+const ReasonArgSchema = z
+  .string()
+  .max(500)
+  .nullable()
+  .optional()
+  .describe(
+    "Optional note on why the limit was set, shown with custom per-user limits. Null clears it.",
+  );
+
+const LimitOutputItemSchema = z.object({
+  throughputUsage: z
+    .object({ currentUsage: z.number(), resetsAt: z.string() })
+    .optional(),
+  id: z.string().describe("The limit ID."),
+  entityType: LimitEntityTypeSchema.describe("The limited entity type."),
+  entityId: z.string().describe("The limited entity ID."),
+  limitType: LimitTypeSchema.describe("The kind of limit."),
+  limitValue: z.number().describe("The configured limit value."),
+  behavior: LimitBehaviorSchema,
+  reason: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("Why the limit was set, if a reason was given."),
+  cleanupInterval: LimitCleanupIntervalSchema.describe(
+    "How often this limit resets.",
+  ),
+  model: z
+    .array(z.string())
+    .nullable()
+    .optional()
+    .describe(
+      "Models targeted by a cost or throughput limit. Null or empty array means all models.",
+    ),
+  mcpServerName: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("MCP server name for MCP-specific limits, if any."),
+  toolName: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("Tool name for tool-specific limits, if any."),
+});
+
+const CreateLimitToolArgsSchema = z
+  .object({
+    entity_type: LimitEntityTypeSchema.describe(
+      "The type of entity to apply the limit to.",
+    ),
+    entity_id: UuidIdSchema.describe(
+      "The ID of the entity (organization, team, agent, user, virtual_key, environment, or llm_oauth_client).",
+    ),
+    limit_type: LimitTypeSchema.describe("The type of limit to apply."),
+    limit_value: z
+      .number()
+      .describe("The limit value (tokens or count depending on limit type)."),
+    model: z
+      .array(z.string())
+      .nullable()
+      .optional()
+      .describe("Array of model names. Omit for all models."),
+    cleanup_interval: LimitCleanupIntervalSchema.optional().describe(
+      "Minute recovers continuously. Other intervals reset on their rolling or calendar schedule. Omit for calendar month; legacy per-minute types imply minute.",
+    ),
+    mcp_server_name: z
+      .string()
+      .optional()
+      .describe(
+        "MCP server name. Required for mcp_server_calls and tool_calls limits.",
+      ),
+    tool_name: z
+      .string()
+      .optional()
+      .describe("Tool name. Required for tool_calls limits."),
+    behavior: LimitBehaviorSchema.optional().describe(
+      "Hard blocks exhausted requests; soft continues and records Prometheus observations. Only for token_cost, tokens and requests limits. Defaults to hard.",
+    ),
+    reason: ReasonArgSchema,
+  })
+  .strict()
+  .superRefine((args, ctx) => {
+    if (args.limit_type === "mcp_server_calls" && !args.mcp_server_name) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["mcp_server_name"],
+        message: "mcp_server_name is required for mcp_server_calls limits.",
+      });
+    }
+
+    if (
+      args.limit_type === "tool_calls" &&
+      (!args.mcp_server_name || !args.tool_name)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["tool_name"],
+        message:
+          "mcp_server_name and tool_name are required for tool_calls limits.",
+      });
+    }
+  });
+
+const registry = defineArchestraTools([
+  defineArchestraTool({
+    shortName: TOOL_CREATE_LIMIT_SHORT_NAME,
+    title: "Create Limit",
+    description:
+      "Create a spend (token_cost), requests, or tokens limit for any supported interval. Minute recovers continuously; other intervals reset on their schedule. Requests and tokens, and minute spend, support organization, team, and virtual_key scopes with cumulative caps. Tokens count only usage reported by the provider, without forecasts. Missing usage is not charged. Spend checks actual billed usage. Token and spend limits can be exceeded by requests already in flight. Legacy requests_per_minute and tokens_per_minute remain minute-only.",
+    schema: CreateLimitToolArgsSchema,
+    outputSchema: z.object({
+      limit: LimitOutputItemSchema,
+    }),
+    async handler({ args, context }) {
+      const { agent: contextAgent } = context;
+
+      logger.info(
+        { agentId: contextAgent.id, createLimitArgs: args },
+        "create_limit tool called",
+      );
+
+      try {
+        if (
+          !context.organizationId ||
+          !(await LimitModel.isEntityInOrganization(
+            args.entity_type,
+            args.entity_id,
+            context.organizationId,
+          ))
+        ) {
+          return errorResult("Limit entity not found.");
+        }
+        const limit = await createLimit({
+          entityType: args.entity_type,
+          entityId: args.entity_id,
+          limitType: args.limit_type,
+          behavior: args.behavior ?? "hard",
+          limitValue: args.limit_value,
+          model:
+            args.model && Array.isArray(args.model) && args.model.length > 0
+              ? args.model
+              : null,
+          cleanupInterval: args.cleanup_interval,
+          mcpServerName: args.mcp_server_name,
+          toolName: args.tool_name,
+          reason: args.reason?.trim() || null,
+        });
+
+        return structuredSuccessResult(
+          { limit },
+          `Successfully created limit.\n\nLimit ID: ${
+            limit.id
+          }\nEntity Type: ${limit.entityType}\nEntity ID: ${
+            limit.entityId
+          }\nLimit Type: ${limit.limitType}\nLimit Value: ${limit.limitValue}${
+            limit.cleanupInterval
+              ? `\nCleanup Interval: ${limit.cleanupInterval}`
+              : ""
+          }${limit.model ? `\nModel: ${limit.model}` : "\nModel: All models"}${
+            limit.mcpServerName ? `\nMCP Server: ${limit.mcpServerName}` : ""
+          }${limit.toolName ? `\nTool: ${limit.toolName}` : ""}`,
+        );
+      } catch (error) {
+        if (error instanceof ApiError) return errorResult(error.message);
+        return catchError(error, "creating limit");
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_GET_LIMITS_SHORT_NAME,
+    title: "Get Limits",
+    description:
+      "Retrieve all limits, optionally filtered by entity type and/or entity ID.",
+    schema: z
+      .object({
+        entity_type: LimitEntityTypeSchema.optional().describe(
+          "Optional filter by entity type.",
+        ),
+        entity_id: UuidIdSchema.optional().describe(
+          "Optional filter by entity ID.",
+        ),
+        limit_type: LimitTypeSchema.optional().describe(
+          "Optional filter by limit type.",
+        ),
+      })
+      .strict(),
+    outputSchema: z.object({
+      limits: z.array(LimitOutputItemSchema),
+    }),
+    async handler({ args, context }) {
+      const { agent: contextAgent } = context;
+
+      logger.info(
+        { agentId: contextAgent.id, getLimitsArgs: args },
+        "get_limits tool called",
+      );
+
+      try {
+        if (!context.organizationId) {
+          return errorResult("Organization context is required.");
+        }
+        const limits = await LimitModel.findAll(
+          args.entity_type,
+          args.entity_id,
+          args.limit_type,
+          context.organizationId,
+        );
+
+        if (limits.length === 0) {
+          return structuredSuccessResult(
+            { limits: [] },
+            args.entity_type || args.entity_id
+              ? `No limits found${
+                  args.entity_type
+                    ? ` for entity type: ${args.entity_type}`
+                    : ""
+                }${args.entity_id ? ` and entity ID: ${args.entity_id}` : ""}.`
+              : "No limits found.",
+          );
+        }
+
+        const formattedLimits = limits
+          .map((limit) => {
+            let result = `**Limit ID:** ${limit.id}`;
+            result += `\n  Entity Type: ${limit.entityType}`;
+            result += `\n  Entity ID: ${limit.entityId}`;
+            result += `\n  Limit Type: ${limit.limitType}`;
+            result += `\n  Limit Value: ${limit.limitValue}`;
+            if (limit.cleanupInterval)
+              result += `\n  Cleanup Interval: ${limit.cleanupInterval}`;
+            if (limit.model) result += `\n  Model: ${limit.model}`;
+            else if (limit.limitType === "token_cost")
+              result += `\n  Model: All models`;
+            if (limit.mcpServerName)
+              result += `\n  MCP Server: ${limit.mcpServerName}`;
+            if (limit.toolName) result += `\n  Tool: ${limit.toolName}`;
+            if (limit.lastCleanup)
+              result += `\n  Last Cleanup: ${limit.lastCleanup}`;
+            return result;
+          })
+          .join("\n\n");
+
+        const throughput = await LlmThroughputModel.usage(limits);
+        return structuredSuccessResult(
+          {
+            limits: limits.map((limit) => ({
+              ...limit,
+              throughputUsage: throughput.get(limit.id),
+            })),
+          },
+          `Found ${limits.length} limit(s):\n\n${formattedLimits}`,
+        );
+      } catch (error) {
+        return catchError(error, "getting limits");
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_UPDATE_LIMIT_SHORT_NAME,
+    title: "Update Limit",
+    description:
+      "Update mutable fields on an existing limit. At least one update field must be provided.",
+    schema: z
+      .object({
+        id: UuidIdSchema.describe("The ID of the limit to update."),
+        limit_value: z
+          .number()
+          .optional()
+          .describe("Optional new limit value."),
+        limit_type: LimitTypeSchema.optional().describe(
+          "Same-unit legacy conversion only: requests_per_minute to requests, or tokens_per_minute to tokens.",
+        ),
+        model: z
+          .array(z.string())
+          .nullable()
+          .optional()
+          .describe("Canonical model names; null applies to all models."),
+        cleanup_interval: LimitCleanupIntervalSchema.optional().describe(
+          "Optional new cleanup interval for this limit.",
+        ),
+        behavior: LimitBehaviorSchema.optional().describe(
+          "Hard blocks exhausted requests; soft continues and records Prometheus observations. Only for token_cost, tokens and requests limits. Defaults to hard.",
+        ),
+        reason: ReasonArgSchema,
+      })
+      .strict(),
+    outputSchema: z.object({
+      limit: LimitOutputItemSchema,
+    }),
+    async handler({ args, context }) {
+      const { agent: contextAgent } = context;
+
+      logger.info(
+        { agentId: contextAgent.id, updateLimitArgs: args },
+        "update_limit tool called",
+      );
+
+      try {
+        const updateData: Record<string, unknown> = {};
+        if (args.limit_type !== undefined)
+          updateData.limitType = args.limit_type;
+        if (args.model !== undefined) updateData.model = args.model;
+        if (args.limit_value !== undefined) {
+          updateData.limitValue = args.limit_value;
+        }
+        if (args.cleanup_interval !== undefined) {
+          updateData.cleanupInterval = args.cleanup_interval;
+        }
+        if (args.behavior !== undefined) updateData.behavior = args.behavior;
+        if (args.reason !== undefined) {
+          updateData.reason = args.reason?.trim() || null;
+        }
+
+        if (Object.keys(updateData).length === 0) {
+          return errorResult("No fields provided to update.");
+        }
+        if (
+          !context.organizationId ||
+          !(await LimitModel.findByIdInOrganization(
+            args.id,
+            context.organizationId,
+          ))
+        )
+          return errorResult("Limit not found.");
+
+        const limit = await LimitModel.patch(args.id, updateData);
+
+        if (!limit) {
+          return errorResult(`Limit with ID ${args.id} not found.`);
+        }
+
+        return structuredSuccessResult(
+          { limit },
+          `Successfully updated limit.\n\nLimit ID: ${limit.id}\nEntity Type: ${limit.entityType}\nEntity ID: ${limit.entityId}\nLimit Type: ${limit.limitType}\nLimit Value: ${limit.limitValue}${
+            limit.cleanupInterval
+              ? `\nCleanup Interval: ${limit.cleanupInterval}`
+              : ""
+          }`,
+        );
+      } catch (error) {
+        return catchError(error, "updating limit");
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_DELETE_LIMIT_SHORT_NAME,
+    title: "Delete Limit",
+    description: "Delete an existing limit by ID.",
+    schema: z
+      .object({
+        id: UuidIdSchema.describe("The ID of the limit to delete."),
+      })
+      .strict(),
+    outputSchema: z.object({
+      success: z.literal(true),
+      id: z.string(),
+    }),
+    async handler({ args, context }) {
+      const { agent: contextAgent } = context;
+
+      logger.info(
+        { agentId: contextAgent.id, deleteLimitArgs: args },
+        "delete_limit tool called",
+      );
+
+      try {
+        if (
+          !context.organizationId ||
+          !(await LimitModel.findByIdInOrganization(
+            args.id,
+            context.organizationId,
+          ))
+        )
+          return errorResult("Limit not found.");
+        const deleted = await LimitModel.delete(args.id);
+
+        if (!deleted) {
+          return errorResult(`Limit with ID ${args.id} not found.`);
+        }
+
+        return structuredSuccessResult(
+          { success: true, id: args.id },
+          `Successfully deleted limit with ID: ${args.id}`,
+        );
+      } catch (error) {
+        return catchError(error, "deleting limit");
+      }
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_GET_AGENT_TOKEN_USAGE_SHORT_NAME,
+    title: "Get Agent Token Usage",
+    description:
+      "Get the total token usage (input and output) for a specific agent. If no id is provided, returns usage for the current agent.",
+    schema: z
+      .object({
+        id: UuidIdSchema.optional().describe(
+          "Optional agent ID. Defaults to the current agent.",
+        ),
+      })
+      .strict(),
+    outputSchema: z.object({
+      id: z.string(),
+      totalInputTokens: z.number(),
+      totalOutputTokens: z.number(),
+      totalTokens: z.number(),
+    }),
+    async handler({ args, context }) {
+      return handleGetTokenUsage({ args, context });
+    },
+  }),
+  defineArchestraTool({
+    shortName: TOOL_GET_LLM_PROXY_TOKEN_USAGE_SHORT_NAME,
+    title: "Get LLM Proxy Token Usage",
+    description:
+      "Get the total token usage (input and output) for the LLM Proxy.",
+    schema: EmptyToolArgsSchema,
+    outputSchema: z.object({
+      id: z.string(),
+      totalInputTokens: z.number(),
+      totalOutputTokens: z.number(),
+      totalTokens: z.number(),
+    }),
+    async handler({ context }) {
+      const { organizationId } = context;
+
+      logger.info(
+        { agentId: context.agent.id },
+        "get_llm_proxy_token_usage tool called",
+      );
+
+      if (!organizationId) {
+        return errorResult("organization context not available.");
+      }
+
+      try {
+        const llmProxy = await AgentModel.getOrgLlmProxy(organizationId);
+        const usage = await LimitModel.getAgentTokenUsage(llmProxy.id);
+
+        return structuredSuccessResult(
+          {
+            id: llmProxy.id,
+            totalInputTokens: usage.totalInputTokens,
+            totalOutputTokens: usage.totalOutputTokens,
+            totalTokens: usage.totalTokens,
+          },
+          `Token usage for the LLM Proxy:\n\nTotal Input Tokens: ${usage.totalInputTokens.toLocaleString()}\nTotal Output Tokens: ${usage.totalOutputTokens.toLocaleString()}\nTotal Tokens: ${usage.totalTokens.toLocaleString()}`,
+        );
+      } catch (error) {
+        return catchError(error, "getting LLM proxy token usage");
+      }
+    },
+  }),
+] as const);
+
+export const toolEntries = registry.toolEntries;
+
+// === Exports ===
+
+export const tools = registry.tools;
+
+async function handleGetTokenUsage(params: {
+  args: { id?: string };
+  context: ArchestraContext;
+}): Promise<CallToolResult> {
+  const { args, context } = params;
+  const { agent: contextAgent } = context;
+
+  logger.info(
+    { agentId: contextAgent.id, getTokenUsageArgs: args },
+    "get_agent_token_usage tool called",
+  );
+
+  try {
+    const targetId = args.id || contextAgent.id;
+    const usage = await LimitModel.getAgentTokenUsage(targetId);
+
+    return structuredSuccessResult(
+      {
+        id: targetId,
+        totalInputTokens: usage.totalInputTokens,
+        totalOutputTokens: usage.totalOutputTokens,
+        totalTokens: usage.totalTokens,
+      },
+      `Token usage for agent ${targetId}:\n\nTotal Input Tokens: ${usage.totalInputTokens.toLocaleString()}\nTotal Output Tokens: ${usage.totalOutputTokens.toLocaleString()}\nTotal Tokens: ${usage.totalTokens.toLocaleString()}`,
+    );
+  } catch (error) {
+    return catchError(error, "getting agent token usage");
+  }
+}

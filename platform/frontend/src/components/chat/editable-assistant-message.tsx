@@ -1,0 +1,182 @@
+"use client";
+
+import {
+  type ChatMessageFeedback,
+  foldCitationSources,
+} from "@archestra/shared";
+import { Info } from "lucide-react";
+import { memo, useMemo } from "react";
+import { Message, MessageContent } from "@/components/ai-elements/message";
+import { Response } from "@/components/ai-elements/response";
+import { stripAssistantProtocolMarkers } from "@/components/chat/chat-messages.utils";
+import {
+  EditableMessageEditor,
+  useMessageEditor,
+} from "@/components/chat/editable-message-editor";
+import type { KnowledgeGraphCitationsProps } from "@/components/chat/knowledge-graph-citations";
+import { KnowledgeGraphCitations } from "@/components/chat/knowledge-graph-citations";
+import { MessageActions } from "@/components/chat/message-actions";
+import {
+  omitRepeatedPolicyDiffs,
+  type PolicyDiffReference,
+} from "./policy-diff-deduplication";
+
+interface EditableAssistantMessageProps {
+  messageId: string;
+  partIndex: number;
+  partKey: string;
+  text: string;
+  isEditing: boolean;
+  showActions: boolean;
+  citationParts?: KnowledgeGraphCitationsProps["parts"];
+  policyDiffReferences?: readonly PolicyDiffReference[];
+  editDisabled?: boolean;
+  isStreaming?: boolean;
+  /** Omit for a read-only transcript: hides edit. */
+  onStartEdit?: (partKey: string) => void;
+  onCancelEdit: () => void;
+  onSave: (
+    messageId: string,
+    partIndex: number,
+    newText: string,
+  ) => Promise<void>;
+  feedback?: ChatMessageFeedback | null;
+  onFeedbackChange?: (
+    messageId: string,
+    feedback: ChatMessageFeedback | null,
+  ) => void;
+  feedbackDisabled?: boolean;
+}
+
+// Memoized so a streamed chunk, which re-renders the whole transcript, only
+// re-renders the bubble whose text changed. Callers pass stable callbacks
+// (see ChatMessages) so the memo holds.
+export const EditableAssistantMessage = memo(function EditableAssistantMessage({
+  messageId,
+  partIndex,
+  partKey,
+  text,
+  isEditing,
+  showActions,
+  citationParts,
+  policyDiffReferences,
+  editDisabled = false,
+  isStreaming = false,
+  onStartEdit,
+  onCancelEdit,
+  onSave,
+  feedback = null,
+  onFeedbackChange,
+  feedbackDisabled = false,
+}: EditableAssistantMessageProps) {
+  const visibleText = stripAssistantProtocolMarkers(text);
+  const editor = useMessageEditor({
+    text: visibleText,
+    isEditing,
+    onSave: (newText) => onSave(messageId, partIndex, newText),
+    onCancelEdit,
+  });
+
+  // The machine-oriented Sources block (verbatim quotes + chunk refs, written
+  // for the quote verifier) folds out of the visible answer once citations
+  // render: markers become superscripts and the quotes move behind the chips.
+  // Copying and editing keep the full original text.
+  const folded = useMemo(
+    () => (citationParts ? foldCitationSources(visibleText) : null),
+    [citationParts, visibleText],
+  );
+  const foldedText =
+    folded && folded.entries.length > 0 ? folded.displayText : visibleText;
+  const displayText = useMemo(
+    () => omitRepeatedPolicyDiffs(foldedText, policyDiffReferences),
+    [foldedText, policyDiffReferences],
+  );
+
+  const handleStartEdit = () => {
+    onStartEdit?.(partKey);
+  };
+
+  if (isEditing) {
+    return (
+      <EditableMessageEditor
+        from="assistant"
+        editor={editor}
+        outerClassName="relative pt-0"
+        contentClassName="max-w-[70%] min-w-[50%] px-3 py-0 pt-3 ring-2 !bg-secondary/50 ring-primary/50"
+        textareaClassName="max-h-[240px] resize-none border-0 focus-visible:ring-0 shadow-none text-sm !bg-secondary"
+        placeholder="Edit this response..."
+        saveLabel="Save"
+        banner={
+          <div className="flex gap-2 items-start">
+            <Info className="h-3 w-3 text-muted-foreground shrink-0 mt-0.5" />
+            <span className="text-xs text-muted-foreground">
+              Edit to correct errors or refine the context. This won't
+              regenerate the conversation.
+            </span>
+          </div>
+        }
+      />
+    );
+  }
+
+  const actions = (
+    <MessageActions
+      textToCopy={visibleText}
+      onEditClick={onStartEdit && handleStartEdit}
+      editDisabled={editDisabled}
+      feedback={feedback}
+      onFeedbackChange={
+        onFeedbackChange &&
+        ((nextFeedback) => onFeedbackChange(messageId, nextFeedback))
+      }
+      feedbackDisabled={feedbackDisabled}
+    />
+  );
+
+  if (displayText !== foldedText && !displayText.trim() && !citationParts) {
+    // The preview replaces the content, but the original message still needs
+    // copy, edit and feedback actions. Keep them visible without an empty bubble.
+    return showActions ? (
+      <Message from="assistant" className="pl-2">
+        {actions}
+      </Message>
+    ) : null;
+  }
+
+  return (
+    <Message from="assistant" className="group/message">
+      {/* The actions are absolutely positioned outside the flow: mounting
+          them when streaming ends must not steal width from the bubble,
+          which would make the finished text visibly rewrap. When the chat
+          column itself is wide enough they hang off the bubble's right edge;
+          otherwise they overlay just under the bubble. A container query is
+          important here because the right panel can narrow the chat without
+          changing the viewport breakpoint. Reveal is hover on desktop and
+          the tap-synthesized hover on touch; pointer-events gating keeps the
+          hidden panel from swallowing taps meant for the content. The
+          positioning wrapper owns the visual gap as padding, creating a hover
+          bridge between the message and the buttons. */}
+      <div className="relative max-w-[80%]">
+        <MessageContent className="max-w-none">
+          <Response
+            isStreaming={isStreaming}
+            className="group-[.is-assistant]:[&>:first-child]:mt-0 group-[.is-assistant]:[&>:last-child]:mb-0"
+          >
+            {displayText}
+          </Response>
+          {citationParts && (
+            <KnowledgeGraphCitations
+              parts={citationParts}
+              citedQuotes={folded?.entries}
+            />
+          )}
+        </MessageContent>
+        {showActions && (
+          <div className="pointer-events-none absolute top-full left-0 z-10 pt-1 opacity-0 transition-opacity group-hover/message:pointer-events-auto group-hover/message:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100 @2xl/chat:top-1/2 @2xl/chat:left-full @2xl/chat:pt-0 @2xl/chat:pl-2 @2xl/chat:-translate-y-1/2">
+            {actions}
+          </div>
+        )}
+      </div>
+    </Message>
+  );
+});

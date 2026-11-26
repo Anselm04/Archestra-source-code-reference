@@ -1,0 +1,147 @@
+---
+title: Access Control
+description: Share resources and assign organization roles
+order: 2
+---
+
+<!-- Check docs writer skill at .agents/skills/archestra-docs-writer/SKILL.md -->
+
+Give people **Can use** on an agent to let them run it without changing it. Give them **Can edit** when they need to change it.
+
+<span id="actions-and-scopes"></span>
+
+<span id="agent-access-vs-mcp-server-access"></span>
+
+<span id="api-example"></span>
+
+<span id="available-permissions"></span>
+
+<span id="chat-access-and-optional-ui-controls"></span>
+
+<span id="environments"></span>
+
+<span id="find-resources-by-access"></span>
+
+<span id="granular-access-control"></span>
+
+<span id="llm-api-permissions"></span>
+
+<span id="log-visibility"></span>
+
+<span id="mcp-registry-and-installation-records"></span>
+
+<span id="models"></span>
+
+<span id="oauth-clients"></span>
+
+<span id="resource-specific-rules"></span>
+
+<span id="saved-credentials"></span>
+
+<span id="scoped-resources"></span>
+
+<span id="service-account-creators"></span>
+
+<span id="sharing-level"></span>
+
+<span id="team-access"></span>
+
+<span id="visibility-scoped-credentials"></span>
+
+## Share a Resource
+
+Resource sharing is an [Enterprise feature](/pricing).
+
+1. Open the item's **Permissions** control.
+2. Add a person, team, role, service account, OAuth client (on Knowledge Bases, knowledge connectors, and files), or **Everyone in the organization**.
+3. Choose their level, then save.
+
+| Level | Allows |
+| --- | --- |
+| Can read | View the item. |
+| Can use | Run or invoke it. |
+| Can edit | Edit its configuration. |
+| Full access | Delete it and manage access. |
+
+You need **Manage access** on the item to share it. To share every current and future item of a kind, use **Permissions** beside **Create** or **Add** on its list; this requires [`accessPolicies:update`](/docs/reference/permissions#accessPolicies:update).
+
+Sharing with everyone or a role also requires that permission or **Full access** on every item of that kind. You cannot grant access you do not hold.
+
+Sharing an agent does not share its MCP servers. Share the servers separately so the person can use their tools. MCP registry entries have an extra **Full access + deploy** level for changing deployments and secret sources; see [server permissions](/docs/mcp/servers). Agent Runtimes have a **Can use and configure** level instead of **Can edit**; see [who can use each runtime](/docs/agents/runtime#choose-who-can-use-each-runtime).
+
+### Share Across Teams
+
+Owners and anyone with **Manage access** on an item can share it with any team in the same organization, including teams they do not belong to. Under **Who can use it**, select **Add access**, choose a team and its access level, then save. No additional role permission is required.
+
+## Predefined Roles
+
+Roles control organization actions, such as creating resources and managing users. Resource grants determine which individual items a person can use or change.
+
+**Member** is the default. Choose a broader role only when the person needs it:
+
+| Role | Choose it for |
+| --- | --- |
+| Member | Using Chat and creating agents, apps, skills, and gateways. |
+| Editor | Also managing providers, models, budgets, environments, Knowledge, and Guardrails. |
+| Platform Admin | Administering the platform without viewing everyone's logs or impersonating users. |
+| Admin | Full organization administration, including everyone's logs and user impersonation. |
+
+See the [exact permission matrix](/docs/reference/permissions#predefined-roles). To change a member's roles, open **Settings → Users**, choose **Change role** on their row, and save with **Update Roles**.
+
+## Compose Access from Granular Roles
+
+Give someone exactly what their job needs without writing a custom role: assign a few granular roles, such as **Agent Writer** and **Log Reader**, and their permissions add up. Granular roles are built in, grouped by area, and cannot be edited.
+
+1. Open the role picker where roles are assigned: **Change role** on a row in **Settings → Users**, **Inherited Roles** on a team, or **Roles** on a service account.
+2. Pick an area on the left, such as **Agents** or **MCP**, and check the roles you need on the right. The checkbox beside an area takes all of its roles. The chevron at the end of a role shows what it grants.
+3. Each choice applies as you make it. Close the picker and save.
+
+What to know:
+
+- Each granular role grants a few permissions, such as [`agent:read`](/docs/reference/permissions#agent:read). **View built-in roles** on **Settings → Roles** lists every built-in role and what it grants, and the [permissions reference](/docs/reference/permissions#granular-roles) has the full table.
+- A granular role opens a page, not every item on it. Which agents or servers someone sees still depends on what is shared with them.
+- A new custom role can start from one of the four preset roles or from another custom role, not from a granular role.
+
+<span id="custom-roles"></span>
+
+<span id="multiple-roles-and-team-grants"></span>
+
+<span id="no-privilege-escalation"></span>
+
+## Create a Custom Role
+
+1. With [`ac:create`](/docs/reference/permissions#ac:create), open **Settings → Roles** and create a role.
+2. Select only the [permissions](/docs/reference/permissions#available-permissions) the job needs.
+3. Assign it to a member, team, or service account.
+
+An account gets the permissions of every role assigned to it directly, plus the roles it inherits from its teams and their parent teams. Set the roles a team passes down under **Inherited Roles** when you edit the team.
+
+<span id="team-roles"></span>
+
+## Team Member and Admin Roles
+
+Within each team, a person is a **member** or an **admin**. Members receive the team's grants but cannot manage its limits just by being members. Admins manage only that team's members and settings.
+
+Team admins can manage [child-team allocations and member key caps](/docs/llm-proxy/cost-controls/limits#team-limits-and-spend) across their team hierarchy, and see [those teams' costs](/docs/insights/costs#view-your-teams-costs). Their own team's ceiling stays protected unless they also administer a parent team.
+
+<span id="delegation-and-concurrent-edits"></span>
+
+<span id="inheritance-and-revocation"></span>
+
+<span id="team-hierarchies"></span>
+
+## Remove Access
+
+Open the item's permissions and remove the recipient. Check inherited grants too: removing a direct grant leaves access through teams, roles, or the organization intact. Team grants reach descendant teams, but not parents or siblings.
+
+Keep at least one recipient with **Manage access**. If a role or team change would delegate access you cannot grant, the form identifies the affected resources and missing permissions.
+
+<span id="ownership"></span>
+
+## Transfer Ownership
+
+Choose **Make owner** on another person's row in the permissions editor. You need edit and full access on the item.
+
+The new owner receives **Full access**. The previous owner keeps their grant until you remove it separately. An owner's grant cannot be removed while they still own the resource.
+
+For request and audit-log access, see [Logs](/docs/insights/logs#who-can-read-them). For automated permission changes, use the [Permissions API](/docs/reference/api/organization).

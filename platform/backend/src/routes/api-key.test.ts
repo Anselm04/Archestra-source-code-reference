@@ -1,0 +1,387 @@
+import { ARCHESTRA_TOKEN_PREFIX } from "@archestra/shared";
+import { vi } from "vitest";
+import { auth } from "@/auth/better-auth";
+import db, { schema } from "@/database";
+import type { FastifyInstanceWithZod } from "@/fastify-instance";
+import { createFastifyInstance } from "@/fastify-instance";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+
+vi.mock("@/auth/better-auth");
+
+const createApiKeyMock = vi.mocked(auth.api.createApiKey);
+const deleteApiKeyMock = vi.mocked(auth.api.deleteApiKey);
+
+describe("api key routes", () => {
+  let app: FastifyInstanceWithZod;
+  let userId: string;
+  let user: User;
+  let otherUserId: string;
+
+  beforeEach(async ({ makeUser }) => {
+    vi.clearAllMocks();
+    user = await makeUser();
+    const otherUser = await makeUser();
+    userId = user.id;
+    otherUserId = otherUser.id;
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: unknown }).user = user;
+    });
+
+    const { default: apiKeyRoutes } = await import("./api-key");
+    await app.register(apiKeyRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("returns a generic create error message instead of exposing upstream details", async () => {
+    createApiKeyMock.mockRejectedValue(
+      Object.assign(new Error("better auth internals leaked"), {
+        statusCode: 400,
+      }),
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      payload: {
+        name: "CLI Key",
+        expiresIn: 30 * 24 * 60 * 60,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: {
+        message: "Failed to create API key",
+        type: "api_validation_error",
+      },
+    });
+  });
+
+  test("surfaces known better-auth validation errors on create", async () => {
+    createApiKeyMock.mockRejectedValue(
+      Object.assign(new Error("The expiresIn is smaller"), {
+        statusCode: 400,
+        body: {
+          code: "EXPIRES_IN_IS_TOO_SMALL",
+          message:
+            "The expiresIn is smaller than the predefined minimum value.",
+        },
+      }),
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      payload: {
+        name: "CLI Key",
+        expiresIn: 30 * 24 * 60 * 60,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: {
+        message: "Expiration must be at least 1 day from now",
+        type: "api_validation_error",
+      },
+    });
+  });
+
+  test("rejects an expiration under 1 day before calling better-auth", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      payload: {
+        name: "CLI Key",
+        expiresIn: 3600,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain(
+      "Expiration must be at least 1 day from now",
+    );
+    expect(createApiKeyMock).not.toHaveBeenCalled();
+  });
+
+  test("rejects an expiration over 365 days before calling better-auth", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      payload: {
+        name: "CLI Key",
+        expiresIn: 366 * 24 * 60 * 60,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain(
+      "Expiration cannot be more than 365 days from now",
+    );
+    expect(createApiKeyMock).not.toHaveBeenCalled();
+  });
+
+  test("rejects a name over 32 characters before calling better-auth", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      payload: {
+        name: "a".repeat(33),
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain(
+      "Name must be at most 32 characters",
+    );
+    expect(createApiKeyMock).not.toHaveBeenCalled();
+  });
+
+  test("lists the authenticated user's API keys only", async () => {
+    await db.insert(schema.apikeysTable).values([
+      {
+        id: "key-1",
+        configId: "default",
+        name: "CLI Key",
+        key: "hashed-key-1",
+        referenceId: userId,
+        enabled: true,
+        createdAt: new Date("2026-03-15T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-15T00:00:00.000Z"),
+      },
+      {
+        id: "key-2",
+        configId: "default",
+        name: "Docs Key",
+        key: "hashed-key-2",
+        referenceId: userId,
+        enabled: true,
+        createdAt: new Date("2026-03-14T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-14T00:00:00.000Z"),
+      },
+      {
+        id: "key-3",
+        configId: "default",
+        name: "Other User Key",
+        key: "hashed-key-3",
+        referenceId: otherUserId,
+        enabled: true,
+        createdAt: new Date("2026-03-13T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-13T00:00:00.000Z"),
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/api-keys",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject([
+      { id: "key-1", name: "CLI Key" },
+      { id: "key-2", name: "Docs Key" },
+    ]);
+  });
+
+  test("gets one API key by id for the authenticated user", async () => {
+    await db.insert(schema.apikeysTable).values({
+      id: "key-1",
+      configId: "default",
+      name: "CLI Key",
+      key: "hashed-key-1",
+      referenceId: userId,
+      enabled: true,
+      createdAt: new Date("2026-03-15T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-15T00:00:00.000Z"),
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/api-keys/key-1",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: "key-1",
+      name: "CLI Key",
+      userId,
+    });
+  });
+
+  test("returns 404 when an API key does not belong to the authenticated user", async () => {
+    await db.insert(schema.apikeysTable).values({
+      id: "key-1",
+      configId: "default",
+      name: "Other User Key",
+      key: "hashed-key-1",
+      referenceId: otherUserId,
+      enabled: true,
+      createdAt: new Date("2026-03-15T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-15T00:00:00.000Z"),
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/api-keys/key-1",
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({
+      error: {
+        message: "API key not found",
+        type: "api_not_found_error",
+      },
+    });
+  });
+
+  test("normalizes a successful create response", async () => {
+    const tokenStart = `${ARCHESTRA_TOKEN_PREFIX}abcd`;
+    const tokenValue = `${ARCHESTRA_TOKEN_PREFIX}abcd1234`;
+
+    createApiKeyMock.mockResolvedValue({
+      id: "key-1",
+      configId: "default",
+      name: "CLI Key",
+      start: tokenStart,
+      prefix: ARCHESTRA_TOKEN_PREFIX,
+      referenceId: userId,
+      enabled: true,
+      refillInterval: null,
+      refillAmount: null,
+      lastRefillAt: null,
+      rateLimitEnabled: false,
+      rateLimitTimeWindow: null,
+      rateLimitMax: null,
+      requestCount: 0,
+      remaining: null,
+      lastRequest: null,
+      expiresAt: new Date("2026-03-15T01:00:00.000Z"),
+      createdAt: new Date("2026-03-15T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-15T00:00:00.000Z"),
+      metadata: { scope: "cli" },
+      permissions: { apiKey: ["read"] },
+      key: tokenValue,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      payload: {
+        name: "CLI Key",
+        expiresIn: 86400,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: "key-1",
+      name: "CLI Key",
+      start: tokenStart,
+      prefix: ARCHESTRA_TOKEN_PREFIX,
+      key: tokenValue,
+      metadata: { scope: "cli" },
+      permissions: { apiKey: ["read"] },
+    });
+  });
+
+  test("omits a null name before calling better-auth createApiKey", async () => {
+    const tokenStart = `${ARCHESTRA_TOKEN_PREFIX}abcd`;
+    const tokenValue = `${ARCHESTRA_TOKEN_PREFIX}abcd1234`;
+
+    createApiKeyMock.mockResolvedValue({
+      id: "key-1",
+      configId: "default",
+      name: null,
+      start: tokenStart,
+      prefix: ARCHESTRA_TOKEN_PREFIX,
+      referenceId: userId,
+      enabled: true,
+      refillInterval: null,
+      refillAmount: null,
+      lastRefillAt: null,
+      rateLimitEnabled: false,
+      rateLimitTimeWindow: null,
+      rateLimitMax: null,
+      requestCount: 0,
+      remaining: null,
+      lastRequest: null,
+      expiresAt: null,
+      createdAt: new Date("2026-03-15T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-15T00:00:00.000Z"),
+      metadata: null,
+      permissions: null,
+      key: tokenValue,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/api-keys",
+      payload: {
+        name: null,
+        expiresIn: 86400,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(createApiKeyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: {
+          expiresIn: 86400,
+        },
+      }),
+    );
+  });
+
+  test("maps upstream delete 404 errors to a safe API key message", async () => {
+    await db.insert(schema.apikeysTable).values({
+      id: "key-1",
+      configId: "default",
+      name: "Existing key",
+      key: "hashed-key-1",
+      referenceId: userId,
+      enabled: true,
+      createdAt: new Date("2026-03-15T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-15T00:00:00.000Z"),
+    });
+    deleteApiKeyMock.mockRejectedValue(
+      Object.assign(new Error("missing key in auth store"), {
+        statusCode: 404,
+      }),
+    );
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: "/api/api-keys/key-1",
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({
+      error: {
+        message: "API key not found",
+        type: "api_not_found_error",
+      },
+    });
+  });
+
+  test("returns 404 before calling upstream delete when the API key is missing", async () => {
+    const response = await app.inject({
+      method: "DELETE",
+      url: "/api/api-keys/missing-key",
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(deleteApiKeyMock).not.toHaveBeenCalled();
+    expect(response.json()).toEqual({
+      error: {
+        message: "API key not found",
+        type: "api_not_found_error",
+      },
+    });
+  });
+});

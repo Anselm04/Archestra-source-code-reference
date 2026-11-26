@@ -1,0 +1,182 @@
+"use client";
+
+import type { McpDeploymentStatusEntry } from "@archestra/shared";
+import { FileText } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
+import { DesktopMcpWaitingStatus } from "./desktop-mcp-install-status";
+import type { CatalogServerType } from "./mcp-server-type";
+
+type InstallationStatus =
+  | "idle"
+  | "pending"
+  | "discovering-tools"
+  | "success"
+  | null;
+
+interface InstallationProgressProps {
+  status: InstallationStatus;
+  serverId?: string;
+  deploymentStatuses?: Record<string, McpDeploymentStatusEntry>;
+  onMoreDetails?: () => void;
+  /**
+   * A remote MCP server has no deployment; its first phase is connecting. A
+   * desktop MCP server's first phase is waiting for the user's computer.
+   */
+  serverType?: CatalogServerType;
+}
+
+const PHASES = {
+  pending: {
+    progress: 33,
+    description: "Starting the deployment",
+  },
+  "discovering-tools": {
+    progress: 66,
+    description: "Discovering tools",
+  },
+  success: {
+    progress: 100,
+    description: "Installation complete",
+  },
+} as const;
+
+/**
+ * Hook that returns animated dots that cycle through ".", "..", "..."
+ */
+function useAnimatedDots(isActive: boolean) {
+  const [dotCount, setDotCount] = useState(1);
+
+  useEffect(() => {
+    if (!isActive) {
+      setDotCount(1);
+      return;
+    }
+
+    const interval = setInterval(() => {
+      setDotCount((prev) => (prev % 3) + 1);
+    }, 400);
+
+    return () => clearInterval(interval);
+  }, [isActive]);
+
+  return ".".repeat(dotCount);
+}
+
+/**
+ * Hook that returns animated progress value that smoothly increments
+ */
+function useAnimatedProgress(targetProgress: number, isActive: boolean) {
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    if (!isActive) {
+      setProgress(0);
+      return;
+    }
+
+    // Immediately set to target if we're at a specific phase
+    if (targetProgress > 0) {
+      setProgress(targetProgress);
+    }
+
+    // Slowly increment progress within the current phase range
+    // This gives the user feedback that something is happening
+    const interval = setInterval(() => {
+      setProgress((prev) => {
+        // Don't exceed the target progress
+        if (prev >= targetProgress) return prev;
+        // Slowly increment (0.5% per interval)
+        return Math.min(prev + 0.5, targetProgress);
+      });
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [targetProgress, isActive]);
+
+  return progress;
+}
+
+export function InstallationProgress({
+  status,
+  serverId,
+  deploymentStatuses = {},
+  onMoreDetails,
+  serverType,
+}: InstallationProgressProps) {
+  const phaseInfo = useMemo(() => {
+    if (!status || status === "idle") return null;
+    const phase = PHASES[status as keyof typeof PHASES] ?? null;
+    if (phase && status === "pending" && serverType === "remote") {
+      return { ...phase, description: "Connecting" };
+    }
+    return phase;
+  }, [status, serverType]);
+
+  // Check if the K8s deployment has failed while installation is still "pending"
+  const deploymentState = serverId ? deploymentStatuses[serverId] : null;
+  const isDeploymentFailed = deploymentState?.state === "failed";
+
+  const isActive =
+    (status === "pending" || status === "discovering-tools") &&
+    !isDeploymentFailed;
+  const targetProgress = phaseInfo?.progress ?? 0;
+  const animatedProgress = useAnimatedProgress(targetProgress, isActive);
+  const animatedDots = useAnimatedDots(isActive);
+
+  // Build description with animated dots for active phases
+  const description = useMemo(() => {
+    if (isDeploymentFailed) {
+      return `Deployment failed${deploymentState?.error ? `: ${deploymentState.error}` : ""}`;
+    }
+    if (!phaseInfo) return "";
+    if (isActive) {
+      return `${phaseInfo.description}${animatedDots}`;
+    }
+    return phaseInfo.description;
+  }, [phaseInfo, isActive, animatedDots, isDeploymentFailed, deploymentState]);
+
+  if (!status || status === "idle" || status === "success") {
+    return null;
+  }
+
+  // It can wait for days, until the MCP bridge on the user's computer runs
+  // the server: no progress to animate, and the Devices tab says why.
+  if (serverType === "desktop_mcp" && status === "pending") {
+    return (
+      <DesktopMcpWaitingStatus className="text-xs text-muted-foreground" />
+    );
+  }
+
+  return (
+    <div className="w-full space-y-2">
+      <Progress
+        value={isDeploymentFailed ? 100 : animatedProgress}
+        className={isDeploymentFailed ? "[&>div]:bg-destructive" : ""}
+      />
+      <div className="flex items-center justify-between text-xs">
+        <span
+          className={
+            isDeploymentFailed
+              ? "text-destructive truncate"
+              : "text-muted-foreground"
+          }
+        >
+          {description}
+        </span>
+        {serverId && onMoreDetails && (
+          <Button
+            variant="link"
+            size="sm"
+            className="h-auto p-0 text-xs"
+            onClick={onMoreDetails}
+          >
+            <FileText className="h-3 w-3 mr-1" />
+            More details
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}

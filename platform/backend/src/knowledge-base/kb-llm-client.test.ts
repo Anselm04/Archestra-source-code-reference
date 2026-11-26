@@ -1,0 +1,764 @@
+import { vi } from "vitest";
+
+const mockGetSecretValue = vi.hoisted(() => vi.fn());
+vi.mock("@/secrets-manager", () => ({
+  getSecretValueForLlmProviderApiKey: mockGetSecretValue,
+}));
+
+const mockCreateDirectLLMModel = vi.hoisted(() =>
+  vi.fn().mockReturnValue({ id: "mock-llm-model" }),
+);
+vi.mock("@/clients/llm-client", () => ({
+  createDirectLLMModel: mockCreateDirectLLMModel,
+}));
+
+import config from "@/config";
+import db, { schema } from "@/database";
+import {
+  LlmProviderApiKeyModel,
+  ModelModel,
+  OrganizationModel,
+} from "@/models";
+import { afterEach, describe, expect, test } from "@/test";
+import {
+  EmbeddingConfigUnresolvableError,
+  OcrConfigUnresolvableError,
+  RerankerConfigUnresolvableError,
+} from "./errors";
+import {
+  getDefaultOrgEmbeddingConfig,
+  resolveApiKeyFromChatApiKey,
+  resolveContextualRetrievalConfig,
+  resolveEmbeddingConfig,
+  resolveOcrConfig,
+  resolveRerankerConfig,
+} from "./kb-llm-client";
+
+async function createSecret(): Promise<string> {
+  const [secret] = await db
+    .insert(schema.secretsTable)
+    .values({ secret: { access_token: "test-secret" } })
+    .returning();
+  return secret.id;
+}
+
+describe("resolveEmbeddingConfig", () => {
+  const originalOllamaBaseUrl = config.llm.ollama.baseUrl;
+  afterEach(() => {
+    config.llm.ollama.baseUrl = originalOllamaBaseUrl;
+  });
+
+  test("uses inferenceBaseUrl when resolving a chat API key", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Azure Key",
+      provider: "azure",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+      baseUrl: "https://discovery.example.com/openai",
+      inferenceBaseUrl: "https://runtime.example.com/openai",
+    });
+
+    mockGetSecretValue.mockResolvedValueOnce("azure-key");
+
+    const result = await resolveApiKeyFromChatApiKey(chatApiKey.id);
+
+    expect(result?.apiKey).toBe("azure-key");
+    expect(result?.baseUrl).toBe("https://runtime.example.com/openai");
+  });
+
+  test("falls back to the configured provider base URL when the key has none", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+
+    // A self-hosted Ollama key created with a blank Base URL stores NULL for
+    // both URL columns and needs no secret.
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Ollama Key",
+      provider: "ollama",
+      secretId: null,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    // The deployment points Ollama at an in-cluster host, not localhost.
+    config.llm.ollama.baseUrl = "http://ollama:11434/v1";
+
+    const result = await resolveApiKeyFromChatApiKey(chatApiKey.id);
+
+    // Must use the configured host (same source chat/sync use), not the
+    // hardcoded localhost default that previously broke embeddings.
+    expect(result?.baseUrl).toBe("http://ollama:11434/v1");
+  });
+
+  test("returns config when org has embedding key and model configured", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "OpenAI Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "text-embedding-3-small",
+    });
+
+    mockGetSecretValue.mockResolvedValueOnce("sk-test-key-123");
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result).not.toBeNull();
+    expect(result?.model).toBe("text-embedding-3-small");
+    expect(result?.dimensions).toBeGreaterThan(0);
+  });
+
+  test("returns null when org has no embedding key configured", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result).toBeNull();
+  });
+
+  test("returns null when org has key but no embedding model", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "OpenAI Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+    });
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result).toBeNull();
+  });
+
+  test("returns config with a null key when chat API key has no secretId", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "OpenAI Key (no secret)",
+      provider: "openai",
+      secretId: null,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "text-embedding-3-small",
+    });
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result).not.toBeNull();
+    expect(result?.model).toBe("text-embedding-3-small");
+    expect(result?.dimensions).toBe(1536);
+    // Keyless configs resolve to a null key (a placeholder is synthesized at the
+    // client boundary for SDKs that require one); Bedrock IAM relies on this to
+    // pick IAM auth rather than a bearer placeholder.
+    expect(result?.apiKey).toBeNull();
+  });
+
+  test("throws when a configured secret cannot be resolved", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "OpenAI Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "text-embedding-3-small",
+    });
+
+    mockGetSecretValue.mockResolvedValueOnce(null);
+
+    // Configured but unresolvable is a diagnosable fault, not "not configured".
+    await expect(resolveEmbeddingConfig(org.id)).rejects.toBeInstanceOf(
+      EmbeddingConfigUnresolvableError,
+    );
+  });
+
+  test("returns null for non-existent organization", async () => {
+    const result = await resolveEmbeddingConfig(
+      "00000000-0000-0000-0000-000000000000",
+    );
+
+    expect(result).toBeNull();
+  });
+
+  test("clamps image off a text-only Bedrock embedding model marked image-capable", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Bedrock Key",
+      provider: "bedrock",
+      secretId: null,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "amazon.titan-embed-text-v2:0",
+    });
+    // The modalities editor let this text-only model be marked image-capable;
+    // the resolved config must not propagate that to connectors.
+    await ModelModel.create({
+      externalId: "bedrock/amazon.titan-embed-text-v2:0",
+      provider: "bedrock",
+      modelId: "amazon.titan-embed-text-v2:0",
+      inputModalities: ["text", "image"],
+      outputModalities: [],
+      embeddingDimensions: 1024,
+    });
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result?.inputModalities).toEqual(["text"]);
+  });
+
+  test("keeps image for a multimodal Bedrock embedding model", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Bedrock Key",
+      provider: "bedrock",
+      secretId: null,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "amazon.titan-embed-image-v1",
+    });
+    await ModelModel.create({
+      externalId: "bedrock/amazon.titan-embed-image-v1",
+      provider: "bedrock",
+      modelId: "amazon.titan-embed-image-v1",
+      inputModalities: ["text", "image"],
+      outputModalities: [],
+      embeddingDimensions: 1024,
+    });
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result?.inputModalities).toEqual(["text", "image"]);
+    // The client's accepted image formats ride along so connectors and the
+    // embedder can gate on them.
+    expect(result?.acceptedImageMimeTypes).toEqual([
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "image/gif",
+    ]);
+  });
+
+  test("resolves a Cohere direct key to the KB's Cohere client with its image formats", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Cohere Key",
+      provider: "cohere",
+      secretId: null,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "embed-v4.0",
+    });
+    await ModelModel.create({
+      externalId: "cohere/embed-v4.0",
+      provider: "cohere",
+      modelId: "embed-v4.0",
+      inputModalities: ["text", "image"],
+      outputModalities: [],
+      embeddingDimensions: 1536,
+    });
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result?.provider).toBe("cohere");
+    expect(result?.dimensions).toBe(1536);
+    expect(result?.inputModalities).toEqual(["text", "image"]);
+    expect(result?.acceptedImageMimeTypes).toEqual([
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "image/gif",
+    ]);
+  });
+
+  test("clamps image off a Cohere embedding model the KB client does not know", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Cohere Key",
+      provider: "cohere",
+      secretId: null,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "embed-english-v2.0",
+    });
+    await ModelModel.create({
+      externalId: "cohere/embed-english-v2.0",
+      provider: "cohere",
+      modelId: "embed-english-v2.0",
+      inputModalities: ["text", "image"],
+      outputModalities: [],
+      embeddingDimensions: 1024,
+    });
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result?.inputModalities).toEqual(["text"]);
+  });
+
+  test("trusts the models table for an allowlisted multimodal Gemini model", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Gemini Key",
+      provider: "gemini",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "gemini-embedding-2",
+    });
+    await ModelModel.create({
+      externalId: "google/gemini-embedding-2",
+      provider: "gemini",
+      modelId: "gemini-embedding-2",
+      inputModalities: ["text", "image"],
+      outputModalities: [],
+      embeddingDimensions: 1536,
+    });
+    mockGetSecretValue.mockResolvedValueOnce("gemini-key");
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result?.inputModalities).toEqual(["text", "image"]);
+    // Gemini's inline-image API takes a documented format list — a GIF
+    // reaching it fails the embed call, so the gate rides along here too.
+    expect(result?.acceptedImageMimeTypes).toEqual(["image/png", "image/jpeg"]);
+  });
+
+  test("clamps image off a text-only Gemini embedding model marked image-capable", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Gemini Key",
+      provider: "gemini",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "gemini-embedding-001",
+    });
+    // The Gemini client forwards images for ANY model, but the API rejects
+    // them for text-only embedding models — so the clamp is allowlist-based.
+    await ModelModel.create({
+      externalId: "google/gemini-embedding-001",
+      provider: "gemini",
+      modelId: "gemini-embedding-001",
+      inputModalities: ["text", "image"],
+      outputModalities: [],
+      embeddingDimensions: 1536,
+    });
+    mockGetSecretValue.mockResolvedValueOnce("gemini-key");
+
+    const result = await resolveEmbeddingConfig(org.id);
+
+    expect(result?.inputModalities).toEqual(["text"]);
+  });
+});
+
+describe("resolveRerankerConfig", () => {
+  test("returns config when org has reranker key and model configured", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Reranker Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      rerankerChatApiKeyId: chatApiKey.id,
+      rerankerModel: "rerank-v3",
+    });
+
+    mockGetSecretValue.mockResolvedValueOnce("sk-reranker-key");
+
+    const result = await resolveRerankerConfig(org.id);
+
+    expect(result).not.toBeNull();
+    expect(result?.modelName).toBe("rerank-v3");
+    expect(mockCreateDirectLLMModel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "sk-reranker-key",
+        modelName: "rerank-v3",
+      }),
+    );
+  });
+
+  test("returns null when org has no reranker key configured", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+
+    const result = await resolveRerankerConfig(org.id);
+
+    expect(result).toBeNull();
+  });
+
+  test("returns null when org has reranker key but no model", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      rerankerChatApiKeyId: chatApiKey.id,
+    });
+
+    const result = await resolveRerankerConfig(org.id);
+
+    expect(result).toBeNull();
+  });
+
+  test("throws when a configured secret cannot be resolved", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      rerankerChatApiKeyId: chatApiKey.id,
+      rerankerModel: "rerank-v3",
+    });
+
+    mockGetSecretValue.mockResolvedValueOnce(null);
+
+    // Configured but unresolvable: a typed fault (the query path catches it and
+    // degrades; save blocks on it).
+    await expect(resolveRerankerConfig(org.id)).rejects.toBeInstanceOf(
+      RerankerConfigUnresolvableError,
+    );
+  });
+});
+
+describe("resolveContextualRetrievalConfig", () => {
+  const originalDeploymentDefault = config.kb.contextualRetrievalEnabled;
+
+  afterEach(() => {
+    config.kb.contextualRetrievalEnabled = originalDeploymentDefault;
+  });
+
+  test("uses the deployment flag as the default for an untouched organization", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    config.kb.contextualRetrievalEnabled = true;
+
+    const result = await resolveContextualRetrievalConfig(org.id);
+
+    expect(result).toEqual({ mode: "document", reranker: null });
+  });
+
+  test("an organization override can disable context without resolving its credential", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Context Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      kbContextualRetrievalMode: "disabled",
+      rerankerChatApiKeyId: chatApiKey.id,
+      rerankerModel: "gpt-4o-mini",
+    });
+
+    const result = await resolveContextualRetrievalConfig(org.id);
+
+    expect(result).toEqual({ mode: "disabled", reranker: null });
+    expect(mockGetSecretValue).not.toHaveBeenCalled();
+    expect(mockCreateDirectLLMModel).not.toHaveBeenCalled();
+  });
+
+  test("resolves the chat reranker for per-passage context", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Context Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      kbContextualRetrievalMode: "chunk",
+      rerankerChatApiKeyId: chatApiKey.id,
+      rerankerModel: "gpt-4o-mini",
+    });
+    mockGetSecretValue.mockResolvedValueOnce("sk-context-key");
+
+    const result = await resolveContextualRetrievalConfig(org.id);
+
+    expect(result.mode).toBe("chunk");
+    expect(result.reranker).toMatchObject({
+      kind: "llm",
+      modelName: "gpt-4o-mini",
+      provider: "openai",
+    });
+  });
+});
+
+describe("resolveOcrConfig", () => {
+  test("returns null when the organization has no OCR pair configured", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    expect(await resolveOcrConfig(org.id)).toBeNull();
+  });
+
+  test("resolves a direct LLM model for an allowlisted provider", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Vision Key",
+      provider: "anthropic",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      ocrChatApiKeyId: chatApiKey.id,
+      ocrModel: "claude-sonnet-5",
+    });
+    mockGetSecretValue.mockResolvedValueOnce("sk-ant-api-key");
+
+    const result = await resolveOcrConfig(org.id);
+
+    expect(result).toMatchObject({
+      modelName: "claude-sonnet-5",
+      provider: "anthropic",
+    });
+    expect(mockCreateDirectLLMModel).toHaveBeenCalledWith({
+      provider: "anthropic",
+      apiKey: "sk-ant-api-key",
+      modelName: "claude-sonnet-5",
+      baseUrl: "https://api.anthropic.com",
+      chatApiKeyId: chatApiKey.id,
+    });
+  });
+
+  test("rejects a provider whose transport cannot carry PDF input", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Native Ollama",
+      provider: "ollama-native",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      ocrChatApiKeyId: chatApiKey.id,
+      ocrModel: "llava",
+    });
+    mockGetSecretValue.mockResolvedValueOnce("unused");
+
+    await expect(resolveOcrConfig(org.id)).rejects.toThrow(
+      OcrConfigUnresolvableError,
+    );
+  });
+
+  test("throws when the configured credential cannot be resolved", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "Broken Key",
+      provider: "anthropic",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+    await OrganizationModel.patch(org.id, {
+      ocrChatApiKeyId: chatApiKey.id,
+      ocrModel: "claude-sonnet-5",
+    });
+    mockGetSecretValue.mockResolvedValueOnce(null);
+
+    await expect(resolveOcrConfig(org.id)).rejects.toThrow(
+      OcrConfigUnresolvableError,
+    );
+  });
+});
+
+describe("getDefaultOrgEmbeddingConfig", () => {
+  test("returns config when first org has embedding configured", async ({
+    makeOrganization,
+  }) => {
+    const org = await makeOrganization();
+    const secretId = await createSecret();
+
+    const chatApiKey = await LlmProviderApiKeyModel.create({
+      organizationId: org.id,
+      name: "OpenAI Key",
+      provider: "openai",
+      secretId,
+      scope: "org",
+      userId: null,
+      teamId: null,
+    });
+
+    await OrganizationModel.patch(org.id, {
+      embeddingChatApiKeyId: chatApiKey.id,
+      embeddingModel: "text-embedding-3-small",
+    });
+
+    mockGetSecretValue.mockResolvedValueOnce("sk-test-key");
+
+    const result = await getDefaultOrgEmbeddingConfig();
+
+    expect(result).not.toBeNull();
+    expect(result?.organizationId).toBe(org.id);
+    expect(result?.config.model).toBe("text-embedding-3-small");
+  });
+
+  test("returns null when org has no embedding config", async ({
+    makeOrganization,
+  }) => {
+    await makeOrganization();
+
+    const result = await getDefaultOrgEmbeddingConfig();
+
+    expect(result).toBeNull();
+  });
+});

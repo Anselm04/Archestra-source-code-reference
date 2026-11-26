@@ -1,0 +1,187 @@
+"use client";
+
+import { Check, Copy, Key, RefreshCw } from "lucide-react";
+import type { ReactNode } from "react";
+import { useState } from "react";
+import { toast } from "sonner";
+import { FormDialog } from "@/components/form-dialog";
+import { Button } from "@/components/ui/button";
+import { DialogBody, DialogStickyFooter } from "@/components/ui/dialog";
+import { InlineNotice, InlineNoticeText } from "@/components/ui/inline-notice";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { copyToClipboard } from "@/lib/clipboard";
+import { formatRelativeTimeFromNow } from "@/lib/utils/date-time";
+
+export interface ManagedPlatformToken {
+  id: string;
+  name: string;
+  tokenStart: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+interface PlatformTokenManagerDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  token: ManagedPlatformToken;
+  title: ReactNode;
+  description: ReactNode;
+  fetchTokenValue: () => Promise<string | null>;
+  rotateToken: () => Promise<string | null>;
+  isRotating: boolean;
+}
+
+export function PlatformTokenManagerDialog({
+  open,
+  onOpenChange,
+  token,
+  title,
+  description,
+  fetchTokenValue,
+  rotateToken,
+  isRotating,
+}: PlatformTokenManagerDialogProps) {
+  const [showValue, setShowValue] = useState(false);
+  const [displayedValue, setDisplayedValue] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [confirmRotate, setConfirmRotate] = useState(false);
+
+  const handleShowToken = async () => {
+    if (!showValue) {
+      const value = await fetchTokenValue();
+      if (value) {
+        setDisplayedValue(value);
+        setShowValue(true);
+      }
+      return;
+    }
+
+    setShowValue(false);
+  };
+
+  const handleCopy = async () => {
+    if (!displayedValue) return;
+
+    await copyToClipboard(displayedValue);
+    setCopied(true);
+    toast.success("Token copied to clipboard");
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleRotate = async () => {
+    if (!confirmRotate) {
+      setConfirmRotate(true);
+      return;
+    }
+
+    const value = await rotateToken();
+    if (!value) return;
+
+    await copyToClipboard(value);
+    toast.success("Token rotated and copied to clipboard");
+    setDisplayedValue(value);
+    setShowValue(true);
+    setConfirmRotate(false);
+  };
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      setShowValue(false);
+      setDisplayedValue(null);
+      setConfirmRotate(false);
+    }
+    onOpenChange(nextOpen);
+  };
+
+  return (
+    <FormDialog
+      open={open}
+      onOpenChange={handleOpenChange}
+      title={title}
+      description={description}
+      size="medium"
+      className="max-w-xl"
+    >
+      <DialogBody className="space-y-4">
+        <div className="space-y-2">
+          <Label>Token</Label>
+          <div className="flex gap-2">
+            <Input
+              aria-label="Token"
+              readOnly
+              value={
+                showValue && displayedValue
+                  ? displayedValue
+                  : `${displayedValue ? displayedValue.substring(0, 14) : token.tokenStart}...`
+              }
+              className="font-mono"
+            />
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={handleShowToken}
+              aria-label={showValue ? "Hide token" : "Show token"}
+              aria-pressed={showValue}
+              title={showValue ? "Hide token" : "Show token"}
+            >
+              <Key className="h-4 w-4" />
+            </Button>
+            {showValue && displayedValue && (
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={handleCopy}
+                aria-label="Copy token"
+                title="Copy token"
+              >
+                {copied ? (
+                  <Check className="h-4 w-4 text-green-500" />
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <div className="space-y-1 text-sm text-muted-foreground">
+          <p>
+            <strong>Created:</strong>{" "}
+            {formatRelativeTimeFromNow(token.createdAt)}
+          </p>
+          <p>
+            <strong>Last used:</strong>{" "}
+            {formatRelativeTimeFromNow(token.lastUsedAt)}
+          </p>
+        </div>
+
+        {confirmRotate && (
+          <InlineNotice variant="error">
+            <InlineNoticeText>
+              Rotating this token will invalidate the current value. Any
+              applications using this token will need to be updated. Click
+              Rotate again to confirm.
+            </InlineNoticeText>
+          </InlineNotice>
+        )}
+      </DialogBody>
+
+      <DialogStickyFooter className="justify-between sm:justify-between">
+        <Button
+          variant={confirmRotate ? "destructive" : "outline"}
+          onClick={handleRotate}
+          disabled={isRotating}
+        >
+          <RefreshCw
+            className={`h-4 w-4 ${isRotating ? "animate-spin" : ""}`}
+          />
+          {confirmRotate ? "Confirm Rotate" : "Rotate Token"}
+        </Button>
+        <Button variant="outline" onClick={() => handleOpenChange(false)}>
+          Close
+        </Button>
+      </DialogStickyFooter>
+    </FormDialog>
+  );
+}

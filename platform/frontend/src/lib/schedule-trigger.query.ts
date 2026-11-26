@@ -1,0 +1,564 @@
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  type PaginationMeta,
+} from "@archestra/shared";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { toast } from "sonner";
+import { handleApiError, throwOnApiError } from "./utils";
+
+const {
+  getScheduleTriggers,
+  getScheduleTrigger,
+  createScheduleTrigger,
+  updateScheduleTrigger,
+  deleteScheduleTrigger,
+  enableScheduleTrigger,
+  disableScheduleTrigger,
+  runScheduleTriggerNow,
+  getScheduleTriggerRuns,
+  getScheduleTriggerRun,
+  createScheduleTriggerRunConversation,
+} = archestraApiSdk;
+
+export type ScheduleTriggerRunStatus =
+  | "running"
+  | "success"
+  | "failed"
+  | "cancelled";
+
+export type ScheduleTriggerRunKind = "due" | "manual";
+
+export type ScheduleTrigger = {
+  id: string;
+  organizationId: string;
+  name: string;
+  agentId: string;
+  projectId?: string | null;
+  messageTemplate: string;
+  cronExpression: string;
+  timezone: string;
+  enabled: boolean;
+  actorUserId: string;
+  lastExecutedAt: string | null;
+  createdAt: string;
+  actor?: {
+    id: string;
+    name: string | null;
+    email: string | null;
+  } | null;
+  agent?: {
+    id: string;
+    name: string | null;
+    agentType: string | null;
+  } | null;
+};
+
+export type ScheduleTriggerRun = {
+  blockedBy?: archestraApiTypes.GetScheduleTriggerRunResponses["200"]["blockedBy"];
+  id: string;
+  organizationId: string;
+  triggerId: string;
+  runKind: ScheduleTriggerRunKind;
+  status: ScheduleTriggerRunStatus;
+  initiatedByUserId: string | null;
+  chatConversationId: string | null;
+  runtimeTaskId?: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  error: string | null;
+  artifact: string | null;
+  createdAt: string;
+};
+
+type PaginatedResponse<T> = {
+  data: T[];
+  pagination: PaginationMeta;
+};
+
+type ScheduleTriggerRequestBody = {
+  name: string;
+  // Optional: omitted when the caller can't pick an agent (no `agent:read`),
+  // and the backend falls back to the org default agent.
+  agentId?: string;
+  projectId?: string;
+  cronExpression: string;
+  timezone: string;
+  messageTemplate: string;
+  enabled?: boolean;
+};
+
+export const scheduleTriggerKeys = {
+  all: ["schedule-triggers"] as const,
+  detail: (triggerId: string) =>
+    [...scheduleTriggerKeys.all, "detail", triggerId] as const,
+  list: (params: {
+    enabled?: boolean;
+    limit?: number;
+    offset?: number;
+    agentIds?: string[];
+  }) => [...scheduleTriggerKeys.all, "list", params] as const,
+  runsPrefix: (triggerId: string) =>
+    [...scheduleTriggerKeys.all, triggerId, "runs"] as const,
+  runs: (
+    triggerId: string,
+    params: {
+      limit?: number;
+      offset?: number;
+      status?: ScheduleTriggerRunStatus;
+    },
+  ) => [...scheduleTriggerKeys.runsPrefix(triggerId), params] as const,
+  run: (triggerId: string, runId: string) =>
+    [...scheduleTriggerKeys.runsPrefix(triggerId), "detail", runId] as const,
+  status: () => [...scheduleTriggerKeys.all, "status"] as const,
+};
+
+export function getScheduleTriggerListQueryParams(params?: {
+  enabled?: boolean;
+  limit?: number;
+  offset?: number;
+  name?: string;
+  actorUserIds?: string[];
+  agentIds?: string[];
+  projectId?: string;
+  showAll?: boolean;
+  refetchInterval?: number | false;
+}) {
+  return {
+    enabled: params?.enabled,
+    limit: params?.limit,
+    offset: params?.offset,
+    name: params?.name,
+    actorUserIds: params?.actorUserIds,
+    agentIds: params?.agentIds,
+    projectId: params?.projectId,
+    showAll: params?.showAll,
+  };
+}
+
+export function getScheduleTriggerRunsQueryParams(params?: {
+  limit?: number;
+  offset?: number;
+  status?: ScheduleTriggerRunStatus;
+  enabled?: boolean;
+}) {
+  return {
+    limit: params?.limit,
+    offset: params?.offset,
+    status: params?.status,
+  };
+}
+
+export function useScheduleTriggers(params?: {
+  enabled?: boolean;
+  limit?: number;
+  offset?: number;
+  name?: string;
+  actorUserIds?: string[];
+  agentIds?: string[];
+  projectId?: string;
+  showAll?: boolean;
+  refetchInterval?: number | false;
+  toastOnError?: boolean;
+}) {
+  const queryParams = getScheduleTriggerListQueryParams(params);
+  const emptyResponse: PaginatedResponse<ScheduleTrigger> = {
+    data: [],
+    pagination: EMPTY_PAGINATION,
+  };
+
+  return useQuery({
+    queryKey: scheduleTriggerKeys.list(queryParams),
+    queryFn: async () => {
+      const response = await getScheduleTriggers({
+        query: {
+          limit: queryParams.limit ?? 50,
+          offset: queryParams.offset ?? 0,
+          ...(queryParams.enabled !== undefined
+            ? { enabled: queryParams.enabled }
+            : {}),
+          ...(queryParams.name ? { name: queryParams.name } : {}),
+          ...(queryParams.actorUserIds?.length
+            ? { actorUserIds: queryParams.actorUserIds.join(",") }
+            : {}),
+          ...(queryParams.agentIds?.length
+            ? { agentIds: queryParams.agentIds.join(",") }
+            : {}),
+          ...(queryParams.projectId
+            ? { projectId: queryParams.projectId }
+            : {}),
+          ...(queryParams.showAll ? { showAll: queryParams.showAll } : {}),
+        },
+      });
+      throwOnApiError(response.error, { toastOnError: params?.toastOnError });
+      return (
+        (response.data as PaginatedResponse<ScheduleTrigger>) ?? emptyResponse
+      );
+    },
+    ...(params?.refetchInterval
+      ? { refetchInterval: params.refetchInterval }
+      : {}),
+  });
+}
+
+export function useScheduleTrigger(
+  triggerId: string | null,
+  params?: {
+    enabled?: boolean;
+    refetchInterval?: number | false;
+  },
+) {
+  return useQuery({
+    queryKey: scheduleTriggerKeys.detail(triggerId ?? ""),
+    queryFn: async () => {
+      const response = await getScheduleTrigger({
+        path: { id: triggerId as string },
+      });
+      throwOnApiError(response.error, { allowNotFound: true });
+      return (response.data as ScheduleTrigger) ?? null;
+    },
+    enabled: !!triggerId && (params?.enabled ?? true),
+    ...(params?.refetchInterval
+      ? { refetchInterval: params.refetchInterval }
+      : {}),
+  });
+}
+
+export function useScheduleTriggerRuns(
+  triggerId: string | null,
+  params?: {
+    limit?: number;
+    offset?: number;
+    status?: ScheduleTriggerRunStatus;
+    enabled?: boolean;
+    // Accepts the TanStack function form so callers can poll only while a run is
+    // active and stop the instant the list settles (reads the latest data).
+    refetchInterval?:
+      | number
+      | false
+      | ((query: {
+          state: { data: PaginatedResponse<ScheduleTriggerRun> | undefined };
+        }) => number | false);
+  },
+) {
+  const queryParams = getScheduleTriggerRunsQueryParams(params);
+  const emptyResponse: PaginatedResponse<ScheduleTriggerRun> = {
+    data: [],
+    pagination: EMPTY_PAGINATION,
+  };
+
+  return useQuery({
+    queryKey: scheduleTriggerKeys.runs(triggerId ?? "", queryParams),
+    queryFn: async () => {
+      const response = await getScheduleTriggerRuns({
+        path: { id: triggerId as string },
+        query: {
+          limit: queryParams.limit ?? 10,
+          offset: queryParams.offset ?? 0,
+          ...(queryParams.status ? { status: queryParams.status } : {}),
+        },
+      });
+      // A deleted/missing parent trigger 404s here; degrade to an empty runs
+      // list rather than an error state.
+      throwOnApiError(response.error, { allowNotFound: true });
+      return (
+        (response.data as PaginatedResponse<ScheduleTriggerRun>) ??
+        emptyResponse
+      );
+    },
+    enabled: !!triggerId && (params?.enabled ?? true),
+    ...(params?.refetchInterval
+      ? { refetchInterval: params.refetchInterval }
+      : {}),
+  });
+}
+
+export function useHasActiveScheduleTriggers() {
+  return useQuery({
+    queryKey: scheduleTriggerKeys.status(),
+    queryFn: async () => {
+      const response = await getScheduleTriggers({
+        query: { enabled: true, limit: 1, offset: 0 },
+      });
+      throwOnApiError(response.error);
+      const data = response.data as
+        | PaginatedResponse<ScheduleTrigger>
+        | undefined;
+      return (data?.data.length ?? 0) > 0;
+    },
+  });
+}
+
+export function useScheduleTriggerRun(
+  triggerId: string | null,
+  runId: string | null,
+  params?: {
+    enabled?: boolean;
+    // Accepts the TanStack function form so callers can poll only while the run
+    // is running and stop the instant it's terminal (reads the latest data).
+    refetchInterval?:
+      | number
+      | false
+      | ((query: {
+          state: { data: ScheduleTriggerRun | null | undefined };
+        }) => number | false);
+  },
+) {
+  return useQuery({
+    queryKey: scheduleTriggerKeys.run(triggerId ?? "", runId ?? ""),
+    queryFn: async () => {
+      const response = await getScheduleTriggerRun({
+        path: { id: triggerId as string, runId: runId as string },
+      });
+      throwOnApiError(response.error, { allowNotFound: true });
+      return (response.data as ScheduleTriggerRun) ?? null;
+    },
+    enabled: !!triggerId && !!runId && (params?.enabled ?? true),
+    ...(params?.refetchInterval
+      ? { refetchInterval: params.refetchInterval }
+      : {}),
+  });
+}
+
+export function useCreateScheduleTriggerRunConversation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      triggerId,
+      runId,
+    }: {
+      triggerId: string;
+      runId: string;
+    }) => {
+      const response = await createScheduleTriggerRunConversation({
+        path: { id: triggerId, runId },
+      });
+      if (response.error) {
+        handleApiError(response.error);
+        throw new Error("Failed to create a conversation for this run");
+      }
+      return response.data as { id: string };
+    },
+    onSuccess: (conversation, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: scheduleTriggerKeys.run(variables.triggerId, variables.runId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: scheduleTriggerKeys.runsPrefix(variables.triggerId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["conversations"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["conversation", conversation.id],
+      });
+    },
+  });
+}
+
+export function useCreateScheduleTrigger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    // A scheduled task is always scoped to a project, so create requires it.
+    mutationFn: async (
+      body: ScheduleTriggerRequestBody & { projectId: string },
+    ) => {
+      const response = await createScheduleTrigger({ body });
+      if (response.error) {
+        handleApiError(response.error);
+        return null;
+      }
+      return (response.data as ScheduleTrigger) ?? null;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      toast.success("Schedule trigger created");
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+    },
+  });
+}
+
+export function useUpdateScheduleTrigger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      id,
+      body,
+    }: {
+      id: string;
+      body: Partial<ScheduleTriggerRequestBody>;
+    }) => {
+      const response = await updateScheduleTrigger({
+        path: { id },
+        body,
+      });
+      if (response.error) {
+        handleApiError(response.error);
+        return null;
+      }
+      return (response.data as ScheduleTrigger) ?? null;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      toast.success("Schedule trigger updated");
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+    },
+  });
+}
+
+export function useDeleteScheduleTrigger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await deleteScheduleTrigger({ path: { id } });
+      if (response.error) {
+        handleApiError(response.error);
+        return null;
+      }
+      return response.data as { success: boolean } | null;
+    },
+    onSuccess: (data) => {
+      if (!data?.success) return;
+      toast.success("Schedule trigger deleted");
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+    },
+  });
+}
+
+export function useEnableScheduleTrigger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await enableScheduleTrigger({ path: { id } });
+      if (response.error) {
+        handleApiError(response.error);
+        return null;
+      }
+      return (response.data as ScheduleTrigger) ?? null;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      toast.success("Schedule trigger enabled");
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+    },
+  });
+}
+
+export function useDisableScheduleTrigger() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await disableScheduleTrigger({ path: { id } });
+      if (response.error) {
+        handleApiError(response.error);
+        return null;
+      }
+      return (response.data as ScheduleTrigger) ?? null;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      toast.success("Schedule trigger disabled");
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+    },
+  });
+}
+
+export function useRunScheduleTriggerNow() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await runScheduleTriggerNow({ path: { id } });
+      if (response.error) {
+        handleApiError(response.error);
+        return null;
+      }
+      return (response.data as ScheduleTriggerRun) ?? null;
+    },
+    onSuccess: (data) => {
+      if (!data) return;
+      queryClient.invalidateQueries({ queryKey: scheduleTriggerKeys.all });
+      queryClient.invalidateQueries({
+        queryKey: scheduleTriggerKeys.runsPrefix(data.triggerId),
+      });
+    },
+  });
+}
+
+// --- Internal constants ---
+
+const EMPTY_PAGINATION: PaginationMeta = {
+  currentPage: 1,
+  limit: 50,
+  total: 0,
+  totalPages: 0,
+  hasNext: false,
+  hasPrev: false,
+};
+
+/** Only requested pages are fetched; filters apply across the complete history. */
+export function useInfiniteScheduleTriggerRuns(
+  triggerId: string | null,
+  filters: {
+    status?: ScheduleTriggerRunStatus;
+    runKind?: ScheduleTriggerRunKind;
+  } = {},
+) {
+  return useInfiniteQuery({
+    queryKey: [
+      ...scheduleTriggerKeys.runsPrefix(triggerId ?? ""),
+      "infinite",
+      filters,
+    ],
+    enabled: !!triggerId,
+    initialPageParam: 0,
+    queryFn: async ({ pageParam, signal }) => {
+      const response = await getScheduleTriggerRuns({
+        path: { id: triggerId as string },
+        query: { limit: 25, offset: pageParam, ...filters },
+        signal,
+      });
+      throwOnApiError(response.error, { toastOnError: false });
+      if (!response.data) throw new Error("Run history is unavailable");
+      return response.data as PaginatedResponse<ScheduleTriggerRun>;
+    },
+    getNextPageParam: (page, _pages, offset) =>
+      page.pagination.hasNext ? offset + page.pagination.limit : undefined,
+    refetchInterval: (query) =>
+      query.state.data?.pages.some((page) =>
+        page.data.some((run) => run.status === "running"),
+      )
+        ? 3000
+        : false,
+  });
+}
+
+export function useAgentSchedules(agentId: string | null) {
+  return useInfiniteQuery({
+    queryKey: [...scheduleTriggerKeys.all, "agent", agentId],
+    enabled: !!agentId,
+    initialPageParam: 0,
+    queryFn: async ({ pageParam, signal }) => {
+      const response = await getScheduleTriggers({
+        query: { agentIds: agentId as string, limit: 25, offset: pageParam },
+        signal,
+      });
+      throwOnApiError(response.error, { toastOnError: false });
+      if (!response.data) throw new Error("Schedules are unavailable");
+      return response.data as PaginatedResponse<ScheduleTrigger>;
+    },
+    getNextPageParam: (page, _pages, offset) =>
+      page.pagination.hasNext ? offset + page.pagination.limit : undefined,
+  });
+}

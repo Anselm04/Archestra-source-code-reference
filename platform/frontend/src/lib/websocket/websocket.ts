@@ -1,0 +1,252 @@
+import type {
+  ClientWebSocketMessage,
+  ServerWebSocketMessage,
+} from "@archestra/shared";
+import config from "@/lib/config/config";
+
+// Combined message type for handlers that receive both directions
+type WebSocketMessage = ClientWebSocketMessage | ServerWebSocketMessage;
+
+type MessageHandler = (message: WebSocketMessage) => void;
+
+type ConnectionHandler = (isConnected: boolean) => void;
+
+class WebSocketService {
+  private ws: WebSocket | null = null;
+  private handlers: Map<WebSocketMessage["type"], Set<MessageHandler>> =
+    new Map();
+  private connectionHandlers: Set<ConnectionHandler> = new Set();
+  private reconnectTimeout: NodeJS.Timeout | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = Infinity;
+  private reconnectDelay = 1000; // Start with 1 second
+  private maxReconnectDelay = 30000; // Max 30 seconds
+  private isManuallyDisconnected = false;
+  private isConnecting = false;
+  private pendingMessages: ClientWebSocketMessage[] = [];
+
+  async connect(): Promise<void> {
+    // Playwright's MSW stack has HTTP handlers but no WebSocket server. Every
+    // caller must share this guard or subscriptions cause a reconnect loop.
+    if (
+      process.env.NEXT_PUBLIC_API_MOCKING === "enabled" &&
+      process.env.NODE_ENV !== "production"
+    ) {
+      return;
+    }
+    if (
+      this.ws?.readyState === WebSocket.OPEN ||
+      this.ws?.readyState === WebSocket.CONNECTING ||
+      this.isConnecting
+    ) {
+      return;
+    }
+
+    this.isManuallyDisconnected = false;
+    this.isConnecting = true;
+
+    try {
+      this.ws = new WebSocket(config.websocket.url);
+
+      this.ws.addEventListener("open", () => {
+        this.isConnecting = false;
+        this.reconnectAttempts = 0;
+        this.reconnectDelay = 1000;
+        this.flushPendingMessages();
+        this.notifyConnectionHandlers(true);
+      });
+
+      // this.ws.addEventListener("error", (_error) => {});
+
+      this.ws.addEventListener("message", (event) => {
+        try {
+          const message: WebSocketMessage = JSON.parse(event.data);
+          this.handleMessage(message);
+        } catch (error) {
+          console.error("[WebSocket] Failed to parse message:", error);
+        }
+      });
+
+      this.ws.addEventListener("close", (event) => {
+        this.ws = null;
+        this.isConnecting = false;
+        this.notifyConnectionHandlers(false);
+
+        // The server accepts the upgrade before it authenticates, so a
+        // signed-out socket still fires "open" (resetting the backoff) and is
+        // then closed with 4401. Retrying would loop every second or so for
+        // as long as the sign-in page is open. Stay closed instead: the
+        // signed-in app calls connect() again when it mounts.
+        if (event.code === UNAUTHORIZED_CLOSE_CODE) {
+          return;
+        }
+
+        // Attempt to reconnect unless manually disconnected
+        if (!this.isManuallyDisconnected) {
+          this.scheduleReconnect();
+        }
+      });
+    } catch (error) {
+      this.isConnecting = false;
+      console.error("[WebSocket] Connection failed:", error);
+      this.notifyConnectionHandlers(false);
+      this.scheduleReconnect();
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error("[WebSocket] Max reconnect attempts reached, giving up");
+      return;
+    }
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+
+    this.reconnectAttempts++;
+    const delay = Math.min(
+      this.reconnectDelay * 1.3 ** this.reconnectAttempts,
+      this.maxReconnectDelay,
+    );
+
+    this.reconnectTimeout = setTimeout(() => {
+      this.connect();
+    }, delay);
+  }
+
+  disconnect(): void {
+    this.isManuallyDisconnected = true;
+    this.pendingMessages = [];
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+
+  /**
+   * Subscribe to messages of a specific type (typed version for known types)
+   */
+  subscribe<T extends WebSocketMessage["type"]>(
+    type: T,
+    handler: (message: Extract<WebSocketMessage, { type: T }>) => void,
+  ): () => void {
+    if (!this.handlers.has(type)) {
+      this.handlers.set(type, new Set());
+    }
+
+    const wrappedHandler = handler as unknown as MessageHandler;
+    this.handlers.get(type)?.add(wrappedHandler);
+
+    // Return unsubscribe function
+    return () => {
+      const handlers = this.handlers.get(type);
+      if (handlers) {
+        handlers.delete(wrappedHandler);
+        if (handlers.size === 0) {
+          this.handlers.delete(type);
+        }
+      }
+    };
+  }
+
+  /**
+   * Observe the connection itself opening and closing. Callers that hold a
+   * server-side subscription need the open edge: the server forgets every
+   * subscription along with the socket it was made on, so the subscription has
+   * to be re-sent on each new connection. The close edge is what tells them a
+   * connection attempt ended without a live socket.
+   */
+  onConnectionChange(handler: ConnectionHandler): () => void {
+    this.connectionHandlers.add(handler);
+    return () => {
+      this.connectionHandlers.delete(handler);
+    };
+  }
+
+  private handleMessage(message: WebSocketMessage): void {
+    const handlers = this.handlers.get(message.type);
+    if (handlers) {
+      handlers.forEach((handler) => {
+        try {
+          handler(message);
+        } catch (error) {
+          console.error("[WebSocket] Error in message handler:", error);
+        }
+      });
+    }
+  }
+
+  isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  private sendNow(message: ClientWebSocketMessage): void {
+    if (!this.isConnected()) {
+      this.pendingMessages.push(message);
+      return;
+    }
+
+    try {
+      this.ws?.send(JSON.stringify(message));
+    } catch (error) {
+      console.error("[WebSocket] Failed to send message:", error);
+      this.pendingMessages.unshift(message);
+    }
+  }
+
+  private flushPendingMessages(): void {
+    if (!this.isConnected() || this.pendingMessages.length === 0) {
+      return;
+    }
+
+    const queuedMessages = [...this.pendingMessages];
+    this.pendingMessages = [];
+    for (const message of queuedMessages) {
+      this.sendNow(message);
+    }
+  }
+
+  /**
+   * Send a message to the server (only client messages allowed)
+   */
+  send(message: ClientWebSocketMessage): void {
+    if (!this.isConnected()) {
+      this.pendingMessages.push(message);
+      if (!this.isManuallyDisconnected && !this.isConnecting && !this.ws) {
+        this.connect().catch((error) => {
+          console.error("[WebSocket] Auto-connect failed:", error);
+        });
+      }
+      return;
+    }
+
+    this.sendNow(message);
+  }
+
+  private notifyConnectionHandlers(isConnected: boolean): void {
+    this.connectionHandlers.forEach((handler) => {
+      try {
+        handler(isConnected);
+      } catch (error) {
+        console.error("[WebSocket] Error in connection handler:", error);
+      }
+    });
+  }
+}
+
+/**
+ * Open a single websocket connection to WebSocket server when the app is loaded
+ */
+const websocketService = new WebSocketService();
+
+export default websocketService;
+
+// Mirrors the close code in the backend's sendUnauthorized().
+const UNAUTHORIZED_CLOSE_CODE = 4401;

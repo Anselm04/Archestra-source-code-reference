@@ -1,0 +1,338 @@
+"use client";
+
+import type { PopoverContentProps } from "@radix-ui/react-popover";
+import { Check, ChevronDown, Search, X } from "lucide-react";
+import * as React from "react";
+import { Badge } from "@/components/ui/badge";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { UnstyledButton } from "@/components/ui/unstyled-button";
+import { useListboxNavigation } from "@/lib/hooks/use-listbox-navigation";
+import { matchesSearchTokens } from "@/lib/search-tokens";
+import { cn } from "@/lib/utils/tailwind";
+
+interface SearchableMultiSelectProps {
+  value: string[];
+  onValueChange: (value: string[]) => void;
+  placeholder?: string;
+  searchPlaceholder?: string;
+  items: Array<{
+    value: string;
+    label: string;
+    searchText?: string;
+    content?: React.ReactNode;
+    selectedContent?: React.ReactNode;
+    description?: string;
+    disabled?: boolean;
+  }>;
+  className?: string;
+  disabled?: boolean;
+  emptyMessage?: string;
+  allowCustom?: boolean;
+  /**
+   * Lifts the typed query so a caller can search server-side. The list is
+   * still filtered locally, so a caller that ignores this keeps working.
+   */
+  onSearchQueryChange?: (value: string) => void;
+  showSearchIcon?: boolean;
+  contentClassName?: string;
+  contentSide?: PopoverContentProps["side"];
+  contentAlign?: PopoverContentProps["align"];
+  contentAvoidCollisions?: PopoverContentProps["avoidCollisions"];
+  listClassName?: string;
+  maxBadgeDisplay?: number;
+  maxSelected?: number;
+  minSelected?: number;
+  id?: string;
+  ariaLabel?: string;
+  "data-testid"?: string;
+  "aria-describedby"?: string;
+  "aria-invalid"?: React.AriaAttributes["aria-invalid"];
+  showSelectedBadges?: boolean;
+  selectedSuffix?: string | ((count: number) => string);
+}
+
+export function SearchableMultiSelect({
+  value,
+  onValueChange,
+  placeholder = "Select items...",
+  searchPlaceholder = "Search...",
+  items,
+  className,
+  disabled = false,
+  emptyMessage = "No results found.",
+  allowCustom = false,
+  onSearchQueryChange,
+  showSearchIcon = true,
+  contentClassName,
+  contentSide,
+  contentAlign,
+  contentAvoidCollisions,
+  listClassName,
+  maxBadgeDisplay = 3,
+  maxSelected,
+  minSelected = 0,
+  id,
+  ariaLabel,
+  "data-testid": testId,
+  "aria-describedby": ariaDescribedBy,
+  "aria-invalid": ariaInvalid,
+  showSelectedBadges = true,
+  selectedSuffix = "selected",
+}: SearchableMultiSelectProps) {
+  const [open, setOpen] = React.useState(false);
+  const [searchQuery, setSearchQuery] = React.useState("");
+
+  const customValue = searchQuery.trim();
+  const canAddCustom =
+    allowCustom &&
+    customValue.length > 0 &&
+    !items.some((item) => item.value === customValue);
+  const filteredItems = React.useMemo(() => {
+    const matches = searchQuery
+      ? items.filter((item) =>
+          matchesSearchTokens(searchQuery, [item.searchText ?? item.label]),
+        )
+      : items;
+    if (!canAddCustom) return matches;
+    const customItem: (typeof items)[number] = {
+      value: customValue,
+      label: customValue,
+      content: <span>Add “{customValue}”</span>,
+    };
+    return [...matches, customItem];
+  }, [items, searchQuery, canAddCustom, customValue]);
+
+  const selectedItems = items.filter((item) => value.includes(item.value));
+
+  const isItemDisabled = (item: (typeof items)[number]) =>
+    !!item.disabled ||
+    (value.includes(item.value)
+      ? value.length <= minSelected
+      : maxSelected !== undefined && value.length >= maxSelected);
+
+  const handleToggleItem = (itemValue: string) => {
+    if (disabled) return;
+    if (value.includes(itemValue)) {
+      if (value.length <= minSelected) return;
+      onValueChange(value.filter((v) => v !== itemValue));
+    } else if (maxSelected === undefined || value.length < maxSelected) {
+      onValueChange([...value, itemValue]);
+      if (allowCustom && !items.some((item) => item.value === itemValue)) {
+        setSearchQuery("");
+        onSearchQueryChange?.("");
+      }
+    }
+  };
+
+  const navigation = useListboxNavigation({
+    open: !disabled && open,
+    onOpenChange: setOpen,
+    values: filteredItems
+      .filter((item) => !isItemDisabled(item))
+      .map((item) => item.value),
+    onSelect: handleToggleItem,
+  });
+
+  const handleRemoveItem = (
+    itemValue: string,
+    e: React.MouseEvent | React.KeyboardEvent,
+  ) => {
+    e.stopPropagation();
+    if (disabled || value.length <= minSelected) return;
+    onValueChange(value.filter((v) => v !== itemValue));
+  };
+
+  const visibleBadges = selectedItems.slice(0, maxBadgeDisplay);
+  const hiddenCount = selectedItems.length - maxBadgeDisplay;
+
+  return (
+    <Popover
+      open={!disabled && open}
+      onOpenChange={(next) => !disabled && setOpen(next)}
+    >
+      <PopoverTrigger asChild>
+        <div
+          role="combobox"
+          id={id}
+          aria-label={ariaLabel}
+          aria-describedby={ariaDescribedBy}
+          aria-invalid={ariaInvalid}
+          data-testid={testId}
+          aria-expanded={open}
+          aria-disabled={disabled}
+          tabIndex={disabled ? -1 : 0}
+          onKeyDown={(e) => {
+            if (disabled || e.target !== e.currentTarget) return;
+            navigation.onTriggerKeyDown(e);
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              setOpen(!open);
+            }
+          }}
+          className={cn(
+            // `min-h-9` with `py-1` matches `Input`, so a select showing one
+            // row of chips sits level with a text field beside it in a
+            // two-column form instead of standing taller for no reason.
+            // `h-auto` still lets it grow once the chips wrap.
+            "flex w-full min-h-9 h-auto items-center justify-between rounded-md border border-input bg-background px-3 py-1 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 cursor-pointer",
+            !value.length && "text-muted-foreground",
+            disabled && "cursor-not-allowed opacity-50",
+            className,
+          )}
+        >
+          {/* The row owns the spacing between chips. The chips used to carry
+              `mr-1 mb-1` as well, which doubled the gap and, because the
+              bottom margin had nothing balancing it at the top, pushed the
+              whole control taller than the field beside it. */}
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+            {selectedItems.length === 0 ? (
+              <span className="text-muted-foreground">{placeholder}</span>
+            ) : showSelectedBadges ? (
+              <>
+                {visibleBadges.map((item) => (
+                  <Badge key={item.value} variant="secondary">
+                    {item.selectedContent ?? item.label}
+                    <UnstyledButton
+                      type="button"
+                      aria-label="Remove selected item"
+                      disabled={disabled || value.length <= minSelected}
+                      className="ml-1 ring-offset-background rounded-full outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          handleRemoveItem(item.value, e);
+                        }
+                      }}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                      }}
+                      onClick={(e) => handleRemoveItem(item.value, e)}
+                    >
+                      <X className="h-3 w-3 text-muted-foreground hover:text-foreground" />
+                    </UnstyledButton>
+                  </Badge>
+                ))}
+                {hiddenCount > 0 && (
+                  <Badge variant="secondary">+{hiddenCount} more</Badge>
+                )}
+              </>
+            ) : (
+              <span>
+                {selectedItems.length}{" "}
+                {typeof selectedSuffix === "function"
+                  ? selectedSuffix(selectedItems.length)
+                  : selectedSuffix}
+              </span>
+            )}
+          </div>
+          <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+        </div>
+      </PopoverTrigger>
+      <PopoverContent
+        className={cn(
+          "max-h-[var(--radix-popover-content-available-height)] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0",
+          contentClassName,
+        )}
+        align={contentAlign ?? "start"}
+        side={contentSide}
+        avoidCollisions={contentAvoidCollisions}
+      >
+        <div className="flex items-center border-b px-3 py-2">
+          {showSearchIcon && (
+            <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
+          )}
+          <input
+            {...navigation.inputProps}
+            onKeyDown={(event) => {
+              if (
+                allowCustom &&
+                event.key === "Enter" &&
+                navigation.activeValue === null &&
+                !event.nativeEvent.isComposing &&
+                !event.altKey &&
+                !event.ctrlKey &&
+                !event.metaKey
+              ) {
+                event.preventDefault();
+                if (canAddCustom) handleToggleItem(customValue);
+                return;
+              }
+              navigation.inputProps.onKeyDown(event);
+            }}
+            aria-label={searchPlaceholder || "Search options"}
+            placeholder={searchPlaceholder}
+            value={searchQuery}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              onSearchQueryChange?.(e.target.value);
+            }}
+            className="flex w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+          />
+        </div>
+        <div
+          {...navigation.listboxProps}
+          role="listbox"
+          aria-label={ariaLabel ?? placeholder}
+          aria-multiselectable="true"
+          className={cn(
+            "max-h-[min(300px,calc(var(--radix-popover-content-available-height)-3rem))] overflow-y-auto p-1",
+            listClassName,
+          )}
+          onWheelCapture={(event) => event.stopPropagation()}
+        >
+          {filteredItems.length === 0 ? (
+            <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+              {emptyMessage}
+            </div>
+          ) : (
+            filteredItems.map((item) => {
+              const isSelected = value.includes(item.value);
+              return (
+                <UnstyledButton
+                  key={item.value}
+                  {...navigation.getOptionProps(item.value)}
+                  role="option"
+                  type="button"
+                  disabled={isItemDisabled(item)}
+                  aria-disabled={isItemDisabled(item)}
+                  aria-selected={isSelected}
+                  onClick={() => {
+                    if (isItemDisabled(item)) return;
+                    handleToggleItem(item.value);
+                  }}
+                  className={cn(
+                    "relative flex w-full cursor-default select-none items-center justify-between rounded-sm px-2 py-1.5 text-left text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground",
+                    isSelected && "bg-accent text-accent-foreground",
+                    navigation.activeValue === item.value &&
+                      "bg-accent text-accent-foreground",
+                    isItemDisabled(item) &&
+                      "cursor-not-allowed opacity-60 hover:bg-transparent hover:text-inherit",
+                  )}
+                >
+                  <span className="min-w-0 flex-1">
+                    {item.content ?? item.label}
+                    {item.description && (
+                      <span className="block text-xs text-muted-foreground truncate">
+                        {item.description}
+                      </span>
+                    )}
+                  </span>
+                  <Check
+                    className={cn(
+                      "ml-2 h-4 w-4 shrink-0",
+                      isSelected ? "opacity-100" : "opacity-0",
+                    )}
+                  />
+                </UnstyledButton>
+              );
+            })
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}

@@ -1,0 +1,240 @@
+import { createHash } from "node:crypto";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import db, { schema } from "@/database";
+import { PreparedQuery } from "@/database/prepared-query";
+
+class OAuthAccessTokenModel {
+  static hashTokenForLookup(oauthAccessToken: string): string {
+    // codeql[js/insufficient-password-hash] This hashes a high-entropy OAuth bearer token for lookup, not a user password.
+    return createHash("sha256").update(oauthAccessToken).digest("base64url");
+  }
+
+  /**
+   * Create an OAuth access token row.
+   */
+  static async create(params: {
+    id?: string;
+    tokenHash: string;
+    clientId: string;
+    userId: string;
+    expiresAt: Date;
+    scopes: string[];
+    referenceId?: string | null;
+    sessionId?: string | null;
+    refreshId?: string | null;
+  }) {
+    const [accessToken] = await db
+      .insert(schema.oauthAccessTokensTable)
+      .values({
+        id: params.id ?? crypto.randomUUID(),
+        token: params.tokenHash,
+        clientId: params.clientId,
+        userId: params.userId,
+        expiresAt: params.expiresAt,
+        scopes: params.scopes,
+        referenceId: params.referenceId ?? null,
+        sessionId: params.sessionId ?? null,
+        refreshId: params.refreshId ?? null,
+        createdAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: schema.oauthAccessTokensTable.id,
+        set: {
+          token: params.tokenHash,
+          clientId: params.clientId,
+          userId: params.userId,
+          expiresAt: params.expiresAt,
+          scopes: params.scopes,
+          referenceId: params.referenceId ?? null,
+          sessionId: params.sessionId ?? null,
+          refreshId: params.refreshId ?? null,
+          createdAt: new Date(),
+        },
+      })
+      .returning();
+
+    return accessToken;
+  }
+
+  /** Delete one access token by its id; true when it existed. */
+  static async deleteById(id: string): Promise<boolean> {
+    const rows = await db
+      .delete(schema.oauthAccessTokensTable)
+      .where(eq(schema.oauthAccessTokensTable.id, id))
+      .returning({ id: schema.oauthAccessTokensTable.id });
+    return rows.length > 0;
+  }
+
+  /**
+   * Delete access tokens minted for the given refresh token rows. Returns the
+   * number of rows removed.
+   */
+  static async deleteByRefreshIds(refreshIds: string[]): Promise<number> {
+    if (refreshIds.length === 0) {
+      return 0;
+    }
+    const rows = await db
+      .delete(schema.oauthAccessTokensTable)
+      .where(inArray(schema.oauthAccessTokensTable.refreshId, refreshIds))
+      .returning({ id: schema.oauthAccessTokensTable.id });
+    return rows.length;
+  }
+
+  static async createClientCredentialsToken(params: {
+    tokenHash: string;
+    clientId: string;
+    expiresAt: Date;
+    scopes: string[];
+    referenceId?: string | null;
+    /** Set when the client authenticated with a federated credential. */
+    federatedCredentialId?: string | null;
+  }) {
+    const [accessToken] = await db
+      .insert(schema.oauthAccessTokensTable)
+      .values({
+        id: crypto.randomUUID(),
+        token: params.tokenHash,
+        clientId: params.clientId,
+        expiresAt: params.expiresAt,
+        scopes: params.scopes,
+        referenceId: params.referenceId ?? null,
+        federatedCredentialId: params.federatedCredentialId ?? null,
+        createdAt: new Date(),
+      })
+      .returning();
+
+    return accessToken;
+  }
+
+  /**
+   * Find an access token by its hashed value.
+   * better-auth stores tokens as SHA-256 base64url hashes.
+   *
+   * Revoked access tokens are treated as absent.
+   *
+   * LEFT JOINs with oauth_refresh_token to include revocation status.
+   * When a refresh token is revoked, all associated access tokens should
+   * be considered invalid (defense-in-depth — better-auth's revocation
+   * endpoint also deletes access tokens, but this guards against edge cases).
+   */
+  static async getByTokenHash(tokenHash: string) {
+    const [result] = await OAuthAccessTokenModel.byTokenHash
+      .get()
+      .execute({ tokenHash });
+    return result;
+  }
+
+  static async getTokenHashById(id: string): Promise<string | undefined> {
+    const [row] = await db
+      .select({ token: schema.oauthAccessTokensTable.token })
+      .from(schema.oauthAccessTokensTable)
+      .where(eq(schema.oauthAccessTokensTable.id, id))
+      .limit(1);
+    return row?.token;
+  }
+
+  /** Delete one access token by its hashed value; true when it existed. */
+  static async deleteByTokenHash(tokenHash: string): Promise<boolean> {
+    const rows = await db
+      .delete(schema.oauthAccessTokensTable)
+      .where(eq(schema.oauthAccessTokensTable.token, tokenHash))
+      .returning({ id: schema.oauthAccessTokensTable.id });
+    return rows.length > 0;
+  }
+
+  /**
+   * Revoke only a client-owned application token, never a user's token family.
+   */
+  static async deleteClientCredentialsToken(params: {
+    tokenHash: string;
+    clientId: string;
+  }): Promise<void> {
+    await db
+      .delete(schema.oauthAccessTokensTable)
+      .where(
+        and(
+          eq(schema.oauthAccessTokensTable.token, params.tokenHash),
+          eq(schema.oauthAccessTokensTable.clientId, params.clientId),
+          isNull(schema.oauthAccessTokensTable.userId),
+          isNull(schema.oauthAccessTokensTable.refreshId),
+        ),
+      );
+  }
+
+  /** Update the persisted expiry for a hashed value. */
+  static async updateExpiresAtByTokenHash(params: {
+    tokenHash: string;
+    expiresAt: Date;
+  }) {
+    const [accessToken] = await db
+      .update(schema.oauthAccessTokensTable)
+      .set({ expiresAt: params.expiresAt })
+      .where(eq(schema.oauthAccessTokensTable.token, params.tokenHash))
+      .returning();
+
+    return accessToken ?? null;
+  }
+
+  /**
+   * Bind a freshly minted token to a resource audience, only while it is still
+   * unbound. better-auth issues opaque tokens with a null `referenceId`; the
+   * shareable-App connector mint stamps the audience here. The `IS NULL` guard
+   * makes this a one-shot write so it can never clobber a binding another issuer
+   * (e.g. the enterprise-managed `mcp-resource:` path) already set. Returns the
+   * updated row, or null when the token was absent or already bound.
+   */
+  static async bindReferenceIdByTokenHashWhenUnbound(params: {
+    tokenHash: string;
+    referenceId: string;
+  }) {
+    const [accessToken] = await db
+      .update(schema.oauthAccessTokensTable)
+      .set({ referenceId: params.referenceId })
+      .where(
+        and(
+          eq(schema.oauthAccessTokensTable.token, params.tokenHash),
+          isNull(schema.oauthAccessTokensTable.referenceId),
+        ),
+      )
+      .returning();
+
+    return accessToken ?? null;
+  }
+
+  private static readonly byTokenHash = new PreparedQuery((database) => {
+    return database
+      .select({
+        id: schema.oauthAccessTokensTable.id,
+        token: schema.oauthAccessTokensTable.token,
+        clientId: schema.oauthAccessTokensTable.clientId,
+        sessionId: schema.oauthAccessTokensTable.sessionId,
+        userId: schema.oauthAccessTokensTable.userId,
+        referenceId: schema.oauthAccessTokensTable.referenceId,
+        refreshId: schema.oauthAccessTokensTable.refreshId,
+        expiresAt: schema.oauthAccessTokensTable.expiresAt,
+        createdAt: schema.oauthAccessTokensTable.createdAt,
+        scopes: schema.oauthAccessTokensTable.scopes,
+        refreshTokenRevoked: schema.oauthRefreshTokensTable.revoked,
+      })
+      .from(schema.oauthAccessTokensTable)
+      .leftJoin(
+        schema.oauthRefreshTokensTable,
+        eq(
+          schema.oauthAccessTokensTable.refreshId,
+          schema.oauthRefreshTokensTable.id,
+        ),
+      )
+      .where(
+        and(
+          eq(schema.oauthAccessTokensTable.token, sql.placeholder("tokenHash")),
+          // Better Auth 1.7 revokes a session's access tokens on sign-out by
+          // stamping `revoked` instead of deleting them.
+          isNull(schema.oauthAccessTokensTable.revoked),
+        ),
+      )
+      .limit(1)
+      .prepare("archestra_oauth_access_token_by_hash");
+  });
+}
+
+export default OAuthAccessTokenModel;
